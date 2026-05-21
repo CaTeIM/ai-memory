@@ -20,6 +20,8 @@ tempfile.workspace = true
 jiff.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
 
 [dev-dependencies]
 

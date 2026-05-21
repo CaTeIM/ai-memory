@@ -35,6 +35,10 @@ pub enum Command {
     Search(SearchArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
+    /// Run the filesystem watcher (foreground; Ctrl-C to stop).
+    Watch(WatchArgs),
+    /// Wipe the data directory's wiki/, db/, raw/ contents.
+    Reset(ResetArgs),
 }
 
 /// Arguments for `init`.
@@ -64,6 +68,25 @@ pub struct SearchArgs {
     /// Emit results as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `watch`.
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Workspace name to attribute discovered files to (auto-created).
+    #[arg(long, default_value = "default")]
+    pub workspace: String,
+    /// Project name within the workspace (auto-created).
+    #[arg(long, default_value = "scratch")]
+    pub project: String,
+}
+
+/// Arguments for `reset`.
+#[derive(Debug, Args)]
+pub struct ResetArgs {
+    /// Required to actually wipe data. Without this we just dry-run.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 /// Arguments for `write-page`.

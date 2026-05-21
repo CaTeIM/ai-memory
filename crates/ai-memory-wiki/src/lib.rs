@@ -8,8 +8,10 @@
 mod atomic;
 mod error;
 mod markdown;
+mod watcher;
 mod wiki;
 
 pub use error::{WikiError, WikiResult};
 pub use markdown::{Markdown, derive_title, emit, parse};
+pub use watcher::{DEBOUNCE_WINDOW, RECONCILE_INTERVAL, WatcherHandle};
 pub use wiki::{Wiki, WritePageRequest};

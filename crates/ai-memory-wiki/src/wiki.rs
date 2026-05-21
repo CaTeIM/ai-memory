@@ -57,6 +57,46 @@ impl Wiki {
         parse(&raw)
     }
 
+    /// Cloneable handle to the underlying store writer.
+    #[must_use]
+    pub fn writer(&self) -> &WriterHandle {
+        &self.writer
+    }
+
+    /// Re-index the page on disk at `path` into the store *without*
+    /// rewriting the file.
+    ///
+    /// Called by the watcher when an external editor (Obsidian, vim) has
+    /// changed a file we did not write. The store-side sha256 short-circuit
+    /// makes this idempotent: if the on-disk content already matches the
+    /// latest version, no supersession happens.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for any filesystem, parsing, or store error.
+    pub async fn reindex_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> WikiResult<PageId> {
+        let md = self.read_page(&path)?;
+        let title = derive_title(&md.frontmatter, &md.body, &path);
+        let id = self
+            .writer
+            .upsert_page(NewPage {
+                workspace_id,
+                project_id,
+                path,
+                title,
+                body: md.body,
+                tier: Tier::Semantic,
+                frontmatter_json: md.frontmatter,
+                pinned: false,
+            })
+            .await?;
+        Ok(id)
+    }
+
     /// Write `body` (with optional `frontmatter`) atomically to
     /// `<wiki_root>/<path>` and upsert the matching page row in the store.
     ///

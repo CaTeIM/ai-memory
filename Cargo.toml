@@ -64,6 +64,11 @@ refinery = { version = "0.8", features = ["rusqlite"] }
 sha2 = "0.10"
 parking_lot = "0.12"
 
+# Filesystem watcher + process inspection.
+notify = "8"
+notify-debouncer-full = "0.6"
+sysinfo = "0.32"
+
 # Testing.
 tempfile = "3"
 
