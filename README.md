@@ -152,6 +152,28 @@ docker cp ai-memory:/data/wiki ./my-ai-memory-wiki
 docker exec ai-memory git -C /data/wiki log --oneline
 ```
 
+### Rules vs facts — ai-memory tells you when something belongs in CLAUDE.md
+
+When you type something like "don't forget to never add a function
+without a unit test", that's a **durable project rule**, not a
+session-level observation. Rules need to fire on every relevant
+action — that's what your project's `CLAUDE.md` / `AGENTS.md` is for
+(it's loaded into the agent's system prompt every turn), while
+ai-memory queries only fire when the agent thinks to call them.
+
+The consolidator now classifies each compiled observation as
+`decision | fact | rule | gotcha`. Rule-tagged pages are auto-routed
+to `wiki/_rules/<slug>.md`, and the next time you run `memory_lint`
+the agent sees a suggestion:
+
+> **rule_suggestion**: Page `_rules/never-ship-code-without-test.md`
+> looks like a durable project rule. Consider copying it into your
+> project's CLAUDE.md / AGENTS.md so the agent sees it on every
+> turn, not just when it remembers to call memory_query.
+
+ai-memory never edits your `CLAUDE.md` itself — the suggestion is
+the whole UX. You copy what's useful, ignore what isn't.
+
 ### Nudge the agent to *use* memory proactively
 
 Lifecycle hooks handle *capture* and *handoff resume* without you

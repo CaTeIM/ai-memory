@@ -212,13 +212,32 @@ impl Consolidator {
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
-            let path = PagePath::new(upd.path.clone())?;
+            // When the LLM classifies an update as a rule, ALWAYS
+            // route it to `_rules/<slug>.md` regardless of what
+            // path it suggested — this is the M20 contract that
+            // lets the lint pass find every rule-shaped page in a
+            // single sweep without scanning frontmatter across the
+            // whole wiki.
+            let final_path = if upd.kind == crate::types::PageKind::Rule {
+                let slug = slugify_for_rule(&upd.title);
+                format!("_rules/{slug}.md")
+            } else {
+                upd.path.clone()
+            };
+            let path = PagePath::new(final_path)?;
             let tier = upd.tier.parse::<Tier>().unwrap_or(Tier::Semantic);
             let mut fm = serde_json::Map::new();
             fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
             fm.insert(
                 "tier".into(),
                 serde_json::Value::String(tier_as_str(tier).into()),
+            );
+            // M20: surface the semantic classification into
+            // frontmatter so the lint pass + downstream tooling
+            // can branch on it without re-classifying.
+            fm.insert(
+                "kind".into(),
+                serde_json::Value::String(upd.kind.as_str().into()),
             );
             if !upd.tags.is_empty() {
                 fm.insert(
@@ -308,7 +327,18 @@ fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> C
          - concepts/<slug>.md         (semantic, evergreen concept pages)\n\
          - decisions/<short>.md       (semantic, ADR-style records)\n\
          - gotchas/<slug>.md          (semantic, failure modes / surprises)\n\
-         \nEach update must include a title, markdown body, tier, and tags.\n",
+         \nClassify each update with one of these `kind` values:\n\
+         - `decision` (the project chose X over Y)\n\
+         - `gotcha`   (a failure mode or surprise worth remembering)\n\
+         - `rule`     (durable project convention: \"always X\", \"never Y\")\n\
+         - `fact`     (everything else; the default)\n\
+         \nWhen you mark an update as `rule`, write the body as a clear \
+         standalone instruction the agent could follow on every relevant \
+         action. The path you suggest for a rule will be overridden — the \
+         system routes rules to `_rules/<slug>.md` automatically and the \
+         lint pass surfaces a hint to copy it into the project's CLAUDE.md.\
+         \n\nEach update must include a title, markdown body, tier, kind, \
+         and tags.\n",
     );
     ChatRequest {
         system: Some(BATCH_SYSTEM_PROMPT.into()),
@@ -396,6 +426,40 @@ fn one_line(s: &str) -> String {
         .collect()
 }
 
+/// ASCII-slug a rule title for the `_rules/<slug>.md` path.
+///
+/// Lower-cases, replaces runs of non-`[a-z0-9]` with `-`, trims
+/// leading/trailing hyphens, and caps at 60 chars. Falls back to
+/// `rule` when the input has no alphanumerics (e.g. a non-Latin
+/// title) so we always produce a valid PagePath.
+fn slugify_for_rule(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_dash = true; // leading dashes get folded
+    for c in title.chars() {
+        let lower = c.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return "rule".into();
+    }
+    if out.len() > 60 {
+        out.truncate(60);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
+}
+
 fn short_id(s: &str) -> String {
     s.chars().take(8).collect()
 }
@@ -415,3 +479,46 @@ that future agents and the user can read to recover context.\n\nRules:\n\
 4. Do NOT include redundant per-tool-call detail. Aggregate.\n\
 5. Do NOT echo timestamps or session ids (frontmatter already has them).\n\
 6. Tags: 0-5 short kebab-case tags surfaced to frontmatter.\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slugifier produces a clean ASCII path for typical English titles.
+    #[test]
+    fn slugify_handles_typical_rule_title() {
+        assert_eq!(
+            slugify_for_rule("Never ship code without a unit test"),
+            "never-ship-code-without-a-unit-test"
+        );
+    }
+
+    /// Punctuation + apostrophes collapse into single hyphens; no
+    /// trailing hyphen lingers from a final non-alphanumeric.
+    #[test]
+    fn slugify_collapses_punctuation_and_trims() {
+        assert_eq!(
+            slugify_for_rule("Don't merge before lint!"),
+            "don-t-merge-before-lint"
+        );
+        assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
+    }
+
+    /// Non-Latin / empty-after-cleanup titles fall back to a static
+    /// slug instead of producing an invalid PagePath.
+    #[test]
+    fn slugify_falls_back_for_unprintable_titles() {
+        assert_eq!(slugify_for_rule(""), "rule");
+        assert_eq!(slugify_for_rule("!!!"), "rule");
+        assert_eq!(slugify_for_rule("中文"), "rule");
+    }
+
+    /// Very long titles get capped at 60 chars with no trailing dash.
+    #[test]
+    fn slugify_caps_length() {
+        let long = "a".repeat(200);
+        let slug = slugify_for_rule(&long);
+        assert!(slug.len() <= 60);
+        assert!(!slug.ends_with('-'));
+    }
+}

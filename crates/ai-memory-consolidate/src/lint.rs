@@ -125,8 +125,35 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                 pages: vec![c.path.as_str().to_string()],
             });
         }
+        // M20: rule-shaped pages get a "consider adding to
+        // CLAUDE.md" suggestion. Two signals are checked:
+        //   1. Frontmatter `kind: rule` — set by the consolidator
+        //      when it classifies an observation as a rule.
+        //   2. Page path starts with `_rules/` — same routing
+        //      target. Either signal suffices.
+        let frontmatter: Option<serde_json::Value> = serde_json::from_str(&c.frontmatter_json).ok();
+        let kind_is_rule = frontmatter
+            .as_ref()
+            .and_then(|fm| fm.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("rule");
+        let path_str = c.path.as_str();
+        let path_is_rule = path_str.starts_with("_rules/");
+        if kind_is_rule || path_is_rule {
+            out.push(LintFinding {
+                kind: "rule_suggestion".into(),
+                severity: "info".into(),
+                message: format!(
+                    "Page {path_str} looks like a durable project rule. \
+                     Consider copying it into your project's CLAUDE.md / \
+                     AGENTS.md so the agent sees it on every turn, not \
+                     just when it remembers to call memory_query."
+                ),
+                pages: vec![path_str.to_string()],
+            });
+        }
         // Duplicate-title tracking: peek the frontmatter for a `title` field.
-        if let Ok(fm) = serde_json::from_str::<serde_json::Value>(&c.frontmatter_json)
+        if let Some(fm) = frontmatter.as_ref()
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
         {
             titles
@@ -296,5 +323,73 @@ mod tests {
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    /// M20: a page tagged `kind: rule` in its frontmatter triggers
+    /// a rule_suggestion finding pointing the user at CLAUDE.md.
+    #[test]
+    fn rule_pass_flags_rule_kind_frontmatter() {
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/no-impl-without-test.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Never ship code without a test", "kind": "rule"}"#
+                .into(),
+        };
+        let findings = rule_based_findings(&[candidate]);
+        let rules: Vec<_> = findings
+            .iter()
+            .filter(|f| f.kind == "rule_suggestion")
+            .collect();
+        assert_eq!(rules.len(), 1, "expected one rule_suggestion finding");
+        assert!(rules[0].message.contains("CLAUDE.md"));
+    }
+
+    /// M20: a page under `_rules/` also triggers the suggestion
+    /// even when the frontmatter is missing/empty — the path
+    /// itself is enough signal.
+    #[test]
+    fn rule_pass_flags_rules_path() {
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("_rules/no-impl-without-test.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: "{}".into(),
+        };
+        let findings = rule_based_findings(&[candidate]);
+        assert!(
+            findings.iter().any(|f| f.kind == "rule_suggestion"),
+            "expected a rule_suggestion finding for _rules/ page",
+        );
+    }
+
+    /// Defensive: a normal concept page (no rule signal) does NOT
+    /// emit the suggestion. Without this guard, every fact-tagged
+    /// page would noise up the lint report.
+    #[test]
+    fn rule_pass_skips_non_rule_pages() {
+        let candidate = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/karpathy-wiki.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 5,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
+        };
+        let findings = rule_based_findings(&[candidate]);
+        assert!(
+            findings.iter().all(|f| f.kind != "rule_suggestion"),
+            "non-rule page must not produce a rule_suggestion finding",
+        );
     }
 }

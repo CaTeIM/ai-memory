@@ -18,13 +18,65 @@ pub struct ConsolidatedPage {
     pub tags: Vec<String>,
 }
 
+/// Semantic classification of one consolidated page. Surfaced into
+/// the page's frontmatter (`kind: rule`, etc.) so the lint pass can
+/// differentiate "decisions the project has made" from "durable
+/// rules the team enforces" from raw "facts that emerged today".
+///
+/// The `rule` variant is special: rule-tagged pages are auto-routed
+/// to `_rules/<slug>.md` and the lint pass suggests adding them to
+/// the project's CLAUDE.md / AGENTS.md so they fire on every turn,
+/// not just on memory_query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PageKind {
+    /// Project-wide constraint or convention. Examples: "never
+    /// commit without a test", "always run lint before merging".
+    /// Gets routed to `_rules/<slug>.md` + a lint suggestion to
+    /// migrate into CLAUDE.md.
+    Rule,
+    /// Decision the project made (ADR-shaped). Examples: "chose
+    /// session cookies over JWT for auth", "rejected vector RAG
+    /// in favour of Karpathy wiki".
+    Decision,
+    /// A failure mode or surprise worth remembering. Examples:
+    /// "Claude Code's session-end fires twice when /exit is typed
+    /// during a tool call".
+    Gotcha,
+    /// Anything that doesn't fit a stronger category. The default —
+    /// keeps existing call sites that don't classify explicitly
+    /// working unchanged.
+    #[default]
+    Fact,
+}
+
+impl PageKind {
+    /// Wire string for serialisation + frontmatter.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Decision => "decision",
+            Self::Gotcha => "gotcha",
+            Self::Fact => "fact",
+        }
+    }
+}
+
 /// One update inside a multi-page consolidation batch (M7b).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConsolidatedPageUpdate {
     /// Relative wiki path (`concepts/foo.md`, `decisions/0001.md`, …).
+    /// When `kind` is `Rule` the consolidator overrides this to
+    /// `_rules/<slug>.md` regardless — see `PageKind::Rule`.
     pub path: String,
     /// Tier (`semantic`, `episodic`, `procedural`, `working`).
     pub tier: String,
+    /// Semantic classification. Defaults to `fact` if the LLM
+    /// doesn't supply one — existing consolidations without this
+    /// field still deserialise.
+    #[serde(default)]
+    pub kind: PageKind,
     /// New page title.
     pub title: String,
     /// New markdown body.
