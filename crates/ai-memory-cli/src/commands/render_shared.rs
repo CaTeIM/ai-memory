@@ -77,36 +77,62 @@ pub(crate) fn build_claude_code_payload(
     let mut hooks_block = serde_json::Map::new();
     for (event, script) in CLAUDE_CODE_EVENTS {
         let abs = emit_root.join(script);
-        let mut env = serde_json::Map::new();
-        env.insert("AI_MEMORY_HOOK_URL".into(), json!(server_url));
-        if let Some(t) = auth_token {
-            env.insert("AI_MEMORY_AUTH_TOKEN".into(), json!(t));
-        }
-        // Claude Code's hook schema:
+
+        // Claude Code's hook schema (per
+        // https://code.claude.com/docs/en/hooks):
         //   "<EventName>": [
         //     { "matcher": "<tool-name regex or empty>",
-        //       "hooks": [ { "type": "command", "command": "...", "env": {...} } ]
+        //       "hooks": [ { "type": "command", "command": "..." } ]
         //     }
         //   ]
-        // The OUTER array carries `matcher` + a nested `hooks` array.
-        // The INNER hook entry carries `type: "command"` plus the
-        // actual command. An empty matcher means "fire for every
-        // event of this kind" — appropriate for ai-memory's
-        // capture hooks which want every tool call, every prompt,
-        // every session boundary.
+        //
+        // We INLINE env vars into the command string itself
+        // (`AI_MEMORY_HOOK_URL=... AI_MEMORY_AUTH_TOKEN=... /path`)
+        // rather than passing them through an `env` field on the
+        // hook entry. Reasons:
+        //   1. CC doesn't appear to honour an `env` field at this
+        //      level — observed empirically: the hook fires but
+        //      the script sees neither var and falls back to the
+        //      127.0.0.1 default, so POSTs go nowhere.
+        //   2. Inlining the env into the command string is
+        //      portable across any shell-style hook runner — POSIX
+        //      `VAR=val command` syntax is universally honoured.
+        //   3. The hook scripts already read those env vars (see
+        //      `hooks/claude-code/session-start.sh` etc.), so no
+        //      script changes are required.
+        let mut prefix = format!("AI_MEMORY_HOOK_URL={} ", shell_quote(server_url));
+        if let Some(t) = auth_token {
+            prefix.push_str(&format!("AI_MEMORY_AUTH_TOKEN={} ", shell_quote(t)));
+        }
+        let command = format!("{prefix}{}", abs.to_string_lossy());
+
+        // Empty matcher = fire on every event of this kind. Right
+        // for ai-memory's capture hooks (every prompt, every tool
+        // call, every session boundary).
         hooks_block.insert(
             event.into(),
             json!([{
                 "matcher": "",
                 "hooks": [{
                     "type": "command",
-                    "command": abs.to_string_lossy().into_owned(),
-                    "env": env,
+                    "command": command,
                 }],
             }]),
         );
     }
     json!({ "hooks": hooks_block })
+}
+
+/// Minimal shell quoting for embedding values into a `VAR=val cmd`
+/// prefix. Wraps in single quotes; embedded `'` is escaped via
+/// `'\''`. Safe for the URLs and bearer tokens we embed (no
+/// realistic value contains anything else weird).
+fn shell_quote(s: &str) -> String {
+    if !s.contains(['\'', ' ', '"', '$', '`', '\\']) {
+        return s.to_string();
+    }
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 #[cfg(test)]
@@ -140,13 +166,22 @@ mod tests {
     fn claude_code_payload_embeds_auth_token_when_provided() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", Some("tok"));
-        // Updated for Claude Code's matcher+hooks shape: env lives
-        // on the INNER hook entry now (one nesting level deeper).
-        let session_start = v
-            .pointer("/hooks/SessionStart/0/hooks/0/env/AI_MEMORY_AUTH_TOKEN")
+        // Env vars are inlined into the command string so CC's
+        // hook runner sees them regardless of whether it honours
+        // a separate `env` field. Assert the token landed in the
+        // command prefix.
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert_eq!(session_start, "tok");
+        assert!(
+            command.contains("AI_MEMORY_AUTH_TOKEN=tok"),
+            "command should inline the auth token; got: {command}"
+        );
+        assert!(
+            command.contains("AI_MEMORY_HOOK_URL=http://localhost:49374"),
+            "command should inline the hook URL; got: {command}"
+        );
     }
 
     /// Regression guard: Claude Code's hook schema requires the
@@ -188,14 +223,15 @@ mod tests {
     fn claude_code_payload_omits_auth_token_when_absent() {
         let root = PathBuf::from("/host/hooks/claude-code");
         let v = build_claude_code_payload(&root, "http://localhost:49374", None);
-        // The env block lives inside the INNER hook entry (one level
-        // deeper than the legacy shape).
-        let env = v
-            .pointer("/hooks/SessionStart/0/hooks/0/env")
-            .and_then(|e| e.as_object())
+        let command = v
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(|s| s.as_str())
             .unwrap();
-        assert!(env.contains_key("AI_MEMORY_HOOK_URL"));
-        assert!(!env.contains_key("AI_MEMORY_AUTH_TOKEN"));
+        assert!(command.contains("AI_MEMORY_HOOK_URL="));
+        assert!(
+            !command.contains("AI_MEMORY_AUTH_TOKEN="),
+            "no token expected in command: {command}"
+        );
     }
 
     #[test]
@@ -206,9 +242,11 @@ mod tests {
             .pointer("/hooks/SessionStart/0/hooks/0/command")
             .and_then(|s| s.as_str())
             .unwrap();
-        assert_eq!(
-            cmd,
-            "/home/user/.ai-memory/hooks/claude-code/session-start.sh"
+        // The command now has the env prefix + the absolute path,
+        // joined by a single space.
+        assert!(
+            cmd.ends_with("/home/user/.ai-memory/hooks/claude-code/session-start.sh"),
+            "command should end with the absolute script path: {cmd}"
         );
     }
 }
