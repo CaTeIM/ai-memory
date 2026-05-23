@@ -259,8 +259,6 @@ fn codex_upsert_mcp_server(
 ) -> anyhow::Result<()> {
     use toml_edit::{Item, Table, Value, value};
 
-    let bearer = bearer_header_value_shared(args.auth_token.as_deref());
-
     // Capture sibling entries from either inline-table or block-table
     // storage so we can rebuild in block form without dropping them.
     let preserved: Vec<(String, Item)> = match doc.get("mcp_servers") {
@@ -278,12 +276,31 @@ fn codex_upsert_mcp_server(
     };
 
     // Build our `[mcp_servers.<name>]` as a block-style table.
+    //
+    // IMPORTANT: Codex's MCP schema (per
+    // `openai/codex/codex-rs/config/src/mcp_types.rs`) supports the
+    // following keys for an HTTP-transport entry:
+    //
+    //   url                  string         the /mcp endpoint
+    //   bearer_token         string         literal bearer token
+    //   bearer_token_env_var string         env var name holding the token
+    //   http_headers         table          static custom headers
+    //   env_http_headers     table          env-var-backed custom headers
+    //   oauth                table          OAuth client config
+    //   …
+    //
+    // We use `bearer_token` (literal) — the user already provided
+    // the token via --auth-token, embedding it directly avoids the
+    // shell-profile-editing step required by env_var indirection.
+    //
+    // The previous shape used `[mcp_servers.<name>.headers]`
+    // (the wrong key, with no support in Codex's schema), which
+    // Codex silently ignored and then prompted the user with
+    // "Run `codex mcp login <name>`" — the OAuth fallback.
     let mut server = Table::new();
     server["url"] = value(args.server_url.clone());
-    if let Some(b) = bearer {
-        let mut headers = Table::new();
-        headers["Authorization"] = value(b);
-        server["headers"] = Item::Table(headers);
+    if let Some(t) = args.auth_token.as_deref() {
+        server["bearer_token"] = value(t);
     }
 
     // Replace `mcp_servers` wholesale with a fresh implicit parent
@@ -340,6 +357,12 @@ fn render_claude_code(args: &InstallMcpArgs) -> Result<String> {
 fn render_codex(args: &InstallMcpArgs) -> String {
     // Codex uses TOML, not JSON. Hand-render the snippet so the
     // table headers stay deterministic.
+    //
+    // Schema: Codex's MCP HTTP transport uses `bearer_token`
+    // (literal) or `bearer_token_env_var` (env-var indirection)
+    // for auth — NOT a `[mcp_servers.<name>.headers]` sub-table.
+    // The wrong key just makes Codex fall back to its OAuth
+    // login flow ("Run `codex mcp login <name>`").
     let mut out = format!(
         "# Codex CLI — append to ~/.codex/config.toml\n\
          #\n\
@@ -348,13 +371,12 @@ fn render_codex(args: &InstallMcpArgs) -> String {
         name = args.name,
         url = args.server_url,
     );
-    if let Some(b) = bearer_header_value(args) {
+    if let Some(t) = args.auth_token.as_deref() {
         out.push_str(&format!(
-            "\n# Codex passes [mcp_servers.<name>.headers] verbatim:\n\
-             [mcp_servers.{name}.headers]\n\
-             Authorization = \"{b}\"\n",
-            name = args.name,
-            b = b,
+            "bearer_token = \"{t}\"\n\
+             # Or, to avoid embedding the literal:\n\
+             # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
+             # (and export AI_MEMORY_AUTH_TOKEN in your shell before starting codex)\n",
         ));
     }
     out
@@ -546,9 +568,22 @@ mod tests {
             McpClient::Openclaw,
         ] {
             let out = render_with_token(client);
+            // Most clients (Claude Code / Cursor / Gemini / OpenCode /
+            // ClaudeDesktop / OpenClaw) embed the token as an
+            // `Authorization: Bearer <token>` header — assert
+            // "Bearer <token>".
+            //
+            // Codex's TOML schema uses `bearer_token = "<token>"`
+            // directly (no `Bearer ` prefix in the file). Assert
+            // the raw token appears under the right key.
+            let expected = if matches!(client, McpClient::Codex) {
+                "bearer_token = \"test-token-deadbeef\""
+            } else {
+                "Bearer test-token-deadbeef"
+            };
             assert!(
-                out.contains("Bearer test-token-deadbeef"),
-                "client {client:?} did not embed the bearer token:\n{out}"
+                out.contains(expected),
+                "client {client:?} did not embed the bearer token (expected {expected:?}):\n{out}"
             );
         }
     }
@@ -625,15 +660,24 @@ mod tests {
             out.contains("[mcp_servers.ai-memory]"),
             "expected block-form table header, got:\n{out}"
         );
+        // Bearer token lives on the SERVER table as `bearer_token`,
+        // not under a `[mcp_servers.X.headers]` sub-table. The
+        // previous shape was the wrong key (`headers` doesn't exist
+        // in Codex's MCP schema; the correct keys are `bearer_token`
+        // / `bearer_token_env_var` / `http_headers` / `env_http_headers`)
+        // and made Codex prompt for OAuth on every start.
         assert!(
-            out.contains("[mcp_servers.ai-memory.headers]"),
-            "expected block-form headers sub-table, got:\n{out}"
+            out.contains("bearer_token = \"test-token-deadbeef\""),
+            "expected `bearer_token = \"...\"` in the server table, got:\n{out}"
+        );
+        assert!(
+            !out.contains("[mcp_servers.ai-memory.headers]"),
+            "the legacy `[mcp_servers.X.headers]` sub-table is invalid in Codex's schema; should NOT be emitted, got:\n{out}"
         );
         assert!(
             !out.contains("mcp_servers = {"),
             "found inline-table form (regression):\n{out}"
         );
-        assert!(out.contains("Bearer test-token-deadbeef"));
     }
 
     /// Migrating from the old M22 inline-table form to block form must
