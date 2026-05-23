@@ -19,6 +19,13 @@ use crate::markdown::{Markdown, derive_title, emit, parse};
 /// file *and* sends a `WriteCmd::UpsertPage` to the store in a single
 /// call — no background-task indexing-after-return (basic-memory #763
 /// lesson).
+///
+/// ## On-disk layout
+///
+/// Pages are stored at `<wiki_root>/<workspace_id>/<project_id>/<page-path>`.
+/// Each of `workspace_id` and `project_id` is a UUID string. This layout is
+/// the single canonical namespace; all path construction must go through
+/// [`Wiki::project_root`] or [`Wiki::abs_path`] — never hand-rolled joins.
 #[derive(Clone)]
 pub struct Wiki {
     root: PathBuf,
@@ -272,7 +279,8 @@ impl Wiki {
     }
 
     /// Write `body` (with optional `frontmatter`) atomically to
-    /// `<wiki_root>/<path>` and upsert the matching page row in the store.
+    /// `<wiki_root>/<workspace_id>/<project_id>/<path>` and upsert the
+    /// matching page row in the store.
     ///
     /// The store side does the sha256 short-circuit + supersession dance.
     /// Returns the id of the page version that is now `is_latest = 1`.
@@ -387,6 +395,22 @@ mod tests {
     use ai_memory_store::Store;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn project_root_is_wiki_root_joined_with_ws_and_proj() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        assert_eq!(
+            wiki.project_root(ws, proj),
+            tmp.path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join(proj.to_string()),
+        );
+    }
+
     fn req(
         ws: WorkspaceId,
         proj: ProjectId,
@@ -435,13 +459,11 @@ mod tests {
         let _ = id; // any non-zero PageId is sufficient
 
         // File is on disk at the per-project location.
-        let on_disk = std::fs::read_to_string(
-            tmp.path()
-                .join("wiki")
-                .join(ws.to_string())
-                .join(proj.to_string())
-                .join("notes/karpathy.md"),
-        )
+        let on_disk = std::fs::read_to_string(wiki.abs_path(
+            ws,
+            proj,
+            &PagePath::new("notes/karpathy.md").unwrap(),
+        ))
         .unwrap();
         assert!(on_disk.starts_with("---\n"));
         assert!(on_disk.contains("title: Karpathy LLM Wiki"));
@@ -491,13 +513,11 @@ mod tests {
         .await
         .unwrap();
 
-        let on_disk = std::fs::read_to_string(
-            tmp.path()
-                .join("wiki")
-                .join(ws.to_string())
-                .join(proj.to_string())
-                .join("notes/leaky.md"),
-        )
+        let on_disk = std::fs::read_to_string(wiki.abs_path(
+            ws,
+            proj,
+            &PagePath::new("notes/leaky.md").unwrap(),
+        ))
         .unwrap();
         // The on-disk page must not contain any of the planted
         // secrets; each should have been replaced with [REDACTED].
@@ -560,12 +580,7 @@ mod tests {
         let ids = wiki.apply_batch(batch).await.unwrap();
         assert_eq!(ids.len(), 5);
         for i in 0..5 {
-            let path = tmp
-                .path()
-                .join("wiki")
-                .join(ws.to_string())
-                .join(proj.to_string())
-                .join(format!("batch/{i}.md"));
+            let path = wiki.abs_path(ws, proj, &PagePath::new(format!("batch/{i}.md")).unwrap());
             assert!(path.is_file(), "missing file {i}");
             let body = std::fs::read_to_string(&path).unwrap();
             assert!(body.contains(&format!("Page {i}")));
@@ -625,18 +640,9 @@ mod tests {
         .await
         .unwrap();
 
-        let path_a = tmp
-            .path()
-            .join("wiki")
-            .join(ws.to_string())
-            .join(proj_a.to_string())
-            .join("decisions/foo.md");
-        let path_b = tmp
-            .path()
-            .join("wiki")
-            .join(ws.to_string())
-            .join(proj_b.to_string())
-            .join("decisions/foo.md");
+        let page = PagePath::new("decisions/foo.md").unwrap();
+        let path_a = wiki.abs_path(ws, proj_a, &page);
+        let path_b = wiki.abs_path(ws, proj_b, &page);
 
         assert!(path_a.is_file(), "alpha file must exist");
         assert!(path_b.is_file(), "beta file must exist");

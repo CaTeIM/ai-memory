@@ -386,10 +386,11 @@ docker run --rm \
 - 1-2k generated tokens → ~$0.007 output
 - Total: well under $0.20 per run.
 
-**Idempotency.** The first run produces `wiki/bootstrap.md`
-listing every page generated + a one-paragraph rationale. Re-running
-without `--force` errors out. Delete the manifest (and the generated
-pages) if you want a clean re-bootstrap.
+**Idempotency.** The first run produces a per-project `bootstrap.md`
+manifest (at `<wiki>/<workspace>/<project>/bootstrap.md`) listing every
+page generated + a one-paragraph rationale. Re-running without `--force`
+errors out. Delete the manifest (and the generated pages) if you want a
+clean re-bootstrap.
 
 **Dry-run first.** Always worth doing before the real call to see
 which sources would actually be sent + how many tokens that

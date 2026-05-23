@@ -313,6 +313,42 @@ async fn resolve_ws_proj(
     Ok((ws, proj))
 }
 
+/// Look up workspace + project by name **without** auto-creating them.
+/// Returns `(WorkspaceId, ProjectId)` on success, or a ready-to-return
+/// 404/500 error response. Used by destructive handlers (purge, rename)
+/// where auto-creation would silently succeed on a typo.
+async fn lookup_ws_proj_no_create(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+) -> Result<(WorkspaceId, ProjectId), (StatusCode, Json<serde_json::Value>)> {
+    let ws_id = match state.reader.find_workspace(workspace.to_string()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("workspace '{workspace}' not found")
+                })),
+            ));
+        }
+        Err(e) => return Err(internal_err(e.to_string())),
+    };
+    let proj_id = match state.reader.find_project(ws_id, project.to_string()).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("project '{project}' not found in workspace '{workspace}'")
+                })),
+            ));
+        }
+        Err(e) => return Err(internal_err(e.to_string())),
+    };
+    Ok((ws_id, proj_id))
+}
+
 // ---------------------------------------------------------------------
 // bootstrap
 // ---------------------------------------------------------------------
@@ -502,24 +538,12 @@ pub struct ReorgReport {
     pub summary: ReorgSummaryJson,
 }
 
-async fn handle_reorg(
-    State(state): State<Arc<AdminState>>,
-    Json(req): Json<ReorgRequest>,
-) -> impl IntoResponse {
-    // Step 1: ensure the default workspace exists.
-    let ws = match state.writer.get_or_create_workspace("default").await {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
-            );
-        }
-    };
-
-    // Step 2: read all sessions with a non-NULL, non-empty cwd.
-    let sessions_with_cwd: Vec<(SessionId, ProjectId, String)> = match state
-        .reader
+/// Read every session that has a non-empty `cwd` field, returning
+/// `(session_id, project_id, cwd)` triples ordered by `started_at`.
+async fn list_sessions_with_cwd(
+    reader: &ai_memory_store::ReaderPool,
+) -> Result<Vec<(SessionId, ProjectId, String)>, StoreError> {
+    reader
         .with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, project_id, cwd \
@@ -543,7 +567,73 @@ async fn handle_reorg(
             Ok(out)
         })
         .await
-    {
+}
+
+/// Build the reorg plan: for each session with a new project basename,
+/// resolve-or-create the target project, return the plan entries plus
+/// the set of session updates and the distinct-project count.
+async fn build_reorg_plan(
+    state: &AdminState,
+    ws: WorkspaceId,
+    sessions: Vec<(SessionId, ProjectId, String)>,
+) -> Result<(Vec<ReorgPlanEntry>, Vec<(SessionId, ProjectId)>, usize), StoreError> {
+    // Resolve target project per distinct cwd (basename-derived).
+    let mut cwd_to_proj: std::collections::HashMap<String, (WorkspaceId, ProjectId, String)> =
+        std::collections::HashMap::new();
+    for (_, _, cwd) in &sessions {
+        if cwd_to_proj.contains_key(cwd.as_str()) {
+            continue;
+        }
+        let project_name = std::path::Path::new(cwd.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string());
+        let proj = state
+            .writer
+            .get_or_create_project(ws, project_name.clone(), Some(cwd.clone()))
+            .await?;
+        cwd_to_proj.insert(cwd.clone(), (ws, proj, project_name));
+    }
+
+    // Build plan — sessions whose project_id already matches are skipped.
+    let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
+    let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
+    for (session_id, old_project_id, cwd) in &sessions {
+        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
+        if *new_project_id == *old_project_id {
+            continue;
+        }
+        plan_entries.push(ReorgPlanEntry {
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            new_project: project_name.clone(),
+        });
+        writer_plan.push((*session_id, *new_project_id));
+    }
+
+    let distinct_new_projects: std::collections::HashSet<ProjectId> =
+        writer_plan.iter().map(|(_, pid)| *pid).collect();
+
+    Ok((plan_entries, writer_plan, distinct_new_projects.len()))
+}
+
+async fn handle_reorg(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<ReorgRequest>,
+) -> impl IntoResponse {
+    let ws = match state.writer.get_or_create_workspace("default").await {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("workspace: {e}") })),
+            );
+        }
+    };
+
+    let sessions = match list_sessions_with_cwd(&state.reader).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -553,7 +643,7 @@ async fn handle_reorg(
         }
     };
 
-    if sessions_with_cwd.is_empty() {
+    if sessions.is_empty() {
         let report = ReorgReport {
             dry_run: req.dry_run,
             plan: Vec::new(),
@@ -570,25 +660,9 @@ async fn handle_reorg(
         );
     }
 
-    // Step 3: resolve target project per distinct cwd (basename-derived).
-    let mut cwd_to_proj: std::collections::HashMap<String, (WorkspaceId, ProjectId, String)> =
-        std::collections::HashMap::new();
-    for (_, _, cwd) in &sessions_with_cwd {
-        if cwd_to_proj.contains_key(cwd.as_str()) {
-            continue;
-        }
-        let project_name = std::path::Path::new(cwd.as_str())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| "unknown".to_string());
-        let proj = match state
-            .writer
-            .get_or_create_project(ws, project_name.clone(), Some(cwd.clone()))
-            .await
-        {
-            Ok(id) => id,
+    let (plan_entries, writer_plan, distinct_count) =
+        match build_reorg_plan(&state, ws, sessions).await {
+            Ok(t) => t,
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -596,29 +670,7 @@ async fn handle_reorg(
                 );
             }
         };
-        cwd_to_proj.insert(cwd.clone(), (ws, proj, project_name));
-    }
 
-    // Step 4: build plan — sessions whose project_id already matches are skipped.
-    let mut plan_entries: Vec<ReorgPlanEntry> = Vec::new();
-    let mut writer_plan: Vec<(SessionId, ProjectId)> = Vec::new();
-    for (session_id, old_project_id, cwd) in &sessions_with_cwd {
-        let (_, new_project_id, project_name) = &cwd_to_proj[cwd.as_str()];
-        if *new_project_id == *old_project_id {
-            continue;
-        }
-        plan_entries.push(ReorgPlanEntry {
-            session_id: session_id.to_string(),
-            cwd: cwd.clone(),
-            new_project: project_name.clone(),
-        });
-        writer_plan.push((*session_id, *new_project_id));
-    }
-
-    let distinct_new_projects: std::collections::HashSet<ProjectId> =
-        writer_plan.iter().map(|(_, pid)| *pid).collect();
-
-    // Step 5: dry-run → return the plan without writing.
     if req.dry_run || writer_plan.is_empty() {
         let report = ReorgReport {
             dry_run: req.dry_run,
@@ -627,7 +679,7 @@ async fn handle_reorg(
                 sessions_moved: 0,
                 observations_updated: 0,
                 pages_graveyarded: 0,
-                distinct_new_projects: distinct_new_projects.len(),
+                distinct_new_projects: distinct_count,
             },
         };
         return (
@@ -636,7 +688,6 @@ async fn handle_reorg(
         );
     }
 
-    // Step 6: execute.
     let summary = match state.writer.reorg_sessions(writer_plan).await {
         Ok(s) => s,
         Err(e) => {
@@ -654,7 +705,7 @@ async fn handle_reorg(
             sessions_moved: summary.sessions_moved,
             observations_updated: summary.observations_updated,
             pages_graveyarded: summary.pages_graveyarded,
-            distinct_new_projects: distinct_new_projects.len(),
+            distinct_new_projects: distinct_count,
         },
     };
     (
@@ -986,44 +1037,11 @@ async fn handle_purge_project(
     }
 
     // Look up workspace and project IDs without auto-creating.
-    let ws_id = match state.reader.find_workspace(req.workspace.clone()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("workspace '{}' not found", req.workspace)
-                })),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
-
-    let proj_id = match state.reader.find_project(ws_id, req.project.clone()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "project '{}' not found in workspace '{}'",
-                        req.project, req.workspace
-                    )
-                })),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
 
     let label = format!("{}/{}", req.workspace, req.project);
     let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
@@ -1105,45 +1123,10 @@ async fn handle_rename_project(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<RenameProjectRequest>,
 ) -> impl IntoResponse {
-    // Step 1: look up workspace; 404 if absent.
-    let ws_id = match state.reader.find_workspace(req.workspace.clone()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("workspace '{}' not found", req.workspace)
-                })),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
-    };
-
-    // Step 2: look up the source project; 404 if absent.
-    let proj_id = match state.reader.find_project(ws_id, req.from.clone()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "project '{}' not found in workspace '{}'",
-                        req.from, req.workspace
-                    )
-                })),
-            );
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            );
-        }
+    // Look up workspace + source project; 404 if either is absent.
+    let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
     };
 
     // Step 3: execute the rename. The writer validates the name and

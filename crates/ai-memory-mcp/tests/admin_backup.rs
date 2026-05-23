@@ -4,15 +4,17 @@
 //! seeds a page, POSTs to `/admin/backup`, and asserts:
 //! - the response Content-Type is `application/gzip`,
 //! - the body is a valid gzip/tar stream,
-//! - the seeded wiki file appears in the tarball.
+//! - the seeded wiki file appears in the tarball at the per-project path,
+//! - the seeded file's content inside the tarball matches the original body.
 
-use ai_memory_core::{NewPage, PagePath, Tier};
+use ai_memory_core::{PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
-use ai_memory_wiki::Wiki;
+use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use flate2::read::GzDecoder;
+use std::io::Read as _;
 use tar::Archive;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -35,11 +37,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
     (state, store)
 }
 
-/// Seed a page directly into the store (index only — we also need the
-/// on-disk wiki file for the tarball). Use `AdminState.wiki.write_page`
-/// via the state, but here we seed through the store + write the file
-/// directly to exercise the backup path.
-async fn seed_page(store: &Store, tmp: &TempDir, path: &str, body: &str) {
+/// Seed a page through [`Wiki::write_page`] so it lands in the correct
+/// per-project directory (`<wiki>/<ws>/<proj>/<path>`), proving the
+/// backup path picks up the production write layout.
+async fn seed_page(state: &AdminState, store: &Store, path: &str, body: &str) {
     let ws = store
         .writer
         .get_or_create_workspace("default".to_string())
@@ -50,34 +51,33 @@ async fn seed_page(store: &Store, tmp: &TempDir, path: &str, body: &str) {
         .get_or_create_project(ws, "scratch".to_string(), None)
         .await
         .unwrap();
-    store
-        .writer
-        .upsert_page(NewPage {
+    state
+        .wiki
+        .write_page(WritePageRequest {
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path).unwrap(),
-            title: "Test".to_string(),
+            frontmatter: serde_json::json!({ "title": "Test" }),
             body: body.to_string(),
             tier: Tier::Semantic,
-            frontmatter_json: serde_json::json!({}),
             pinned: false,
+            title: Some("Test".into()),
         })
         .await
         .unwrap();
-
-    // Also write the file on disk so the tarball picks it up.
-    let full = tmp.path().join("wiki").join(path);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(&full, body).unwrap();
 }
 
 #[tokio::test]
 async fn backup_returns_application_gzip_content_type() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
-    seed_page(&store, &tmp, "concepts/karpathy.md", "compile not retrieve").await;
+    seed_page(
+        &state,
+        &store,
+        "concepts/karpathy.md",
+        "compile not retrieve",
+    )
+    .await;
 
     let router = admin_router(state);
     let req = Request::builder()
@@ -103,13 +103,8 @@ async fn backup_returns_application_gzip_content_type() {
 async fn backup_body_is_valid_gzip_and_contains_seeded_page() {
     let tmp = TempDir::new().unwrap();
     let (state, store) = make_state(&tmp).await;
-    seed_page(
-        &store,
-        &tmp,
-        "concepts/karpathy.md",
-        "compile-not-retrieve from Karpathy LLM wiki",
-    )
-    .await;
+    let known_body = "compile-not-retrieve from Karpathy LLM wiki";
+    seed_page(&state, &store, "concepts/karpathy.md", known_body).await;
 
     let router = admin_router(state);
     let req = Request::builder()
@@ -125,28 +120,35 @@ async fn backup_body_is_valid_gzip_and_contains_seeded_page() {
         .unwrap();
     assert!(!bytes.is_empty(), "backup body must not be empty");
 
-    // Decompress and list entries.
+    // Decompress, list entries, and check the seeded file's content.
     let decoder = GzDecoder::new(bytes.as_ref());
     let mut archive = Archive::new(decoder);
-    let entries: Vec<String> = archive
-        .entries()
-        .expect("tarball must be readable")
-        .map(|e| {
-            e.expect("entry must be readable")
-                .path()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-
+    let mut found_page = false;
+    let mut found_db = false;
+    let mut page_content = String::new();
+    for entry in archive.entries().expect("tarball must be readable") {
+        let mut entry = entry.expect("entry must be readable");
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if path.contains("concepts/karpathy.md") {
+            entry
+                .read_to_string(&mut page_content)
+                .expect("page entry must be readable");
+            found_page = true;
+        }
+        if path.contains("memory.sqlite") {
+            found_db = true;
+        }
+    }
     assert!(
-        entries.iter().any(|p| p.contains("concepts/karpathy.md")),
-        "tarball must contain the seeded page; entries: {entries:?}"
+        found_page,
+        "tarball must contain the seeded page; no 'concepts/karpathy.md' entry found"
     );
+    assert!(found_db, "tarball must contain the db snapshot");
+    // Verify the page body matches what was written — confirms the backup
+    // captured the per-project write-path content, not stale or wrong data.
     assert!(
-        entries.iter().any(|p| p.contains("memory.sqlite")),
-        "tarball must contain the db snapshot; entries: {entries:?}"
+        page_content.contains(known_body),
+        "page content in tarball must contain the seeded body; got: {page_content:?}"
     );
 }
 

@@ -33,7 +33,7 @@ Every project's data lives under an isolated, UUID-keyed root on disk:
 │       ├── gotchas/
 │       ├── sessions/
 │       ├── _rules/
-│       ├── log.md
+│       ├── log-YYYY-MM.md      # rolling event log, one file per month
 │       └── bootstrap.md
 └── <other_workspace_id>/
     └── <other_project_id>/
@@ -107,7 +107,7 @@ What happens:
    whitespace. 422 on bad input.
 3. `UPDATE projects SET name = ? WHERE id = ?`. UNIQUE-violation on
    the `(workspace_id, name)` index → 422 with "name taken".
-4. Return `{label, from, to, pages}`.
+4. Return `{workspace, from, to, pages}`.
 
 Zero files move on disk because the disk path is keyed by
 `project_id`, not name. The web UI URL `/web/w/<ws>/<proj-name>/…`

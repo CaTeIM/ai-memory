@@ -25,10 +25,10 @@
 //!
 //! ## Idempotency
 //!
-//! First write produces `wiki/bootstrap.md` recording the run
-//! (timestamp, source counts, generated page count). Re-running
-//! refuses unless `--force` is passed. The user can always delete
-//! `wiki/bootstrap.md` (and the generated pages) to reset.
+//! First write produces `<wiki>/<workspace>/<project>/bootstrap.md`
+//! recording the run (timestamp, source counts, generated page count).
+//! Re-running refuses unless `--force` is passed. The user can always
+//! delete the manifest (and the generated pages) to reset.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -55,9 +55,12 @@ pub enum BootstrapError {
     /// Project repo path doesn't exist or isn't a git repo.
     #[error("repo path {0} is not a git repository")]
     NotARepo(PathBuf),
-    /// The wiki already has a `bootstrap.md` manifest. Re-run with
+    /// The project already has a `bootstrap.md` manifest. Re-run with
     /// `--force` to overwrite.
-    #[error("project already bootstrapped (wiki/bootstrap.md exists). Pass --force to re-run.")]
+    #[error(
+        "this project is already bootstrapped (its bootstrap manifest already exists). \
+         Pass --force to re-run."
+    )]
     AlreadyBootstrapped,
     /// All source categories were excluded; nothing to do.
     #[error("no input sources selected; remove at least one --exclude-* flag")]

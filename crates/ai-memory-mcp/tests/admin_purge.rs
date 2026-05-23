@@ -241,11 +241,7 @@ async fn purge_project_deletes_data_and_files() {
     let (ws, _keep, doomed) = seed_two_projects(&store, &state.wiki).await;
 
     // The per-project directory must exist before purge.
-    let proj_dir = tmp
-        .path()
-        .join("wiki")
-        .join(ws.to_string())
-        .join(doomed.to_string());
+    let proj_dir = state.wiki.project_root(ws, doomed);
     assert!(proj_dir.exists(), "project dir must exist before purge");
 
     let resp = post(
@@ -297,6 +293,8 @@ async fn purge_project_preserves_sibling_project() {
     let (state, store) = make_state(&tmp).await;
 
     let (ws, keep, _doomed) = seed_two_projects(&store, &state.wiki).await;
+    // Clone the wiki handle before state is consumed by `post`.
+    let wiki = state.wiki.clone();
 
     let resp = post(
         state,
@@ -323,11 +321,7 @@ async fn purge_project_preserves_sibling_project() {
     );
 
     // keep's wiki directory must still exist with its page.
-    let keep_dir = tmp
-        .path()
-        .join("wiki")
-        .join(ws.to_string())
-        .join(keep.to_string());
+    let keep_dir = wiki.project_root(ws, keep);
     assert!(keep_dir.exists(), "keep's project dir must survive");
     let keep_file = keep_dir.join("notes/keep.md");
     assert!(keep_file.exists(), "keep's wiki file must survive");

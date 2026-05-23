@@ -324,10 +324,11 @@ export AI_MEMORY_SERVER_URL="http://localhost:49374"
 ai-memory bootstrap --workspace homelab --project myproj
 ```
 
-Bootstrap produces a `wiki/bootstrap.md` manifest listing every page
-generated + a one-paragraph rationale. Run with `--dry-run` first to
-preview which sources would be sent without paying for the LLM call.
-Re-running on the same project requires `--force`.
+Bootstrap produces a per-project `bootstrap.md` manifest (under
+`<wiki>/<workspace>/<project>/`) listing every page generated + a
+one-paragraph rationale. Run with `--dry-run` first to preview which
+sources would be sent without paying for the LLM call. Re-running on
+the same project requires `--force`.
 
 See [`docs/install.md`](docs/install.md#bootstrap-mid-project) for
 the full flag reference + per-source priority order.

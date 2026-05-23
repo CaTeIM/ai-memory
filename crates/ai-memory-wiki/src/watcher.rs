@@ -190,6 +190,9 @@ async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent)
         let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
             continue;
         };
+        if is_reserved_filename(&page_path) {
+            continue;
+        }
         if !raw_path.is_file() {
             // Likely a transient state (mv, atomic rename in flight).
             continue;
@@ -330,6 +333,7 @@ fn walk_markdown(root: &Path) -> WikiResult<Vec<PagePath>> {
                 && is_markdown(&path)
                 && !is_tempfile(&path)
                 && let Some(pp) = page_path_relative_to(root, &path)
+                && !is_reserved_filename(&pp)
             {
                 out.push(pp);
             }
@@ -346,6 +350,21 @@ fn is_tempfile(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with(".ai-memory-tmp."))
+}
+
+/// Returns `true` for the per-project reserved files that are NOT wiki
+/// pages: `log-YYYY-MM.md` (per-month rolling event ledger — see
+/// `ai-memory-hooks::log::log_filename_for`), the legacy `log.md`
+/// filename for backwards compatibility, and `bootstrap.md` (manifest).
+/// The watcher must skip them to avoid supersession loops — every
+/// `append_event` write triggers a watcher event, triggering an
+/// `upsert_page`, creating a spurious new supersession version.
+fn is_reserved_filename(page_path: &PagePath) -> bool {
+    let s = page_path.as_str();
+    s == "log.md"
+        || s == "bootstrap.md"
+        // log-YYYY-MM.md — 7 chars between the dash and the dot.
+        || (s.starts_with("log-") && s.ends_with(".md") && s.len() == "log-YYYY-MM.md".len())
 }
 
 fn page_path_relative_to(root: &Path, abs: &Path) -> Option<PagePath> {
@@ -415,6 +434,34 @@ mod tests {
         assert!(
             extract_project_ids(wiki_root, event_path).is_none(),
             "flat path with no namespace must return None"
+        );
+    }
+
+    /// `extract_project_ids` must return `None` when the second segment is not a valid UUID.
+    #[test]
+    fn extract_rejects_garbage_in_project_segment() {
+        let wiki_root = Path::new("/tmp/wiki");
+        let ws = WorkspaceId::new().to_string();
+        let event_path =
+            std::path::PathBuf::from(format!("/tmp/wiki/{ws}/not-a-uuid/decisions/foo.md"));
+        assert!(
+            extract_project_ids(wiki_root, &event_path).is_none(),
+            "garbage project segment must return None"
+        );
+    }
+
+    /// `extract_project_ids` must return `None` when there is no page path
+    /// after the two UUID segments (would produce an empty `PagePath`).
+    #[test]
+    fn extract_rejects_empty_page_path() {
+        let wiki_root = Path::new("/tmp/wiki");
+        let ws = WorkspaceId::new().to_string();
+        let proj = ProjectId::new().to_string();
+        // Just the project dir itself with no page path beneath.
+        let event_path = std::path::PathBuf::from(format!("/tmp/wiki/{ws}/{proj}"));
+        assert!(
+            extract_project_ids(wiki_root, &event_path).is_none(),
+            "missing page path must return None"
         );
     }
 
@@ -496,6 +543,78 @@ mod tests {
         assert!(is_tempfile(p));
         let q = Path::new("/some/dir/normal.md");
         assert!(!is_tempfile(q));
+    }
+
+    /// `walk_markdown` must not return `log.md` or `bootstrap.md`
+    /// (reserved per-project files that must not become wiki pages).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn walk_markdown_skips_reserved_filenames() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+
+        let proj_dir = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string());
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        // Write a legitimate page plus the reserved files (legacy
+        // `log.md`, the rotated `log-YYYY-MM.md`, and `bootstrap.md`).
+        // Single-word unique tokens so FTS5 (which parses hyphens as
+        // operators) can match them.
+        std::fs::write(proj_dir.join("real.md"), "real content\n").unwrap();
+        std::fs::write(proj_dir.join("log.md"), "sessionstarted logtoken unique\n").unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-05.md"),
+            "sessionstarted rotatedlogtoken unique\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("bootstrap.md"),
+            "bootstrapmanifest boottoken unique\n",
+        )
+        .unwrap();
+
+        let handle = WatcherHandle::start(wiki.clone()).unwrap();
+        // Trigger the reconciliation pass directly.
+        reconcile(&wiki).await.unwrap();
+
+        // Only `real.md` should land in the index.
+        let hits = store
+            .reader
+            .search_pages("real content".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "only the real page should be indexed");
+        assert_eq!(hits[0].path.as_str(), "real.md");
+
+        // Neither reserved file should be searchable.
+        let log_hits = store
+            .reader
+            .search_pages("logtoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(log_hits.is_empty(), "log.md must not be indexed");
+
+        let rotated_hits = store
+            .reader
+            .search_pages("rotatedlogtoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(
+            rotated_hits.is_empty(),
+            "log-YYYY-MM.md (rotated) must not be indexed"
+        );
+
+        let boot_hits = store
+            .reader
+            .search_pages("boottoken".into(), 5)
+            .await
+            .unwrap();
+        assert!(boot_hits.is_empty(), "bootstrap.md must not be indexed");
+
+        handle.shutdown().await;
+        drop(store);
     }
 
     /// Defence: an attacker who can write to wiki/ shouldn't be able

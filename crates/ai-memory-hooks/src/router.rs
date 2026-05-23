@@ -288,7 +288,7 @@ async fn process(state: &HookState, env: HookEnvelope) -> anyhow::Result<()> {
 
     // Append the log line to the per-project log.md.
     if let Err(e) = log::append_event(
-        state.wiki.root(),
+        &state.wiki,
         ws,
         proj,
         Timestamp::now(),
