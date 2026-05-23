@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# ai-memory — thin wrapper that invokes the dockerised ai-memory
+# binary with the right mounts so install-* commands can edit your
+# real config files, bootstrap can read your real project, and
+# data-dir commands hit the same volume your server uses.
+#
+# Install this to ~/.local/bin/ai-memory (ensure ~/.local/bin is on
+# PATH). See README "Quick start" for the one-liner.
+#
+# Special wrapper-only subcommands (not forwarded to the binary):
+#   ai-memory upgrade       Pull the latest image + remind to re-stage hooks.
+#
+# Env overrides:
+#   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
+#   AI_MEMORY_DOCKER        docker command (default: docker; e.g. "podman")
+#   AI_MEMORY_DATA_VOLUME   named volume mounted at /data (default: ai-memory-data)
+#   AI_MEMORY_DATA_DIR      host path to bind-mount at /data instead (rare)
+#   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
+#   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
+set -euo pipefail
+
+IMAGE="${AI_MEMORY_IMAGE:-akitaonrails/ai-memory:latest}"
+DOCKER="${AI_MEMORY_DOCKER:-docker}"
+DATA_VOLUME="${AI_MEMORY_DATA_VOLUME:-ai-memory-data}"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/ai-memory"
+VERSION_CHECK_FILE="${CACHE_DIR}/last-version-check"
+HOOKS_STAGE_DIR="${HOME}/.local/share/ai-memory/hooks"
+WRAPPER_RAW_URL="${AI_MEMORY_WRAPPER_URL:-https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory}"
+
+# ---- version-check helpers (best-effort; never block the wrapper) --------
+
+local_digest() {
+  "${DOCKER}" image inspect --format='{{index .RepoDigests 0}}' "${IMAGE}" 2>/dev/null \
+    | sed 's/.*@//' || true
+}
+
+remote_digest() {
+  # docker manifest inspect was experimental pre-20.10; on modern
+  # docker it's stable. Silent on failure (offline, podman, etc.).
+  "${DOCKER}" manifest inspect "${IMAGE}" 2>/dev/null \
+    | grep -oE 'sha256:[a-f0-9]{64}' | head -n 1 || true
+}
+
+maybe_warn_outdated() {
+  [ -z "${AI_MEMORY_NO_VERSION_CHECK:-}" ] || return 0
+  # Skip in non-interactive contexts so we don't pollute pipes / CI.
+  [ -t 2 ] || return 0
+  # Skip if we checked within the last 24h (works on both BSD + GNU find).
+  if [ -f "${VERSION_CHECK_FILE}" ] \
+     && [ -z "$(find "${VERSION_CHECK_FILE}" -mtime +0 2>/dev/null)" ]; then
+    return 0
+  fi
+  mkdir -p "${CACHE_DIR}"
+  touch "${VERSION_CHECK_FILE}"
+  local local_d remote_d
+  local_d=$(local_digest)
+  remote_d=$(remote_digest)
+  [ -n "${local_d}" ] && [ -n "${remote_d}" ] || return 0
+  if [ "${local_d}" != "${remote_d}" ]; then
+    printf '\033[33mai-memory: a newer image is available on Docker Hub.\033[0m\n' >&2
+    printf '           run `ai-memory upgrade` to pull it + refresh hooks.\n' >&2
+  fi
+}
+
+# ---- upgrade subcommand --------------------------------------------------
+
+self_upgrade_script() {
+  command -v curl >/dev/null 2>&1 || { echo "  curl not found; skipping wrapper self-upgrade" >&2; return 0; }
+  # Portable script-path resolution (works without GNU readlink/realpath).
+  local script_dir script_path tmp
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+  echo "→ checking for wrapper script updates (${script_path})"
+  tmp="$(mktemp)" || return 0
+  if ! curl -fsSL "${WRAPPER_RAW_URL}" -o "${tmp}" 2>/dev/null; then
+    echo "  could not fetch ${WRAPPER_RAW_URL}; skipping self-upgrade"
+    rm -f "${tmp}"
+    return 0
+  fi
+  # Sanity: must look like our bash script. Refuse to install
+  # anything that doesn't start with the expected shebang.
+  if ! head -n1 "${tmp}" | grep -q '^#!/usr/bin/env bash'; then
+    echo "  downloaded file doesn't look like the ai-memory wrapper; skipping"
+    rm -f "${tmp}"
+    return 0
+  fi
+  if cmp -s "${tmp}" "${script_path}"; then
+    echo "  wrapper already up to date"
+    rm -f "${tmp}"
+    return 0
+  fi
+  chmod +x "${tmp}"
+  if ! mv "${tmp}" "${script_path}" 2>/dev/null; then
+    echo "  could not replace ${script_path} (permission denied?)"
+    echo "  rerun with: sudo install -m 0755 ${tmp} ${script_path}"
+    return 0
+  fi
+  echo "  ✓ wrapper updated — re-executing with the new version"
+  AI_MEMORY_SKIP_SELF_UPGRADE=1 exec "${script_path}" upgrade
+}
+
+cmd_upgrade() {
+  if [ -z "${AI_MEMORY_SKIP_SELF_UPGRADE:-}" ]; then
+    self_upgrade_script
+  fi
+  echo "→ pulling ${IMAGE}"
+  "${DOCKER}" pull "${IMAGE}"
+
+  local found_agents=()
+  if [ -d "${HOOKS_STAGE_DIR}" ]; then
+    for d in "${HOOKS_STAGE_DIR}"/*/; do
+      [ -d "${d}" ] || continue
+      found_agents+=("$(basename "${d}")")
+    done
+  fi
+
+  echo
+  if [ "${#found_agents[@]}" -gt 0 ]; then
+    echo "→ refreshing staged hook scripts for: ${found_agents[*]}"
+    for agent in "${found_agents[@]}"; do
+      # `install-hooks --apply` re-stages scripts AND idempotently
+      # rewrites the agent's settings.json entry. Safe to re-run:
+      # the seven hook keys we own get replaced; everything else
+      # (other hooks the user wired up) survives untouched.
+      echo "    ai-memory install-hooks --agent ${agent} --apply"
+      AI_MEMORY_NO_VERSION_CHECK=1 \
+      "$0" install-hooks --agent "${agent}" --apply \
+        || echo "      (skipped — re-run with the same --server-url / --auth-token used originally)"
+    done
+  else
+    echo "→ no staged hook scripts found at ${HOOKS_STAGE_DIR}"
+    echo "  (nothing to refresh — install-hooks hasn't been run with --apply yet)"
+  fi
+
+  echo
+  if "${DOCKER}" ps --filter "name=^ai-memory$" --format '{{.Names}}' 2>/dev/null \
+       | grep -q '^ai-memory$'; then
+    echo "→ restart the running ai-memory container to pick up the new image:"
+    if [ -f "$(pwd)/docker/docker-compose.yml" ] \
+       || [ -f "$(pwd)/docker-compose.yml" ]; then
+      echo "      docker compose up -d   # if you run via compose"
+    fi
+    echo "      docker stop ai-memory && docker rm ai-memory"
+    echo "      # then re-run your docker-run command (see README Quick start)"
+  fi
+
+  mkdir -p "${CACHE_DIR}"
+  touch "${VERSION_CHECK_FILE}"
+}
+
+# ---- intercept wrapper-only subcommands ----------------------------------
+
+case "${1:-}" in
+  upgrade)
+    shift
+    cmd_upgrade
+    exit 0
+    ;;
+esac
+
+# ---- normal pass-through to the binary inside docker ---------------------
+
+maybe_warn_outdated || true
+
+TTY_ARGS=()
+if [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+  TTY_ARGS=(-it)
+fi
+
+ENV_ARGS=()
+for var in \
+  AI_MEMORY_AUTH_TOKEN \
+  AI_MEMORY_LLM_PROVIDER \
+  AI_MEMORY_LLM_MODEL \
+  AI_MEMORY_LLM_BASE_URL \
+  AI_MEMORY_EMBEDDING_PROVIDER \
+  AI_MEMORY_EMBEDDING_MODEL \
+  AI_MEMORY_EMBEDDING_BASE_URL \
+  AI_MEMORY_EMBEDDING_DIM \
+  AI_MEMORY_ALLOWED_HOSTS \
+  ANTHROPIC_API_KEY \
+  OPENAI_API_KEY \
+  VOYAGE_API_KEY \
+  LLM_API_KEY \
+  RUST_LOG
+do
+  if [ -n "${!var:-}" ]; then
+    ENV_ARGS+=(-e "${var}")
+  fi
+done
+
+# Mount the data dir at /data so commands that open the store
+# (status, bootstrap, search, write-page, lint, embed, …) see the
+# same content the server sees. Bind-mount a host path if the user
+# overrode AI_MEMORY_DATA_DIR; otherwise use the named volume.
+DATA_ARGS=(-e "AI_MEMORY_DATA_DIR=/data")
+if [ -n "${AI_MEMORY_DATA_DIR:-}" ] && [ -d "${AI_MEMORY_DATA_DIR}" ]; then
+  DATA_ARGS+=(-v "${AI_MEMORY_DATA_DIR}:/data")
+else
+  DATA_ARGS+=(-v "${DATA_VOLUME}:/data")
+fi
+
+# Mount $HOME at the same path inside the container so:
+#   - dirs::home_dir() resolves identically (~/.claude/settings.json
+#     auto-detect works without --config-file)
+#   - install-hooks stages scripts into ~/.local/share/ai-memory/hooks/
+# Mount $PWD when it's outside $HOME (so install-instructions
+# --target ./CLAUDE.md and bootstrap with $PWD as repo-root work).
+PWD_ARGS=()
+case "${PWD}" in
+  "${HOME}"|"${HOME}"/*) : ;;  # already covered by the $HOME mount
+  *) PWD_ARGS=(-v "${PWD}:${PWD}") ;;
+esac
+
+exec "${DOCKER}" run --rm "${TTY_ARGS[@]}" \
+  -v "${HOME}:${HOME}" \
+  "${PWD_ARGS[@]}" \
+  -w "${PWD}" \
+  -e HOME="${HOME}" \
+  -u "$(id -u):$(id -g)" \
+  "${DATA_ARGS[@]}" \
+  "${ENV_ARGS[@]}" \
+  "${IMAGE}" "$@"

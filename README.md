@@ -30,55 +30,95 @@ You need: Docker + an agent CLI (Claude Code, Codex, OpenCode, Cursor,
 or anything else that speaks MCP).
 
 ```bash
-# 1. Generate a bearer token (one-time; save the output).
-export TOKEN=$(docker run --rm akitaonrails/ai-memory:latest generate-auth-token)
+# 1. Install the ai-memory CLI wrapper (a ~3 KB shell script that
+#    runs the binary inside docker with your $HOME mounted). This is
+#    the only thing that needs to live on the host filesystem.
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \
+    -o ~/.local/bin/ai-memory
+chmod +x ~/.local/bin/ai-memory
+# Most distros put ~/.local/bin on PATH automatically. If `which
+# ai-memory` comes up empty, add this to ~/.bashrc / ~/.zshrc:
+#     export PATH="$HOME/.local/bin:$PATH"
 
-# 2. Start the server. Replace the API keys (or omit the four
-#    -e AI_MEMORY_LLM_* / EMBEDDING_* lines for zero-LLM mode — FTS5
-#    search still works without any keys).
+# 2. Generate a bearer token (one-time; save it).
+export AI_MEMORY_AUTH_TOKEN=$(ai-memory generate-auth-token)
+
+# 3. Start the server. `--restart unless-stopped` makes it come back
+#    on docker daemon restart and on machine boot (provided your
+#    docker service is enabled at boot — `sudo systemctl enable
+#    docker` on most distros). Omit the LLM / EMBEDDING lines for
+#    zero-LLM mode — FTS5 search still works without any keys.
 docker run -d --name ai-memory \
+    --restart unless-stopped \
     -p 49374:49374 \
     -v ai-memory-data:/data \
-    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
+    -e AI_MEMORY_AUTH_TOKEN="$AI_MEMORY_AUTH_TOKEN" \
     -e AI_MEMORY_LLM_PROVIDER=anthropic \
     -e ANTHROPIC_API_KEY=sk-ant-... \
     -e AI_MEMORY_EMBEDDING_PROVIDER=openai \
     -e OPENAI_API_KEY=sk-... \
     akitaonrails/ai-memory:latest
 
-# 3. Wire your agent CLI to it. Claude Code shown below; for Codex,
-#    OpenCode, Cursor, Claude Desktop, Gemini CLI, OpenClaw, see
-#    docs/install.md.
-
-# 3a. Register the MCP endpoint (auto-edits ~/.claude/settings.json)
-docker run --rm -v "$HOME:/host" akitaonrails/ai-memory:latest \
-    install-mcp --client claude-code --apply \
-        --config-file /host/.claude/settings.json \
-        --server-url "http://localhost:49374/mcp" \
-        --auth-token "$TOKEN"
-
-# 3b. Extract the bundled hook scripts to your home dir
-docker cp ai-memory:/usr/local/share/ai-memory/hooks ~/.ai-memory/
-
-# 3c. Wire the hooks into ~/.claude/settings.json (also auto-edits)
-docker run --rm -v "$HOME:/host" akitaonrails/ai-memory:latest \
-    install-hooks --agent claude-code --apply \
-        --hooks-dir /host/.ai-memory/hooks \
-        --config-file /host/.claude/settings.json \
-        --server-url "http://localhost:49374" \
-        --auth-token "$TOKEN"
+# 4. Wire your agent CLI in two commands. The wrapper takes care of
+#    mounts + auto-detecting ~/.claude/settings.json. Re-run with
+#    `--agent codex`, `--agent opencode`, `--client cursor`, etc.
+#    for additional agents; full list in docs/install.md.
+ai-memory install-mcp   --client claude-code --apply \
+    --server-url "http://localhost:49374/mcp"
+ai-memory install-hooks --agent  claude-code --apply \
+    --server-url "http://localhost:49374"
 ```
 
-Both `install-mcp` and `install-hooks` accept `--apply` to **mutate
-the agent's config file in place** (idempotent — re-runs replace
-ai-memory's entry, preserving every other server / hook the user has
-configured; a timestamped `.bak-<ts>` is written next to the file
-before each modifying write). Drop `--apply` to keep the legacy
-print-the-JSON behaviour.
+Both `install-mcp` and `install-hooks` are idempotent — re-runs
+replace ai-memory's entry, preserve every other server / hook the
+user has configured, and write a timestamped `.bak-<ts>` next to the
+file before each modifying write. The hook scripts are staged into
+`~/.local/share/ai-memory/hooks/<agent>/` automatically; re-running
+overwrites them so future image updates ship updated hooks. Drop
+`--apply` to print the snippet instead of mutating.
 
 That's it. Start a Claude Code session as usual — every prompt and
 tool call now lands in ai-memory, and the next session you open in
 this project will see a handoff with where you left off.
+
+> **Prefer docker compose?** Clone the repo and run
+> `docker compose -f docker/docker-compose.yml up -d` instead of
+> step 3. The bundled compose file already has
+> `restart: unless-stopped`, a healthcheck, and the named volume
+> wired up; step 4 is identical.
+
+### Keeping ai-memory up to date
+
+The wrapper checks Docker Hub at most once every 24 hours and prints
+a one-line warning to stderr when a newer image is available. To
+upgrade:
+
+```bash
+ai-memory upgrade
+```
+
+In order: (1) self-upgrades the wrapper script itself by re-fetching
+`bin/ai-memory` from GitHub (validated against the shebang; falls
+back gracefully if curl is missing or perms block the in-place
+replacement), (2) `docker pull`s the latest image, (3) re-stages
+hook scripts under `~/.local/share/ai-memory/hooks/<agent>/` for
+every agent you've configured, and (4) tells you how to restart the
+server container so the new binary is picked up. The hook refresh
+is idempotent — re-running `install-hooks --apply` replaces the
+seven keys ai-memory owns and leaves every other hook the user has
+wired up alone. Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the
+daily check, or `AI_MEMORY_WRAPPER_URL=<url>` to pin the self-upgrade
+source (e.g. a fork or a tagged release).
+
+> **Inside ai-jail (or any bwrap sandbox)?** The wrapper at
+> `~/.local/bin/ai-memory` works fine — the sandbox bind-mounts
+> `~/.local` read-only, so the script is visible from inside, and
+> `/var/run/docker.sock` is already passed through. Run the
+> `install-*` commands *outside* ai-jail (they need to write to
+> `~/.local/share/ai-memory/hooks/`, which the sandbox keeps
+> read-only); daily use from inside the sandbox needs no binary at
+> all (agents reach ai-memory over MCP).
 
 **For everything else** — Codex, OpenCode, Cursor, Claude Desktop,
 Gemini CLI, OpenClaw, the curl-based hook installer (no docker
@@ -130,15 +170,9 @@ solves that by LLM-summarising your existing `git log`, README,
 ```bash
 # Run from your project's repo root (requires an LLM provider on the
 # server). Default settings ingest everything; budget caps at 50k
-# input tokens (~$0.04 with Kimi 2.6).
-docker run --rm \
-    -v ai-memory-data:/data \
-    -v "$PWD:/repo" \
-    -e AI_MEMORY_AUTH_TOKEN="$TOKEN" \
-    -e AI_MEMORY_LLM_PROVIDER=anthropic \
-    -e ANTHROPIC_API_KEY=sk-ant-... \
-    akitaonrails/ai-memory:latest \
-    bootstrap --repo-path /repo --workspace homelab --project myproj
+# input tokens (~$0.05 with Claude Haiku 4.5). The wrapper auto-mounts the
+# data volume and $PWD into the container.
+ai-memory bootstrap --workspace homelab --project myproj
 ```
 
 Bootstrap produces a `wiki/bootstrap.md` manifest listing every page
@@ -192,13 +226,12 @@ thinking to call `memory_query`. For projects where memory matters,
 one command installs the recommended snippet into your `CLAUDE.md`:
 
 ```bash
-docker run --rm -v "$PWD:/host" akitaonrails/ai-memory:latest \
-    install-instructions --target /host/CLAUDE.md
+ai-memory install-instructions --target ./CLAUDE.md
 ```
 
 The block is wrapped in `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` markers so re-running picks up an updated
-snippet without duplicating. Use `--target /host/AGENTS.md` for
+snippet without duplicating. Use `--target ./AGENTS.md` for
 non-Claude agents, or any other path for project-rules files
 (`.cursor/rules`, `.windsurfrules`, etc.). Append `--print` to
 preview without writing.
