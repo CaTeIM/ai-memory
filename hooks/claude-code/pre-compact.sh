@@ -1,9 +1,17 @@
 #!/bin/sh
 # Claude Code pre-compact hook.
-# Forwards the event JSON to the ai-memory server. Adds an
-# Authorization: Bearer header when AI_MEMORY_AUTH_TOKEN is set in
-# this hook's environment (set it via install-hooks --auth-token).
+# Forwards the event JSON to the ai-memory server, fire-and-forget.
+# Walks up from the payload's cwd for a .ai-memory.toml marker file;
+# if found, appends `&workspace=X&project=Y` to the URL so the server
+# routes the event to the declared workspace/project pair instead of
+# bucketing by basename(cwd) under the default workspace.
+. "$(dirname "$0")/_lib.sh"
+
 SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
+PAYLOAD=$(cat)
+CWD=$(ai_memory_extract_cwd "$PAYLOAD")
+QS=$(ai_memory_marker_qs "$CWD")
+
 post_hook() {
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
         curl -s --max-time 0.5 -X POST "$1" \
@@ -16,5 +24,7 @@ post_hook() {
             --data-binary @-
     fi
 }
-post_hook "$SERVER/hook?event=pre-compact&agent=claude-code" >/dev/null 2>&1 || true
+
+printf '%s' "$PAYLOAD" \
+    | post_hook "$SERVER/hook?event=pre-compact&agent=claude-code${QS}" >/dev/null 2>&1 || true
 exit 0
