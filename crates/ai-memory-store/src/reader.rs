@@ -6,6 +6,7 @@
 //! soft cap: a connection that comes back when the pool is already full
 //! is simply dropped.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +15,8 @@ use ai_memory_core::{
     PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 use parking_lot::Mutex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 // `ai_memory_core::Tier` is referenced via fully-qualified path inside the
 // DecayCandidate struct definition above to avoid a top-level import
@@ -938,94 +940,76 @@ impl ReaderPool {
             return Ok(Vec::new());
         }
         self.with_conn(move |conn| {
-            let seed_set: std::collections::HashSet<PageId> = seed_ids.iter().copied().collect();
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
 
-            let mut outgoing = conn.prepare(
-                "SELECT tp.id, tp.path, tp.title, substr(tp.body, 1, 240) \
-                 FROM links l \
-                 JOIN pages tp ON tp.id = l.to_page_id \
-                 WHERE l.from_page_id = ?1 \
-                   AND tp.workspace_id = ?2 \
-                   AND tp.project_id = ?3 \
-                   AND tp.is_latest = 1 \
-                 ORDER BY tp.updated_at DESC",
-            )?;
-            let mut incoming = conn.prepare(
-                "SELECT fp.id, fp.path, fp.title, substr(fp.body, 1, 240) \
-                 FROM links l \
-                 JOIN pages fp ON fp.id = l.from_page_id \
-                 WHERE l.to_page_id = ?1 \
-                   AND fp.workspace_id = ?2 \
-                   AND fp.project_id = ?3 \
-                   AND fp.is_latest = 1 \
-                 ORDER BY fp.updated_at DESC",
-            )?;
-
-            for seed_id in &seed_ids {
-                let rows = outgoing.query_map(
-                    params![
-                        seed_id.as_bytes(),
-                        workspace_id.as_bytes(),
-                        project_id.as_bytes()
-                    ],
-                    |row| {
-                        let id_bytes: Vec<u8> = row.get(0)?;
-                        let path: String = row.get(1)?;
-                        let title: String = row.get(2)?;
-                        let snippet: String = row.get(3)?;
-                        Ok((id_bytes, path, title, snippet))
-                    },
-                )?;
-                for row in rows {
-                    let (id_bytes, path, title, snippet) = row?;
-                    let id = PageId::from_slice(&id_bytes)?;
-                    if seed_set.contains(&id) || !seen.insert(id) {
-                        continue;
-                    }
-                    out.push(PageHit {
-                        id,
-                        path: PagePath::new(path)?,
-                        title,
-                        snippet,
-                        rank: 0.0,
-                    });
-                    if out.len() >= limit {
-                        return Ok(out);
-                    }
+            let mut values_clause = String::with_capacity(seed_ids.len() * 8);
+            let mut sql_params = Vec::with_capacity(seed_ids.len() * 2 + 4);
+            for (idx, seed_id) in seed_ids.iter().enumerate() {
+                if idx > 0 {
+                    values_clause.push_str(", ");
                 }
+                values_clause.push_str("(?, ?)");
+                sql_params.push(Value::Blob(seed_id.as_bytes().to_vec()));
+                sql_params.push(Value::Integer(idx as i64));
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
 
-                let rows = incoming.query_map(
-                    params![
-                        seed_id.as_bytes(),
-                        workspace_id.as_bytes(),
-                        project_id.as_bytes()
-                    ],
-                    |row| {
-                        let id_bytes: Vec<u8> = row.get(0)?;
-                        let path: String = row.get(1)?;
-                        let title: String = row.get(2)?;
-                        let snippet: String = row.get(3)?;
-                        Ok((id_bytes, path, title, snippet))
-                    },
-                )?;
-                for row in rows {
-                    let (id_bytes, path, title, snippet) = row?;
-                    let id = PageId::from_slice(&id_bytes)?;
-                    if seed_set.contains(&id) || !seen.insert(id) {
-                        continue;
-                    }
-                    out.push(PageHit {
-                        id,
-                        path: PagePath::new(path)?,
-                        title,
-                        snippet,
-                        rank: 0.0,
-                    });
-                    if out.len() >= limit {
-                        return Ok(out);
-                    }
+            let mut sql = String::with_capacity(values_clause.len() + 1_400);
+            write!(
+                &mut sql,
+                "WITH seeds(seed_id, seed_ord) AS (VALUES {values_clause}), \
+                 neighbors AS ( \
+                   SELECT tp.id AS id, tp.path AS path, tp.title AS title, \
+                          substr(tp.body, 1, 240) AS snippet, \
+                          seeds.seed_ord * 2 AS stream_ord, tp.updated_at AS updated_at \
+                   FROM seeds \
+                   JOIN links l ON l.from_page_id = seeds.seed_id \
+                   JOIN pages tp ON tp.id = l.to_page_id \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1 \
+                   UNION ALL \
+                   SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
+                          substr(fp.body, 1, 240) AS snippet, \
+                          seeds.seed_ord * 2 + 1 AS stream_ord, fp.updated_at AS updated_at \
+                   FROM seeds \
+                   JOIN links l ON l.to_page_id = seeds.seed_id \
+                   JOIN pages fp ON fp.id = l.from_page_id \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1 \
+                 ) \
+                 SELECT id, path, title, snippet \
+                 FROM neighbors \
+                 WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = neighbors.id) \
+                 ORDER BY stream_ord ASC, updated_at DESC"
+            )
+            .expect("writing SQL into String cannot fail");
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                Ok((id_bytes, path, title, snippet))
+            })?;
+
+            for row in rows {
+                let (id_bytes, path, title, snippet) = row?;
+                let id = PageId::from_slice(&id_bytes)?;
+                if !seen.insert(id) {
+                    continue;
+                }
+                out.push(PageHit {
+                    id,
+                    path: PagePath::new(path)?,
+                    title,
+                    snippet,
+                    rank: 0.0,
+                });
+                if out.len() >= limit {
+                    break;
                 }
             }
             Ok(out)

@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Same-body page upserts are now true no-ops, avoiding periodic watcher
   reconcile writes, FTS churn, and misleading recent-page timestamps.
+- Graph-neighbor expansion for hybrid search now batches all seed pages into
+  one SQL query instead of issuing incoming/outgoing lookups per seed.
+- Embedding backfill stores embeddings in chunks instead of one writer
+  command and SQLite transaction per page.
 - Documented the vector backend policy and the measured criteria required
   before adding `sqlite-vec`.
 - Clarified Gemini CLI support docs: MCP registration, lifecycle hooks,

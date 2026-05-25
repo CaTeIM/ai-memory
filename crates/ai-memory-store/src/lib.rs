@@ -21,7 +21,7 @@ mod writer;
 
 pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
-pub use ops::{PurgeSummary, ReorgSummary};
+pub use ops::{EmbeddingWrite, PurgeSummary, ReorgSummary};
 pub use reader::{
     ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
     EmbeddingTripleCount, ObservationHit, PageHit, PageHitWithMeta, PageMeta, PageSummary,

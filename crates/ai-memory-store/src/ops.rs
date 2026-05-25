@@ -51,6 +51,21 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
 
+/// One embedding upsert requested by a backfill or embed command.
+#[derive(Debug)]
+pub struct EmbeddingWrite {
+    /// Page receiving the embedding.
+    pub page_id: PageId,
+    /// Packed little-endian `f32` vector bytes.
+    pub vector_bytes: Vec<u8>,
+    /// Embedding provider name.
+    pub provider: String,
+    /// Embedding model name.
+    pub model: String,
+    /// Vector dimension.
+    pub dim: u32,
+}
+
 /// Upsert a page by path, superseding any existing latest version when the
 /// content (sha256 of body) has changed.
 ///
@@ -412,6 +427,39 @@ pub fn store_embedding(
              created_at = excluded.created_at",
         params![page_id.as_bytes(), vector_bytes, provider, model, dim, now,],
     )?;
+    Ok(())
+}
+
+/// Store / replace a batch of page embeddings in one transaction.
+pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) -> StoreResult<()> {
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO page_embeddings (page_id, vector, provider, model, dim, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(page_id) DO UPDATE SET \
+                 vector = excluded.vector, \
+                 provider = excluded.provider, \
+                 model = excluded.model, \
+                 dim = excluded.dim, \
+                 created_at = excluded.created_at",
+        )?;
+        for embedding in embeddings {
+            stmt.execute(params![
+                embedding.page_id.as_bytes(),
+                embedding.vector_bytes.as_slice(),
+                embedding.provider.as_str(),
+                embedding.model.as_str(),
+                embedding.dim,
+                now,
+            ])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1096,5 +1144,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model, "model-b", "latest model metadata wins");
+    }
+
+    #[test]
+    fn store_embeddings_batches_rows_in_one_call() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let p1 = upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body a")).unwrap();
+        let p2 = upsert_page(&mut conn, &page(ws, proj, "notes/b.md", "body b")).unwrap();
+
+        store_embeddings(
+            &mut conn,
+            &[
+                EmbeddingWrite {
+                    page_id: p1,
+                    vector_bytes: vec![0u8; 4],
+                    provider: "test".into(),
+                    model: "model".into(),
+                    dim: 1,
+                },
+                EmbeddingWrite {
+                    page_id: p2,
+                    vector_bytes: vec![1u8; 4],
+                    provider: "test".into(),
+                    model: "model".into(),
+                    dim: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM page_embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

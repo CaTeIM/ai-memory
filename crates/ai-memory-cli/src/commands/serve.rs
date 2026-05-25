@@ -7,7 +7,7 @@ use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{HookState, hook_router};
 use ai_memory_llm::{Embedder, LlmProvider, build_embedder, build_provider};
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
-use ai_memory_store::{ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{EmbeddingWrite, ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
 use ai_memory_web;
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
@@ -35,6 +35,7 @@ use crate::config::{Config, MaintenanceSettings};
 /// 10 MB is generous headroom; without a cap, axum streams unbounded
 /// bodies into memory (audit critical #2).
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+const EMBEDDING_WRITE_BATCH: usize = 100;
 
 struct ConsolidatorSetup {
     server: AiMemoryServer,
@@ -359,6 +360,7 @@ async fn run_embedding_backfill(
 
     let mut embedded = 0usize;
     let mut failed = 0usize;
+    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
     for cand in candidates {
         if already.contains(&cand.id) {
             continue;
@@ -379,23 +381,38 @@ async fn run_embedding_backfill(
                 continue;
             }
         };
-        if let Err(e) = writer
-            .store_embedding(
-                cand.id,
-                f32_vec_to_bytes(&vec),
-                provider.clone(),
-                model.clone(),
-                dim,
-            )
-            .await
-        {
-            failed += 1;
-            tracing::warn!(path = %cand.path, error = %e, "scheduled embed: store failed");
-            continue;
+        pending.push(EmbeddingWrite {
+            page_id: cand.id,
+            vector_bytes: f32_vec_to_bytes(&vec),
+            provider: provider.clone(),
+            model: model.clone(),
+            dim,
+        });
+        if pending.len() >= EMBEDDING_WRITE_BATCH {
+            flush_embedding_batch(writer, &mut pending, &mut embedded, &mut failed).await;
         }
-        embedded += 1;
     }
+    flush_embedding_batch(writer, &mut pending, &mut embedded, &mut failed).await;
     Ok((embedded, failed))
+}
+
+async fn flush_embedding_batch(
+    writer: &WriterHandle,
+    pending: &mut Vec<EmbeddingWrite>,
+    embedded: &mut usize,
+    failed: &mut usize,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
+    let count = batch.len();
+    if let Err(e) = writer.store_embeddings(batch).await {
+        *failed += count;
+        tracing::warn!(count, error = %e, "scheduled embed: batch store failed");
+    } else {
+        *embedded += count;
+    }
 }
 
 async fn configure_embedder(

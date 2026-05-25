@@ -32,7 +32,9 @@ use ai_memory_core::{
     DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider};
-use ai_memory_store::{DecayParams, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{
+    DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
+};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use axum::Json;
 use axum::Router;
@@ -46,6 +48,8 @@ use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
+
+const EMBEDDING_WRITE_BATCH: usize = 100;
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -939,6 +943,7 @@ async fn handle_embed(
     let mut skipped = 0_usize;
     let mut failed = 0_usize;
     let mut would_embed = 0_usize;
+    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
 
     for cand in candidates {
         if !req.reembed && already.contains(&cand.id) {
@@ -965,18 +970,18 @@ async fn handle_embed(
                 continue;
             }
         };
-        let bytes = f32_vec_to_bytes(&vec);
-        if let Err(e) = state
-            .writer
-            .store_embedding(cand.id, bytes, provider.clone(), model.clone(), dim)
-            .await
-        {
-            warn!(path = %cand.path, error = %e, "embed: store_embedding failed");
-            failed += 1;
-            continue;
+        pending.push(EmbeddingWrite {
+            page_id: cand.id,
+            vector_bytes: f32_vec_to_bytes(&vec),
+            provider: provider.clone(),
+            model: model.clone(),
+            dim,
+        });
+        if pending.len() >= EMBEDDING_WRITE_BATCH {
+            flush_embedding_batch(&state.writer, &mut pending, &mut embedded, &mut failed).await;
         }
-        embedded += 1;
     }
+    flush_embedding_batch(&state.writer, &mut pending, &mut embedded, &mut failed).await;
 
     let report = EmbedReport {
         embedded,
@@ -991,6 +996,25 @@ async fn handle_embed(
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     ))
+}
+
+async fn flush_embedding_batch(
+    writer: &WriterHandle,
+    pending: &mut Vec<EmbeddingWrite>,
+    embedded: &mut usize,
+    failed: &mut usize,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
+    let count = batch.len();
+    if let Err(e) = writer.store_embeddings(batch).await {
+        *failed += count;
+        warn!(count, error = %e, "embed: store_embeddings failed");
+    } else {
+        *embedded += count;
+    }
 }
 
 // ---------------------------------------------------------------------

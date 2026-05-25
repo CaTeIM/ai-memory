@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{StoreError, StoreResult};
-use crate::ops::{self, PurgeSummary, ReorgSummary};
+use crate::ops::{self, EmbeddingWrite, PurgeSummary, ReorgSummary};
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
@@ -88,6 +88,10 @@ pub(crate) enum WriteCmd {
         provider: String,
         model: String,
         dim: u32,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    StoreEmbeddingBatch {
+        embeddings: Vec<EmbeddingWrite>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Delete a project and all its data (pages, sessions, observations,
@@ -280,6 +284,20 @@ impl WriterHandle {
             provider,
             model,
             dim,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Store or replace a batch of embeddings in one SQLite transaction.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn store_embeddings(&self, embeddings: Vec<EmbeddingWrite>) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StoreEmbeddingBatch {
+            embeddings,
             reply: tx,
         })
         .await?;
@@ -574,6 +592,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     dim,
                 );
                 send_or_warn(reply, result, "store_embedding");
+            }
+            WriteCmd::StoreEmbeddingBatch { embeddings, reply } => {
+                let result = ops::store_embeddings(&mut conn, &embeddings);
+                send_or_warn(reply, result, "store_embeddings");
             }
             WriteCmd::PurgeProject {
                 workspace_id,
