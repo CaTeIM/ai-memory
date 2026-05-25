@@ -5,7 +5,11 @@
 # if found, appends `&workspace=X&project=Y` to the URL so the server
 # routes the event to the declared workspace/project pair instead of
 # bucketing by basename(cwd) under the default workspace.
-. "$(dirname "$0")/_lib.sh"
+# At runtime (after `install-hooks --apply`) `_lib.sh` is staged
+# alongside this script. From the source tree it lives one dir up.
+_lib_dir="$(dirname "$0")"
+[ -f "$_lib_dir/_lib.sh" ] || _lib_dir="$_lib_dir/.."
+. "$_lib_dir/_lib.sh"
 
 SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
 PAYLOAD=$(cat)
