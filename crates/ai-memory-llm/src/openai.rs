@@ -362,6 +362,16 @@ fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
                 map.retain(|k, _| k == "$ref");
                 return;
             }
+            // OpenAI strict mode rejects `oneOf` outright but accepts
+            // `anyOf`. schemars 1.x emits `oneOf` for every Rust enum
+            // with tagged variants (closed sets where exactly one
+            // branch matches), e.g. `Tier` and `PageKind` under `$defs`
+            // in `ConsolidatedBatch`. For non-overlapping branches the
+            // rewrite is semantically lossless and unblocks every
+            // structured-output call that touches an enum.
+            if let Some(one_of) = map.remove("oneOf") {
+                map.insert("anyOf".to_string(), one_of);
+            }
             let is_object = map
                 .get("type")
                 .and_then(|t| t.as_str())
@@ -590,6 +600,38 @@ mod tests {
             1,
             "only $ref should remain on the node"
         );
+    }
+
+    #[test]
+    fn enforce_strict_renames_oneof_to_anyof() {
+        // OpenAI structured-output strict mode rejects `oneOf` outright
+        // ("In context=(), 'oneOf' is not permitted") while accepting
+        // `anyOf`. schemars 1.x emits `oneOf` for every Rust enum with
+        // tagged variants — e.g. the `Tier` and `PageKind` enums under
+        // `$defs` in `ConsolidatedBatch`. For closed enum sets where
+        // exactly one branch matches per value, `anyOf` is semantically
+        // equivalent (no two branches overlap), so the rewrite is
+        // lossless.
+        let mut schema = json!({
+            "type": "object",
+            "$defs": {
+                "Tier": {
+                    "oneOf": [
+                        { "type": "string", "const": "working" },
+                        { "type": "string", "const": "episodic" }
+                    ]
+                }
+            },
+            "properties": { "tier": { "$ref": "#/$defs/Tier" } }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let tier_def = &schema["$defs"]["Tier"];
+        assert!(
+            tier_def.get("oneOf").is_none(),
+            "oneOf must be rewritten away"
+        );
+        let any_of = tier_def.get("anyOf").expect("oneOf must become anyOf");
+        assert_eq!(any_of.as_array().unwrap().len(), 2);
     }
 
     #[test]
