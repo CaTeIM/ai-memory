@@ -4,7 +4,7 @@
 //! 1. Writing a page through `Wiki::write_page` with an embedder
 //!    attached actually persists an embedding row.
 //! 2. The hybrid RRF path returns sensible results.
-//! 3. The refuse-on-mismatch check flags heterogeneous
+//! 3. The mismatch diagnostic query flags heterogeneous
 //!    `(provider, model, dim)` triples.
 //!
 //! The test uses [`SyntheticEmbedder`] — a deterministic bag-of-words
@@ -92,7 +92,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         );
     }
 
-    // 2. Refuse-on-mismatch reports stale triples.
+    // 2. Mismatch diagnostics report stale triples.
     let mismatch_with_wrong_dim = store
         .reader
         .embedding_meta_for_mismatch(

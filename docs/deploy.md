@@ -219,7 +219,7 @@ ssh "$SERVER" "tail -100 $DEPLOY_DIR/data/logs/ai-memory.log.$(date +%F)"
 - **Embedding mismatch after a model change**: startup logs a warning
   when stored `(provider, model, dim)` triples differ from config.
   Hybrid search ignores stale rows until they are re-embedded. Start
-  the server normally, then run `ai-memory embed --reembed` (or rely
+  the server normally, then run `ai-memory embed --force` (or rely
   on scheduled embedding backfill if enabled).
 - **Container restart loop**: check
   `docker logs ai-memory` - the `ai-memory starting` line at the top

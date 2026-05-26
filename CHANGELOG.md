@@ -71,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker images now bundle both POSIX and PowerShell hook scripts.
 
 ### Fixed
+- `serve` now warns and starts when stored embedding rows were created with a
+  different `(provider, model, dim)` than the current config. Hybrid search
+  ignores stale rows until `ai-memory embed --force` or scheduled backfill
+  re-embeds them, avoiding the previous startup deadlock.
 - Session capture now persists every documented agent kind (`cursor`,
   `gemini-cli`, `claude-desktop`, `openclaw`, `omp` / `pi`) instead of
   failing the `sessions.agent_kind` database CHECK for agents added after

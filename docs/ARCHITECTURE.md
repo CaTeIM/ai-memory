@@ -162,7 +162,7 @@ backpressure, or single-writer SQLite actor.
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `links` | Wikilink / markdown cross-references with `to_page_id` nullable for unresolved forward links. |
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
-| `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised for refuse-on-mismatch checks and missing-embedding diagnostics. |
+| `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
 **Memory tiers (M8 policy):**

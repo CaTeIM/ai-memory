@@ -147,6 +147,14 @@ impl RuntimeEnv {
             ..Self::default()
         }
     }
+
+    #[cfg(test)]
+    pub fn with_openai_api_key_for_tests(api_key: impl Into<String>) -> Self {
+        Self {
+            openai_api_key: Some(SecretString::from(api_key.into())),
+            ..Self::default()
+        }
+    }
 }
 
 /// Accept `Vec<String>` either as a real sequence (config.toml /

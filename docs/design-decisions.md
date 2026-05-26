@@ -218,7 +218,7 @@ Top-line rules carved into the codebase:
 4. Hooks fire-and-forget (agentmemory #221, #143).
 5. No background-task index-after-return; either sync or `index_status: pending` (basic-memory #763).
 6. 3-tuple identity from day one (basic-memory #783/#834).
-7. Vector index records `{provider, model, dim}`; refuse on mismatch (agentmemory #469).
+7. Vector index records `{provider, model, dim}`; ignore stale vectors and warn on mismatch (agentmemory #469).
 8. Embedding cache path absolute, not `/tmp` (basic-memory #741).
 9. Watcher heartbeat + reconciliation pass (basic-memory #580/#758/#798).
 10. Live-process check before destructive ops (basic-memory #765).

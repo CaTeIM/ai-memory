@@ -428,8 +428,8 @@ async fn configure_embedder(
     store: &Store,
     wiki: Wiki,
 ) -> Result<(Wiki, Option<Arc<dyn Embedder>>)> {
-    // M9 — pluggable embedder. Refuse to start if any stored
-    // embeddings disagree with the configured (provider, model, dim).
+    // M9 — pluggable embedder. Stored rows carry provider/model/dim so
+    // query paths can ignore stale vectors after an embedding config change.
     let Some(cfg) = config.embedder_config()? else {
         info!("AI_MEMORY_EMBEDDING_PROVIDER unset; hybrid search disabled (FTS5-only)");
         return Ok((wiki, None));
@@ -444,18 +444,18 @@ async fn configure_embedder(
         )
         .await?;
     if !mismatch.is_empty() {
-        // Refuse-on-mismatch applies to hybrid search (queries only load
+        // Mismatch handling applies to hybrid search (queries only load
         // rows matching the configured triple), not to process liveness.
-        // Blocking startup made `embed --reembed` impossible because the
+        // Blocking startup made `embed --force` impossible because the
         // CLI is an HTTP client to this server.
         tracing::warn!(
             stored = ?mismatch,
-            configured_provider = cfg.provider.name(),
-            configured_model = %cfg.model,
-            configured_dim = cfg.dim,
+            configured_provider = embedder.provider(),
+            configured_model = embedder.model(),
+            configured_dim = embedder.dim(),
             "stored embeddings use a different (provider, model, dim) than configured; \
              hybrid search ignores stale rows until pages are re-embedded — \
-             run `ai-memory embed --reembed` (or wait for scheduled backfill)"
+             run `ai-memory embed --force` (or wait for scheduled backfill)"
         );
     }
     info!(
@@ -606,6 +606,9 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{PagePath, Tier};
+    use ai_memory_llm::SyntheticEmbedder;
+    use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -652,5 +655,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn embedder_mismatch_warns_but_keeps_server_startable() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let synthetic: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(64));
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_embedder(synthetic);
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/old-embedding.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "old embedding"}),
+            body: "existing vector row".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+        })
+        .await
+        .unwrap();
+
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            embedding_provider: Some("openai".into()),
+            runtime_env: crate::config::RuntimeEnv::with_openai_api_key_for_tests("test-key"),
+            ..Config::default()
+        };
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let (_wiki, embedder) = configure_embedder(&cfg, &store, wiki).await.unwrap();
+
+        let embedder = embedder.expect("configured embedder should be enabled");
+        assert_eq!(embedder.provider(), "openai");
     }
 }
