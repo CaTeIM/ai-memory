@@ -123,12 +123,18 @@ main() {
   assert_contains "${TMP_ROOT}/etc/passwd" "ai-memory service user:/var/lib/ai-memory:/usr/bin/nologin"
   assert_contains "${TMP_ROOT}/etc/group" "ai-memory"
 
-  log "Checking tmpfiles in dry-run alternate root"
-  tmpfiles_output="$(systemd-tmpfiles --root="${TMP_ROOT}" --create --dry-run "${TMP_ROOT}/usr/lib/tmpfiles.d/ai-memory.conf" 2>&1)"
-  case "${tmpfiles_output}" in
-    *"/var/lib/ai-memory"*) ;;
-    *) fail "tmpfiles dry-run did not plan /var/lib/ai-memory: ${tmpfiles_output}" ;;
-  esac
+  log "Checking tmpfiles in alternate root"
+  if systemd-tmpfiles --help 2>&1 | grep -q -- '--dry-run'; then
+    tmpfiles_output="$(systemd-tmpfiles --root="${TMP_ROOT}" --create --dry-run "${TMP_ROOT}/usr/lib/tmpfiles.d/ai-memory.conf" 2>&1)"
+    case "${tmpfiles_output}" in
+      *"/var/lib/ai-memory"*) ;;
+      *) fail "tmpfiles dry-run did not plan /var/lib/ai-memory: ${tmpfiles_output}" ;;
+    esac
+  else
+    systemd-tmpfiles --root="${TMP_ROOT}" --create "${TMP_ROOT}/usr/lib/tmpfiles.d/ai-memory.conf" >/dev/null
+    test -d "${TMP_ROOT}/var/lib/ai-memory" || fail "tmpfiles did not create /var/lib/ai-memory in alternate root"
+    test "$(stat -c '%a' "${TMP_ROOT}/var/lib/ai-memory")" = "750" || fail "tmpfiles created /var/lib/ai-memory with unexpected mode"
+  fi
   assert_contains packaging/tmpfiles/ai-memory.conf "d /var/lib/ai-memory 0750 ai-memory ai-memory -"
 
   log "Checking systemd units in alternate root"
