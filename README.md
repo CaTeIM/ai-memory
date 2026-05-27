@@ -96,6 +96,17 @@ priors are at the [bottom](#influences-and-prior-art).
   `memory_query X` from the agent (or `ai-memory search X` from a
   terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
   the hit is a coherent decision page, not a raw chat log.
+- **"Remember this permanently."** When something is worth keeping
+  beyond auto-captured session logs - a decision, a convention, a
+  gotcha - tell the agent "save a permanent note that we standardised
+  on Postgres for X" or "annotate this as a project rule" and it calls
+  `memory_write_page` to write a durable, git-versioned wiki page. From
+  a terminal it's `ai-memory write-page --path decisions/0007-db.md
+  --title "Standardised on Postgres" --body "..." --pinned` (`--pinned`
+  exempts it from the decay sweep). Unlike a handoff (single-use) or an
+  auto-synthesised session page (rewritten on consolidation), a
+  write-page note is yours: it shows up in `memory_query`, renders in
+  `/web`, and stays until you change it.
 - **"This new project has months of history before ai-memory."**
   `cd /path/to/my-project && ai-memory bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and

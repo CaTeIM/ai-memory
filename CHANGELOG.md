@@ -6,7 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `anthropic-oauth` LLM provider: use a Claude Pro/Max subscription via
+  `claude setup-token` instead of an API key. In-Rust, reuses the existing
+  Anthropic Messages client (incl. structured output). **Unofficial and
+  against Anthropic's usage policies — use at your own risk** (docs warn
+  prominently).
+- Opt-in `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`: when set and an LLM provider
+  is configured, SessionEnd additionally runs LLM consolidation on top of the
+  always-written rule-based summary page (non-fatal on failure) ([#40]).
+
+### Changed
+- Docs recommend a small/fast model (Haiku/mini class) for the OAuth /
+  subscription LLM backends — consolidation/lint/explore is summarisation, not
+  hard reasoning, and small models are far easier on subscription rate limits.
+- Aligned every prompt surface + doc with actual SessionEnd behavior: it always
+  writes a rule-based summary page + handoff; LLM consolidation runs on
+  PreCompact, on demand via `memory_consolidate`, and at session end only
+  behind the new opt-in flag ([#40]).
+
 ### Fixed
+- Windows own-write detection: `inode_of` now returns the real NTFS file index
+  (was always `0`, which collapsed the watcher's own-write set) ([#37]).
+- `ai-memory upgrade` no longer fails with `invalid value 'lib' for --agent` —
+  the hook-refresh loop skips the shared `lib/` helper dir ([#38]).
 - Native packaging CI now supports non-root runners whose `systemd-tmpfiles`
   lacks `--dry-run`, while still operating only inside a temporary alternate
   root.
