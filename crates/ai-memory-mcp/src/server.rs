@@ -221,6 +221,14 @@ struct SweepArgs {
     /// If true, preview only. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// Project to sweep. Omit to target the project you're currently working
+    /// in (resolved from recent hook activity). **Omit unless the user
+    /// explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace the project lives in. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -233,6 +241,14 @@ struct LintArgs {
     /// fast rule-based checks. Default false.
     #[serde(default)]
     no_llm: Option<bool>,
+    /// Project to audit. Omit to target the project you're currently working
+    /// in (resolved from recent hook activity). **Omit unless the user
+    /// explicitly names a *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace the project lives in. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -354,9 +370,16 @@ struct WritePageArgs {
     #[serde(default)]
     pinned: bool,
     /// Project to write into. Omit to target the project you're currently
-    /// working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
+    /// working in (resolved from recent hook activity). When set to a name
+    /// that doesn't exist yet, the project is **created** — so writes always
+    /// land where you asked, never silently in the current project. **Omit
+    /// unless the user explicitly names a *different* project.**
     #[serde(default)]
     project: Option<String>,
+    /// Workspace to write into. Only honoured together with an explicit
+    /// `project`; created if it doesn't exist. Omit for the current workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[tool_router]
@@ -473,6 +496,40 @@ impl AiMemoryServer {
             .ok_or_else(|| {
                 McpError::internal_error(format!("project '{project}' not found"), None)
             })?;
+        Ok((workspace_id, project_id))
+    }
+
+    /// Resolve the target for a WRITE, **creating** the workspace/project when
+    /// an explicit name doesn't exist yet. Distinct from [`Self::effective_ids`]
+    /// (find-only, for reads): a write to a named project must land there, not
+    /// silently fall back to the current project. With no explicit `project`,
+    /// the active-project-wins behaviour is preserved (issue #2).
+    async fn write_target_ids(
+        &self,
+        explicit_workspace: Option<&str>,
+        explicit_project: Option<&str>,
+    ) -> Result<(WorkspaceId, ProjectId), McpError> {
+        let Some(project) = trimmed_opt(explicit_project) else {
+            // No explicit project → current project (hook-published active, or
+            // the baked default). Explicit workspace alone has nothing to scope.
+            return Ok(self
+                .active_project
+                .get()
+                .unwrap_or((self.workspace_id, self.project_id)));
+        };
+        let workspace_id = match trimmed_opt(explicit_workspace) {
+            Some(name) => self
+                .writer
+                .get_or_create_workspace(name.to_string())
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => self.workspace_id,
+        };
+        let project_id = self
+            .writer
+            .get_or_create_project(workspace_id, project.to_string(), None)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok((workspace_id, project_id))
     }
 
@@ -724,11 +781,14 @@ impl AiMemoryServer {
         &self,
         Parameters(args): Parameters<SweepArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let report = run_sweep(
             &self.reader,
             &self.writer,
-            self.workspace_id,
-            self.project_id,
+            ws,
+            proj,
             &self.decay_params,
             args.dry_run.unwrap_or(false),
         )
@@ -752,12 +812,15 @@ impl AiMemoryServer {
                 None,
             ));
         };
+        let (ws, proj) = self
+            .effective_ids_for_read_args(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
         let report = run_lint(
             &self.reader,
             wiki,
             self.llm.as_ref(),
-            self.workspace_id,
-            self.project_id,
+            ws,
+            proj,
             args.dry_run.unwrap_or(false),
             !args.no_llm.unwrap_or(false),
         )
@@ -827,7 +890,9 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
-        let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let (ws, proj) = self
+            .write_target_ids(args.workspace.as_deref(), args.project.as_deref())
+            .await?;
 
         let mut fm = serde_json::Map::new();
         if let Some(title) = &args.title {
@@ -1860,6 +1925,7 @@ mod tests {
                 tags: vec!["finance".into()],
                 pinned: true,
                 project: None,
+                workspace: None,
             }))
             .await
             .unwrap();
@@ -1888,6 +1954,80 @@ mod tests {
         assert!(
             recent_text.contains("notes/santander-2025.md"),
             "write-page result must be visible to read tools; got {recent_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_write_page_creates_explicit_project() {
+        // Bug B regression: an explicit `project` that doesn't exist yet must
+        // be created and written to — NOT silently land in the current project.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let baked = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(Parameters(WritePageArgs {
+                path: "notes/elsewhere.md".into(),
+                body: "lands in `other`, not `scratch`".into(),
+                title: None,
+                tier: Some("semantic".into()),
+                tags: vec![],
+                pinned: false,
+                project: Some("other".into()),
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+
+        // Visible in `other` (created), absent from the baked `scratch`.
+        let in_other = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(5),
+                project: Some("other".into()),
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let other_text = in_other
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            other_text.contains("notes/elsewhere.md"),
+            "explicit project must be created + written; got {other_text}"
+        );
+
+        let in_scratch = server
+            .memory_recent(Parameters(RecentArgs {
+                limit: Some(5),
+                project: None,
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+        let scratch_text = in_scratch
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !scratch_text.contains("notes/elsewhere.md"),
+            "write must not leak into the current project; got {scratch_text}"
         );
     }
 
@@ -2027,6 +2167,8 @@ mod tests {
             .memory_lint(Parameters(LintArgs {
                 dry_run: Some(true),
                 no_llm: None,
+                project: None,
+                workspace: None,
             }))
             .await
             .expect_err("must reject when wiki is not attached");
@@ -2037,6 +2179,81 @@ mod tests {
         assert!(
             msg.contains("wiki") || msg.contains("not configured"),
             "error should explain the missing wiki: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_forget_sweep_targets_the_explicit_project() {
+        // Bug C regression: sweep must evaluate the project named in args (or
+        // the session's active project), NOT the baked default. An episodic
+        // page in `audited` is a sweep candidate only when the sweep points
+        // there — never when it runs against the baked `scratch`.
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let baked = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, baked)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(Parameters(WritePageArgs {
+                path: "log/ep.md".into(),
+                body: "episodic note".into(),
+                title: None,
+                tier: Some("episodic".into()),
+                tags: vec![],
+                pinned: false,
+                project: Some("audited".into()),
+                workspace: None,
+            }))
+            .await
+            .unwrap();
+
+        let sweep_count = |args: SweepArgs| {
+            let server = &server;
+            async move {
+                let out = server.memory_forget_sweep(Parameters(args)).await.unwrap();
+                let text = out
+                    .content
+                    .first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.clone())
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["candidates_evaluated"]
+                    .as_u64()
+                    .unwrap()
+            }
+        };
+
+        let audited = sweep_count(SweepArgs {
+            dry_run: Some(true),
+            project: Some("audited".into()),
+            workspace: None,
+        })
+        .await;
+        assert!(
+            audited >= 1,
+            "sweep of the named project must evaluate its episodic page, got {audited}"
+        );
+
+        let baked = sweep_count(SweepArgs {
+            dry_run: Some(true),
+            project: None,
+            workspace: None,
+        })
+        .await;
+        assert_eq!(
+            baked, 0,
+            "sweep of the baked project must not see another project's page, got {baked}"
         );
     }
 
