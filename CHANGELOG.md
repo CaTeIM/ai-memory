@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Multi-user attribution (v0.8 Phase 1, rolling out across milestones
+  P1.1–P1.8).** ai-memory's data model stays single-tenant — every
+  authenticated request sees every page — but writes can now be
+  attributed to a named user. Five `ai-memory user` subcommands
+  (`add`, `list`, `expire`, `revive`, `rotate-token`) manage a `users`
+  table; the auth middleware resolves every request to one of four
+  tiers (Anonymous, Root, DB user, 401), injects an
+  `Extension<ActorContext>` + `Extension<AuthLevel>` for downstream
+  consumers, and gates the root-only admin user-management endpoints.
+  Tokens are 32 bytes of OS CSPRNG, stored only as
+  `SHA-256(token || ":" || token_pepper)` (per-server pepper from
+  `[auth].token_pepper`, auto-generated on `ai-memory init`); see
+  [`docs/users.md`](docs/users.md) for the SHA-256-not-argon2id
+  rationale, the four-rung auth ladder, and the backward-compat
+  migration for pre-v0.8 installs. New v0.8 fields on `[auth]`:
+  `root_username` / `root_email` / `root_name` (label for the bearer
+  token's writes) and `token_pepper`. Per-page `author_id` + web UI
+  surfacing lands in P1.6/P1.7; this milestone set ships P1.1
+  (`ActorContext` + `UserId` in core), P1.2 (table + writer/reader
+  ops + V14 migration), P1.3 (auth middleware), P1.4 (root-gated
+  `POST/GET /admin/users` + `…/expire|revive|rotate-token`), and P1.5
+  (CLI subcommands). **No behaviour change for existing single-user
+  installs**: without `[auth].token_pepper` the multi-user lookup
+  stays dormant, user-management endpoints 503 with a clear
+  `multi-user not enabled` message pointing at `ai-memory init`,
+  and the existing `bearer_token`-only flow keeps authenticating
+  exactly as before.
 - **`memory_query { global: true }` — cross-project global search** that
   reaches every project in every workspace in one call, with each hit
   annotated by its workspace + project so the agent can tell where it

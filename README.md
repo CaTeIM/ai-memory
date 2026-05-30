@@ -288,6 +288,17 @@ Bearer auth protects `/mcp`, `/hook`, `/handoff`, `/admin/*`, and
 as the password. Non-loopback binds should also set
 `AI_MEMORY_ALLOWED_HOSTS` to guard against DNS rebinding.
 
+**Multi-user attribution (v0.8, optional).** When more than one human
+shares a server, ai-memory can attribute each write to a named user.
+The bearer token continues to authenticate at the wire level; users
+created via `ai-memory user add` get their own tokens that resolve to
+their identity in audit logs (and, in subsequent milestones, page
+frontmatter + the web UI). Data stays single-tenant — there is no
+RBAC. Existing single-user installs are not affected unless you opt
+in by setting `[auth].token_pepper` (auto-generated for new installs
+by `ai-memory init`). See [`docs/users.md`](docs/users.md) for the
+full walkthrough and the four-rung auth ladder.
+
 See [`docs/deploy.md`](docs/deploy.md) for the full homelab pattern
 with bearer auth, host allowlisting, and TLS/reverse-proxy options.
 
@@ -445,6 +456,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, native source builds, and current hook/MCP harness caveats. |
 | [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, TLS via cloudflared. |
+| [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
 | [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) | **Read before running purge / rename / backup / restore / reset.** Safety matrix for the state-touching commands, per-project disk layout (how isolation actually works), and operator workflows for "fresh start", "snapshot before risky op", "drop one project". |
 | [`docs/llm-provider-comparison.md`](docs/llm-provider-comparison.md) | Empirical notes behind the recommended LLM defaults. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Operational summary: data flow, crate layout, cross-cutting invariants, schema. |
