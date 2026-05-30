@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-30
+
 ### Fixed
 - **Consolidation no longer fails on long sessions** (~5,000+ observations or
   multi-hour agent runs). Two bugs surfaced trying to consolidate a real
@@ -624,7 +626,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.1
 [0.8.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.8.0
 [0.7.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.1
 [0.7.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.7.0
