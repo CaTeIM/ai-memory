@@ -33,6 +33,11 @@ pub(crate) enum WriteCmd {
         repo_path: Option<String>,
         reply: oneshot::Sender<StoreResult<ProjectId>>,
     },
+    EnsureProjectWorkspace {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     UpsertPage {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
@@ -233,6 +238,27 @@ impl WriterHandle {
             workspace_id,
             name: name.into(),
             repo_path,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Assert that a project still belongs to the supplied workspace.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::NotFound`] when the `(workspace_id, project_id)`
+    /// pair is stale, [`StoreError::WriterClosed`] if the actor has shut down,
+    /// or propagates the SQL error.
+    pub async fn ensure_project_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnsureProjectWorkspace {
+            workspace_id,
+            project_id,
             reply: tx,
         })
         .await?;
@@ -730,6 +756,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     repo_path.as_deref(),
                 );
                 send_or_warn(reply, result, "get_or_create_project");
+            }
+            WriteCmd::EnsureProjectWorkspace {
+                workspace_id,
+                project_id,
+                reply,
+            } => {
+                let result = ops::ensure_project_workspace(&conn, &workspace_id, &project_id);
+                send_or_warn(reply, result, "ensure_project_workspace");
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);

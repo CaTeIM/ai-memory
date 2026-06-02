@@ -39,7 +39,7 @@ use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapsho
 use ai_memory_store::{
     DecayParams, EmbeddingWrite, ReaderPool, StoreError, WriterHandle, f32_vec_to_bytes,
 };
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WikiError, WritePageRequest};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -51,7 +51,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const EMBEDDING_WRITE_BATCH: usize = 100;
 
@@ -1702,20 +1702,11 @@ pub struct PathConflict {
     pub moved_to: String,
 }
 
-/// Lossless cross-workspace move: rename the project's on-disk dir to the
-/// destination workspace, then re-stamp its `workspace_id` across every domain
-/// table (one transaction, same `project_id`). The caller has already verified
-/// the destination has no same-named project.
-///
-/// Ordering is deliberately rename-FIRST, SQL-commit-LAST so the **DB is never
-/// ahead of disk**: a rename failure touches nothing; a crash between the two
-/// steps leaves at most an orphan dir at the destination with the DB still
-/// wholly pointing at the source (recoverable), never a DB row pointing at a
-/// missing file. On a SQL failure the dir is renamed back (the op is
-/// symmetric), so the move is all-or-nothing. During the brief window between
-/// rename and commit, any watcher reindex of the moved files attempts an INSERT
-/// under `(dst_ws, proj)` that the V18 pairing trigger rejects cleanly (the
-/// project still lives in `src_ws`), so no split-brain row is created.
+/// Lossless cross-workspace move: under the wiki mutation gate, rename the
+/// project's on-disk dir to the destination workspace, then re-stamp its
+/// `workspace_id` across every domain table (one transaction, same
+/// `project_id`). The caller has already verified the destination has no
+/// same-named project.
 async fn true_move_project(
     state: &Arc<AdminState>,
     req: &MoveProjectRequest,
@@ -1735,7 +1726,8 @@ async fn true_move_project(
     };
 
     // A true move targets a FRESH destination, so its dir must not already
-    // exist. Check before the rename so a stale leftover can never be clobbered.
+    // exist. Wiki::move_project_workspace repeats this check under the
+    // exclusive mutation guard before it renames anything.
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
         return (
@@ -1749,64 +1741,42 @@ async fn true_move_project(
         );
     }
 
-    // 1) Rename the dir FIRST — before any DB change. A failure here leaves
-    //    everything untouched.
-    if let Err(e) = state.wiki.rename_project_dir(src_proj, src_ws, dst_ws) {
-        warn!(
-            error = %e,
-            "true-move: dir rename failed before any DB change — nothing moved"
-        );
-        return internal_err(format!(
-            "move aborted (nothing changed): on-disk dir rename failed: {e}"
-        ));
-    }
+    let move_ctx = AdmissionContext {
+        workspace: req.from_workspace.clone(),
+        project: req.project.clone(),
+        destination_workspace: Some(req.to_workspace.clone()),
+        destination_project: Some(req.project.clone()),
+        op: AdmissionOp::MoveProject,
+        ..Default::default()
+    };
 
-    // 2) Re-stamp the DB LAST. On failure, rename the dir back so the move is
-    //    all-or-nothing and the DB never ends up ahead of disk.
+    // Wiki owns the critical section: it runs move admission, renames the dir,
+    // re-stamps SQLite, and rolls the dir back on SQL failure while normal page
+    // writes/reindexes are blocked by the same process-local gate.
     let summary = match state
-        .writer
-        .move_project_workspace(src_proj, src_ws, dst_ws)
+        .wiki
+        .move_project_workspace(src_proj, src_ws, dst_ws, Some(move_ctx))
         .await
     {
         Ok(s) => s,
+        Err(WikiError::Store(StoreError::NotFound(msg))) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": msg })),
+            );
+        }
+        Err(WikiError::Io(e))
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && e.to_string().contains("destination dir already exists") =>
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         Err(e) => {
-            let src_dir = state.wiki.project_root(src_ws, src_proj);
-            match state.wiki.rename_project_dir(src_proj, dst_ws, src_ws) {
-                Ok(()) => {
-                    warn!(
-                        error = %e,
-                        "true-move: DB re-stamp failed; renamed the dir back — nothing moved"
-                    );
-                    return match e {
-                        StoreError::NotFound(msg) => (
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({ "error": msg })),
-                        ),
-                        other => internal_err(format!(
-                            "move aborted (nothing changed): DB re-stamp failed: {other}"
-                        )),
-                    };
-                }
-                Err(rollback_err) => {
-                    // Double fault: files are at the destination but the DB
-                    // re-stamp failed AND the rename-back failed. Surface a
-                    // precise manual-repair message.
-                    error!(
-                        error = %e,
-                        rollback_error = %rollback_err,
-                        src = %src_dir.display(),
-                        dst = %dst_dir.display(),
-                        "true-move: DB re-stamp failed AND dir rename-back failed — manual repair required"
-                    );
-                    return internal_err(format!(
-                        "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir \
-                         rename-back also failed ({rollback_err}); manually move {} -> {} or finish \
-                         the re-stamp",
-                        dst_dir.display(),
-                        src_dir.display()
-                    ));
-                }
-            }
+            warn!(error = %e, "true-move: move aborted before completion");
+            return internal_err(format!("move aborted (nothing changed): {e}"));
         }
     };
 
@@ -1892,6 +1862,24 @@ async fn dedup_dest_path(
         }
         n += 1;
     }
+}
+
+fn page_copy_differs(
+    existing: &ai_memory_store::StoredPageBody,
+    source: &Markdown,
+    source_title: &str,
+    source_tier: Tier,
+    source_pinned: bool,
+) -> bool {
+    let source_frontmatter = match serde_json::to_string(&source.frontmatter) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    existing.body != source.body
+        || existing.frontmatter_json != source_frontmatter
+        || existing.title != source_title
+        || existing.tier != source_tier.as_str()
+        || existing.pinned != source_pinned
 }
 
 async fn handle_move_project(
@@ -1987,21 +1975,27 @@ async fn handle_move_project(
     };
 
     // Pre-scan for same-path conflicts (destination already holds the path with
-    // DIFFERENT content). Under the default `block` policy, abort the WHOLE move
-    // now — before anything is copied — so the source stays intact and the
-    // operator resolves them or re-runs with an explicit overwrite/duplicate.
+    // a different body, frontmatter, title, tier, or pinned bit). Under the
+    // default `block` policy, abort the WHOLE move now — before anything is
+    // copied — so the source stays intact and the operator resolves them or
+    // re-runs with an explicit overwrite/duplicate.
     if req.on_conflict == OnConflict::Block {
         let mut blocking: Vec<String> = Vec::new();
         for s in &summaries {
             let Ok(path) = PagePath::new(s.path.clone()) else {
                 continue;
             };
+            let tier: Tier = s.tier.parse().unwrap_or(Tier::Semantic);
+            let pinned = matches!(
+                state.reader.page_meta(&req.from_workspace, &req.project, &s.path).await,
+                Ok(Some(ref m)) if m.pinned
+            );
             if let Ok(Some(existing)) = state
                 .reader
                 .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
                 .await
                 && let Ok(md) = state.wiki.read_page(src_ws, src_proj, &path)
-                && existing.body != md.body
+                && page_copy_differs(&existing, &md, &s.title, tier, pinned)
             {
                 blocking.push(s.path.clone());
             }
@@ -2083,43 +2077,46 @@ async fn handle_move_project(
                 continue;
             }
         };
-        // Same-path conflict (destination holds this path with DIFFERENT
-        // content): apply the on_conflict policy. Identical content always falls
-        // through to a no-op supersession at the same path. `block` was already
-        // handled by the pre-scan above (we never get here with a real conflict).
+        // Same-path conflict (destination holds this path with DIFFERENT page
+        // body/metadata): apply the on_conflict policy. Identical pages always
+        // fall through to a no-op supersession at the same path. `block` was
+        // already handled by the pre-scan above (we never get here with a real
+        // conflict).
         let dest_path = match state
             .reader
             .page_body_by_ids(dst_ws, dst_proj, s.path.as_str())
             .await
         {
-            Ok(Some(existing)) if existing.body != md.body => match req.on_conflict {
-                OnConflict::Duplicate => {
-                    let deduped = dedup_dest_path(
-                        &state,
-                        dst_ws,
-                        dst_proj,
-                        &s.path,
-                        &req.from_workspace,
-                        &used_dest_paths,
-                    )
-                    .await;
-                    conflicts.push(PathConflict {
-                        path: s.path.clone(),
-                        moved_to: deduped.as_str().to_string(),
-                    });
-                    deduped
+            Ok(Some(existing)) if page_copy_differs(&existing, &md, &s.title, tier, pinned) => {
+                match req.on_conflict {
+                    OnConflict::Duplicate => {
+                        let deduped = dedup_dest_path(
+                            &state,
+                            dst_ws,
+                            dst_proj,
+                            &s.path,
+                            &req.from_workspace,
+                            &used_dest_paths,
+                        )
+                        .await;
+                        conflicts.push(PathConflict {
+                            path: s.path.clone(),
+                            moved_to: deduped.as_str().to_string(),
+                        });
+                        deduped
+                    }
+                    // Overwrite: the source page supersedes the destination page at
+                    // the same path (the dest's prior version becomes history).
+                    OnConflict::Overwrite => {
+                        conflicts.push(PathConflict {
+                            path: s.path.clone(),
+                            moved_to: s.path.clone(),
+                        });
+                        path.clone()
+                    }
+                    OnConflict::Block => path.clone(),
                 }
-                // Overwrite: the source page supersedes the destination page at
-                // the same path (the dest's prior version becomes history).
-                OnConflict::Overwrite => {
-                    conflicts.push(PathConflict {
-                        path: s.path.clone(),
-                        moved_to: s.path.clone(),
-                    });
-                    path.clone()
-                }
-                OnConflict::Block => path.clone(),
-            },
+            }
             // No content conflict — but the natural path may already have been
             // CLAIMED by an earlier page's de-duplication (duplicate mode). If
             // so, de-duplicate this one too rather than clobbering the page that

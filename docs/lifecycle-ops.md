@@ -139,22 +139,30 @@ a low-level re-stamp:
 1. Resolve the source `(from_workspace, project)`. 404 on miss.
 2. Reject `from_workspace == to_workspace` (use `rename-project`) → 422.
 3. Get-or-create the destination **workspace** row (not a new project).
-4. Re-stamp `workspace_id` across every domain table for the project in
+4. Take the wiki's exclusive mutation gate and run `op=move_project` admission
+   webhooks with source names in `ctx.workspace` / `ctx.project` and
+   destination names in `ctx.destination_workspace` /
+   `ctx.destination_project`. A reject-policy webhook aborts before files or DB
+   rows move.
+5. While still holding that gate, check that the destination dir is still
+   absent, then `fs::rename` the project dir
+   `<wiki>/<from_ws>/<proj>` → `<wiki>/<to_ws>/<proj>` (atomic within one
+   wiki root).
+6. Re-stamp `workspace_id` across every domain table for the project in
    **one transaction**, keeping the same `project_id`
    (`projects`, `pages`, `sessions`, `observations`, `handoffs`,
    `audit_log`). `page_embeddings` and `links` are keyed by `page_id`, so
    they follow with no re-stamp.
-5. `fs::rename` the project dir
-   `<wiki>/<from_ws>/<proj>` → `<wiki>/<to_ws>/<proj>` (atomic within one
-   wiki root). The destination dir is pre-checked to be absent first. Ordering
-   is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of disk**:
-   a rename failure touches nothing; a crash between the two steps leaves at
-   most an orphan dir at the destination with the DB still wholly at the
-   source (recoverable), never a DB row pointing at a missing file. A SQL
-   failure renames the dir back, so the move is all-or-nothing. During the
-   brief window, any watcher reindex of the moved files attempts an INSERT
-   under `(dst_ws, proj)` that the V18 pairing trigger rejects cleanly (the
-   project still lives in `src_ws`), so no split-brain row is created.
+
+Ordering is **rename-FIRST, SQL-commit-LAST**, so the **DB is never ahead of
+disk**: a rename failure touches nothing; a crash between the two steps leaves
+at most an orphan dir at the destination with the DB still wholly at the source
+(recoverable), never a DB row pointing at a missing file. A SQL failure renames
+the dir back, so the move is all-or-nothing unless the filesystem also refuses
+the rollback, in which case the error names the manual repair. In-process page
+writes/reindexes take the shared side of the same mutation gate and validate the
+`(workspace_id, project_id)` pair before touching disk, so stale source writes
+fail without creating orphan files after the move.
 
 This is O(1) (one transaction + one rename), re-embeds nothing, and
 **preserves everything** — sessions, observations, handoffs and the full
@@ -164,8 +172,9 @@ supersession history all travel with the project.
 hook router has published as the *active* project (a live session's next
 observation would carry a now-stale `workspace_id`). Pass `--force` /
 `force: true` to override — still safe: the move republishes the active
-pointer, and the `(workspace_id, project_id)` insert trigger (V18) rejects
-any stale write cleanly, so the router re-resolves instead of corrupting.
+pointer, and the wiki pair validator plus `(workspace_id, project_id)` insert
+trigger (V18) reject stale writes cleanly, so the router re-resolves instead of
+corrupting or creating old-workspace files.
 
 **2. Destination already has a same-named project → `"copy-purge"`
 (merge).** Two distinct `project_id`s can't be re-stamped into one (it
@@ -182,8 +191,9 @@ blocks the purge (`source_purged: false`) so a fixed re-run is safe
 (re-running is idempotent — copied pages just supersede).
 
 **Same-path conflicts (`on_conflict`).** When a source page's path already
-exists in the destination with **different** content, the policy decides
-(identical content is always a no-op supersession at the same path):
+exists in the destination with a different body, frontmatter, title, tier, or
+pinned bit, the policy decides (identical pages are always a no-op supersession
+at the same path):
 
 - **`block`** (default) — abort the whole move with 409, listing the
   conflicting paths; the source is left intact. The safe default for a
@@ -218,8 +228,9 @@ Failure modes:
 - **Missing `--confirm`** → 400.
 - **`from_workspace == to_workspace`** → 422 (use `rename-project`).
 - **Source project not found** → 404.
-- **Re-stamp committed but dir rename failed** (true-move, exceptional fs
-  error) → 500 with the exact `mv <src> <dst>` to run to reconcile.
+- **True-move admission, rename, or SQL re-stamp failure** → 500 and no
+  committed move. If a rare rollback double-fault happens after the directory
+  moved but before SQL committed, the error includes the exact manual repair.
 
 ### `backup`
 

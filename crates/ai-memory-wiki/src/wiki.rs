@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use ai_memory_core::{NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier, WorkspaceId};
 use ai_memory_llm::Embedder;
-use ai_memory_store::{ReaderPool, WriterHandle, f32_vec_to_bytes};
+use ai_memory_store::{MoveSummary, ReaderPool, WriterHandle, f32_vec_to_bytes};
+use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
 use crate::atomic;
@@ -50,6 +51,11 @@ pub struct Wiki {
     /// empty `workspace`/`project` strings and must fall back to
     /// IDs/headers/`_unscoped` paths.
     store_reader: Option<ReaderPool>,
+    /// Process-local gate around filesystem mutations. Page writes/reindexes
+    /// take a shared guard; project true-move takes the exclusive guard across
+    /// the directory rename and SQLite re-stamp so stale writes cannot land
+    /// files under the old workspace while the project is in flight.
+    mutation_lock: Arc<RwLock<()>>,
 }
 
 impl Wiki {
@@ -71,6 +77,7 @@ impl Wiki {
             sanitizer: Sanitizer::builtin(),
             admission_chain: None,
             store_reader: None,
+            mutation_lock: Arc::new(RwLock::new(())),
         })
     }
 
@@ -170,38 +177,102 @@ impl Wiki {
             .join(project_id.to_string())
     }
 
-    /// Move a project's on-disk directory from one workspace to another,
-    /// keeping the same `project_id` segment:
-    /// `<wiki_root>/<from_ws>/<proj>` → `<wiki_root>/<to_ws>/<proj>`.
+    /// Losslessly move a project to another workspace: rename its on-disk
+    /// directory and re-stamp every store row that carries `workspace_id`, while
+    /// keeping the same `project_id`.
     ///
-    /// Both paths share the same `<wiki_root>`, so `fs::rename` is an atomic
-    /// metadata-only operation on every supported filesystem — no per-file
-    /// copy, no re-embed. The destination workspace directory is created
-    /// first. This pairs with
-    /// [`WriterHandle::move_project_workspace`](ai_memory_store) — callers
-    /// re-stamp SQLite first, then call this to land the files at the path the
-    /// re-stamped rows already point at, so the watcher's own-write
-    /// short-circuit absorbs the resulting events.
+    /// The exclusive mutation guard is held across both filesystem and store
+    /// phases. That keeps in-process page writes/reindexes from observing the
+    /// project half-moved; stale callers that still carry `(from_workspace,
+    /// project_id)` only resume after the DB re-stamp and then fail the pair
+    /// validator before touching disk.
+    ///
+    /// Ordering is rename-first, SQL-last so the DB is never ahead of disk. If
+    /// the SQL re-stamp fails after a rename, the directory is renamed back.
     ///
     /// # Errors
-    /// Propagates [`WikiError::Io`] if the destination already exists or the
-    /// rename fails (e.g. cross-device, which cannot happen within one root).
-    pub fn rename_project_dir(
+    /// Returns [`WikiError`] if the destination directory already exists, the
+    /// rename fails, the SQL re-stamp fails, or rollback fails.
+    pub async fn move_project_workspace(
         &self,
         project_id: ProjectId,
         from_workspace: WorkspaceId,
         to_workspace: WorkspaceId,
-    ) -> WikiResult<()> {
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<MoveSummary> {
+        let _guard = self.mutation_lock.write().await;
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::MoveProject;
+            self.resolve_admission_names(from_workspace, project_id, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+
         let src = self.project_root(from_workspace, project_id);
-        if !src.exists() {
-            // Nothing on disk to move (a project with zero written pages).
-            return Ok(());
-        }
         let dst = self.project_root(to_workspace, project_id);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+
+        if dst.exists() {
+            return Err(crate::WikiError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "destination dir already exists: {}; refusing true-move",
+                    dst.display()
+                ),
+            )));
         }
-        std::fs::rename(&src, &dst)?;
+
+        let renamed = if src.exists() {
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&src, &dst)?;
+            true
+        } else {
+            // Nothing on disk to move (a project with zero written pages).
+            false
+        };
+
+        match self
+            .writer
+            .move_project_workspace(project_id, from_workspace, to_workspace)
+            .await
+        {
+            Ok(summary) => {
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+                }
+                Ok(summary)
+            }
+            Err(e) => {
+                if renamed {
+                    if let Some(parent) = src.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if let Err(rollback_err) = std::fs::rename(&dst, &src) {
+                        return Err(crate::WikiError::Io(std::io::Error::other(format!(
+                            "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
+                            dst.display(),
+                            src.display()
+                        ))));
+                    }
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn ensure_project_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        self.writer
+            .ensure_project_workspace(workspace_id, project_id)
+            .await?;
         Ok(())
     }
 
@@ -278,6 +349,10 @@ impl Wiki {
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
     ) -> WikiResult<()> {
+        let _guard = self.mutation_lock.read().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
@@ -415,6 +490,10 @@ impl Wiki {
         project_id: ProjectId,
         path: PagePath,
     ) -> WikiResult<PageId> {
+        let _guard = self.mutation_lock.read().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
@@ -449,10 +528,11 @@ impl Wiki {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        // Pre-compute markdown + tempfile for each request.
+        // Pre-compute markdown for each request. Filesystem work happens only
+        // after the mutation guard + project/workspace validation below.
         let mut staged: Vec<(
             WritePageRequest,
-            tempfile::NamedTempFile,
+            String,
             std::path::PathBuf,
             Option<AdmissionContext>,
         )> = Vec::with_capacity(requests.len());
@@ -489,51 +569,67 @@ impl Wiki {
                 .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &req.path));
             let emitted = emit(&markdown)?;
             let abs = self.abs_path(req.workspace_id, req.project_id, &req.path);
-            let parent = abs.parent().ok_or_else(|| {
-                ai_memory_wiki_error("page path has no parent (cannot stage tempfile)")
-            })?;
-            std::fs::create_dir_all(parent)?;
-            let mut tmp = tempfile::Builder::new()
-                .prefix(".ai-memory-tmp.")
-                .tempfile_in(parent)?;
-            use std::io::Write as _;
-            tmp.write_all(emitted.as_bytes())?;
-            tmp.as_file().sync_data()?;
             req.frontmatter = markdown.frontmatter;
             req.body = markdown.body;
             let req_with_title = WritePageRequest {
                 title: Some(title),
                 ..req
             };
-            staged.push((req_with_title, tmp, abs, resolved_ctx));
+            staged.push((req_with_title, emitted, abs, resolved_ctx));
         }
 
-        // Build NewPage batch with the precomputed titles.
-        let pages: Vec<ai_memory_core::NewPage> = staged
-            .iter()
-            .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                workspace_id: req.workspace_id,
-                project_id: req.project_id,
-                path: req.path.clone(),
-                title: req.title.clone().unwrap_or_default(),
-                body: req.body.clone(),
-                tier: req.tier,
-                frontmatter_json: req.frontmatter.clone(),
-                pinned: req.pinned || is_slot_path(&req.path),
-                links: extract_links(&req.body, &req.path),
-                author_id: req.author_id,
-            })
-            .collect();
+        let (ids, dispatches) = {
+            let _guard = self.mutation_lock.read().await;
+            let mut staged_files: Vec<(
+                WritePageRequest,
+                tempfile::NamedTempFile,
+                std::path::PathBuf,
+                Option<AdmissionContext>,
+            )> = Vec::with_capacity(staged.len());
+            for (req, emitted, abs, ctx) in staged {
+                self.ensure_project_workspace(req.workspace_id, req.project_id)
+                    .await?;
+                let parent = abs.parent().ok_or_else(|| {
+                    ai_memory_wiki_error("page path has no parent (cannot stage tempfile)")
+                })?;
+                std::fs::create_dir_all(parent)?;
+                let mut tmp = tempfile::Builder::new()
+                    .prefix(".ai-memory-tmp.")
+                    .tempfile_in(parent)?;
+                use std::io::Write as _;
+                tmp.write_all(emitted.as_bytes())?;
+                tmp.as_file().sync_data()?;
+                staged_files.push((req, tmp, abs, ctx));
+            }
 
-        let ids = self.writer.upsert_pages_batch(pages).await?;
+            // Build NewPage batch with the precomputed titles.
+            let pages: Vec<ai_memory_core::NewPage> = staged_files
+                .iter()
+                .map(|(req, _, _, _)| ai_memory_core::NewPage {
+                    workspace_id: req.workspace_id,
+                    project_id: req.project_id,
+                    path: req.path.clone(),
+                    title: req.title.clone().unwrap_or_default(),
+                    body: req.body.clone(),
+                    tier: req.tier,
+                    frontmatter_json: req.frontmatter.clone(),
+                    pinned: req.pinned || is_slot_path(&req.path),
+                    links: extract_links(&req.body, &req.path),
+                    author_id: req.author_id,
+                })
+                .collect();
 
-        // SQL succeeded; rename tempfiles into place.
-        let mut dispatches = Vec::with_capacity(staged.len());
-        for (req, tmp, abs, ctx) in staged {
-            let persisted = tmp.persist(&abs)?;
-            persisted.sync_data()?;
-            dispatches.push((req.path, req.frontmatter, req.body, ctx));
-        }
+            let ids = self.writer.upsert_pages_batch(pages).await?;
+
+            // SQL succeeded; rename tempfiles into place.
+            let mut dispatches = Vec::with_capacity(staged_files.len());
+            for (req, tmp, abs, ctx) in staged_files {
+                let persisted = tmp.persist(&abs)?;
+                persisted.sync_data()?;
+                dispatches.push((req.path, req.frontmatter, req.body, ctx));
+            }
+            (ids, dispatches)
+        };
 
         if let Some(chain) = &self.admission_chain {
             for (path, frontmatter, body, ctx) in &dispatches {
@@ -620,34 +716,42 @@ impl Wiki {
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links = extract_links(&markdown.body, &path);
 
-        let emitted = emit(&markdown)?;
-        let abs = self.abs_path(workspace_id, project_id, &path);
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        atomic::write_atomic(&abs, emitted.as_bytes())?;
-
         let Markdown {
             frontmatter: final_frontmatter,
             body: final_body,
         } = markdown;
         let path_for_dispatch = path.clone();
         let frontmatter_for_dispatch = final_frontmatter.clone();
-        let page_id = self
-            .writer
-            .upsert_page(NewPage {
-                workspace_id,
-                project_id,
-                path,
-                title,
-                body: final_body.clone(),
-                tier,
-                frontmatter_json: final_frontmatter,
-                pinned,
-                links,
-                author_id,
-            })
-            .await?;
+        let emitted = emit(&Markdown {
+            frontmatter: final_frontmatter.clone(),
+            body: final_body.clone(),
+        })?;
+
+        let page_id = {
+            let _guard = self.mutation_lock.read().await;
+            self.ensure_project_workspace(workspace_id, project_id)
+                .await?;
+            let abs = self.abs_path(workspace_id, project_id, &path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            atomic::write_atomic(&abs, emitted.as_bytes())?;
+
+            self.writer
+                .upsert_page(NewPage {
+                    workspace_id,
+                    project_id,
+                    path,
+                    title,
+                    body: final_body.clone(),
+                    tier,
+                    frontmatter_json: final_frontmatter,
+                    pinned,
+                    links,
+                    author_id,
+                })
+                .await?
+        };
         // Embed if configured. We do this on the caller's task so the
         // tool reply still happens "indexes commit in the same
         // transaction" (basic-memory #763 lesson): no fire-and-forget

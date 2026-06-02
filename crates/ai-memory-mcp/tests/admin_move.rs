@@ -16,10 +16,15 @@
 use ai_memory_core::{PagePath, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
 use ai_memory_store::{DecayParams, Store};
-use ai_memory_wiki::{Wiki, WritePageRequest};
+use ai_memory_wiki::{
+    AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
+};
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::routing::post as axum_post;
+use axum::{Json, Router};
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -70,6 +75,39 @@ async fn post(state: AdminState, uri: &str, body: serde_json::Value) -> axum::re
 
 /// Seed `<ws>/<project>/<path>` with one page carrying `body`.
 async fn seed_page(store: &Store, wiki: &Wiki, ws: &str, project: &str, path: &str, body: &str) {
+    seed_page_with_metadata(
+        store,
+        wiki,
+        ws,
+        project,
+        path,
+        body,
+        SeedPageOptions {
+            frontmatter: serde_json::json!({"title": path}),
+            title: Some(path.into()),
+            tier: Tier::Semantic,
+            pinned: false,
+        },
+    )
+    .await;
+}
+
+struct SeedPageOptions {
+    frontmatter: serde_json::Value,
+    title: Option<String>,
+    tier: Tier,
+    pinned: bool,
+}
+
+async fn seed_page_with_metadata(
+    store: &Store,
+    wiki: &Wiki,
+    ws: &str,
+    project: &str,
+    path: &str,
+    body: &str,
+    options: SeedPageOptions,
+) {
     let ws_id = store.writer.get_or_create_workspace(ws).await.unwrap();
     let proj = store
         .writer
@@ -80,11 +118,11 @@ async fn seed_page(store: &Store, wiki: &Wiki, ws: &str, project: &str, path: &s
         workspace_id: ws_id,
         project_id: proj,
         path: PagePath::new(path.to_string()).unwrap(),
-        frontmatter: serde_json::json!({"title": path}),
+        frontmatter: options.frontmatter,
         body: body.to_string(),
-        tier: Tier::Semantic,
-        pinned: false,
-        title: Some(path.into()),
+        tier: options.tier,
+        pinned: options.pinned,
+        title: options.title,
         admission_ctx: None,
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
@@ -546,6 +584,127 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
     assert_eq!(obs[0].workspace_id, dst_ws, "observation re-stamped to dst");
 }
 
+#[tokio::test]
+async fn true_move_stale_source_write_fails_before_creating_file() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    let stale_wiki = state.wiki.clone();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let stale_path = PagePath::new("notes/stale.md".to_string()).unwrap();
+    let err = stale_wiki
+        .write_page(WritePageRequest {
+            workspace_id: src_ws,
+            project_id: src_proj,
+            path: stale_path.clone(),
+            frontmatter: serde_json::json!({"title": "stale"}),
+            body: "must not land".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: Some("stale".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("does not belong to workspace"),
+        "stale write should fail at the pair validator: {err}"
+    );
+    assert!(
+        !stale_wiki.abs_path(src_ws, src_proj, &stale_path).exists(),
+        "stale write must not create an orphan file under the old workspace"
+    );
+}
+
+#[tokio::test]
+async fn true_move_notifies_admission_with_destination_names() {
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_route = seen.clone();
+    let app = Router::new().route(
+        "/hook",
+        axum_post(
+            move |headers: HeaderMap, Json(payload): Json<serde_json::Value>| {
+                let seen = seen_for_route.clone();
+                async move {
+                    let mut payload = payload;
+                    payload["op_header"] = headers
+                        .get("X-Memory-Op")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .into();
+                    seen.lock().unwrap().push(payload);
+                    StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Reject,
+        events: vec![AdmissionOp::MoveProject],
+        blocking: true,
+    }])
+    .unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_admission_chain(chain)
+        .with_store_reader(store.reader.clone());
+    let state = AdminState {
+        writer: store.writer.clone(),
+        reader: store.reader.clone(),
+        wiki,
+        llm: None,
+        embedder: None,
+        provider_health: ai_memory_llm::ProviderHealth::default(),
+        decay_params: DecayParams::default(),
+        data_dir: tmp.path().to_path_buf(),
+        db_path: store.db_path().to_path_buf(),
+        bind: "127.0.0.1:0".to_string(),
+        bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        token_pepper: None,
+        active_project: ai_memory_core::ActiveProject::new(),
+        on_project_moved: None,
+    };
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "body a").await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rec = seen.lock().unwrap();
+    assert_eq!(rec.len(), 1, "move_project admission must fire once");
+    assert_eq!(rec[0]["op_header"], "move_project");
+    assert_eq!(rec[0]["ctx"]["workspace"], "src");
+    assert_eq!(rec[0]["ctx"]["project"], "proj");
+    assert_eq!(rec[0]["ctx"]["destination_workspace"], "dst");
+    assert_eq!(rec[0]["ctx"]["destination_project"], "proj");
+    assert_eq!(rec[0]["page"]["path"], "");
+}
+
 // ---------------------------------------------------------------------------
 // Rework (PR #60 review): failure model, live-session guard, copy-purge
 // conflict/partial/idempotency, copy-purge embedding carry-over.
@@ -840,6 +999,67 @@ async fn copy_purge_conflict_blocks_by_default() {
         dst_paths,
         vec!["notes/a.md"],
         "destination unchanged — nothing copied"
+    );
+}
+
+/// `on_conflict=block` must treat metadata differences as conflicts too. A
+/// same body/title/frontmatter with a different pinned bit would otherwise be
+/// silently overwritten by the copy path.
+#[tokio::test]
+async fn copy_purge_conflict_blocks_metadata_difference_by_default() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let fm = serde_json::json!({"title": "same"});
+    seed_page_with_metadata(
+        &store,
+        &state.wiki,
+        "src",
+        "proj",
+        "notes/a.md",
+        "same body",
+        SeedPageOptions {
+            frontmatter: fm.clone(),
+            title: Some("same".into()),
+            tier: Tier::Semantic,
+            pinned: false,
+        },
+    )
+    .await;
+    seed_page_with_metadata(
+        &store,
+        &state.wiki,
+        "dst",
+        "proj",
+        "notes/a.md",
+        "same body",
+        SeedPageOptions {
+            frontmatter: fm,
+            title: Some("same".into()),
+            tier: Tier::Semantic,
+            pinned: true,
+        },
+    )
+    .await;
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({ "from_workspace": "src", "project": "proj", "to_workspace": "dst", "confirm": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert_eq!(body["conflicts"], json!(["notes/a.md"]), "{body}");
+
+    let (src_ws, _) = ids(&store, "src", "proj").await;
+    assert!(
+        store
+            .reader
+            .find_project(src_ws, "proj".to_string())
+            .await
+            .unwrap()
+            .is_some(),
+        "metadata conflict must leave the source intact"
     );
 }
 

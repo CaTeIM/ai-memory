@@ -142,6 +142,32 @@ pub fn get_or_create_project(
     Ok(id)
 }
 
+/// Assert that `project_id` currently belongs to `workspace_id`.
+///
+/// Wiki writes call this before touching the filesystem so a stale hook/cache
+/// carrying the old workspace for a moved project fails before it can create an
+/// orphan file. The pairing INSERT triggers are still the final SQL backstop.
+pub fn ensure_project_workspace(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
+) -> StoreResult<()> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![project_id.as_bytes(), workspace_id.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if found.is_some() {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound(format!(
+            "project {project_id} does not belong to workspace {workspace_id}"
+        )))
+    }
+}
+
 /// Upsert a batch of pages inside one transaction. Either *all* pages
 /// land (each becoming the new `is_latest=true` version) or none do.
 ///
@@ -1156,7 +1182,9 @@ mod tests {
     //! deserve direct coverage so a regression surfaces with a
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
-    use ai_memory_core::{LinkTarget, NewHandoff, NewPage, NewSession, PagePath, Tier};
+    use ai_memory_core::{
+        LinkTarget, NewHandoff, NewPage, NewSession, PagePath, Tier, WorkspaceId,
+    };
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -2010,6 +2038,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(src_pages, 1, "rollback must preserve source pages");
+    }
+
+    #[test]
+    fn ensure_project_workspace_rejects_stale_pair_before_disk_write() {
+        let (_tmp, conn, ws, proj) = fresh_db();
+        let other_ws = WorkspaceId::new();
+
+        ensure_project_workspace(&conn, &ws, &proj).unwrap();
+        assert!(
+            matches!(
+                ensure_project_workspace(&conn, &other_ws, &proj),
+                Err(StoreError::NotFound(_))
+            ),
+            "a stale workspace/project pair must fail before wiki writes touch disk"
+        );
+    }
+
+    #[test]
+    fn v18_migration_refuses_existing_split_brain_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        crate::migrations::run_to(&mut conn, 17).unwrap();
+
+        let src_ws = get_or_create_workspace(&mut conn, "src").unwrap();
+        let stale_ws = get_or_create_workspace(&mut conn, "stale").unwrap();
+        let proj = get_or_create_project(&mut conn, &src_ws, "scratch", None).unwrap();
+        let mut bad_page = page(src_ws, proj, "notes/split.md", "body");
+        bad_page.workspace_id = stale_ws;
+        upsert_page(&mut conn, &bad_page).unwrap();
+
+        let err = crate::migrations::run_to(&mut conn, 18).unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK constraint failed"),
+            "V18 must abort instead of preserving split-brain rows: {err}"
+        );
     }
 
     /// V18 integrity triggers: an INSERT whose `workspace_id` disagrees with
