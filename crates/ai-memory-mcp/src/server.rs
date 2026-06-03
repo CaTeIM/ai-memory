@@ -538,19 +538,22 @@ impl AiMemoryServer {
     }
 
     /// Build the [`ActorKey`] for a tool call from the request's stored
-    /// extensions. When the auth middleware has attached an
-    /// [`ai_memory_core::ActorContext`] (rung 1 root, rung 2 DB user), its
-    /// `user` field is used; the `session_id` comes from the same
-    /// extension when the agent's MCP client forwards it, otherwise stays
-    /// `None` and the per-actor lookup gracefully degrades to the single
-    /// slot under `[auto_scope] mode = single` (the default).
+    /// extensions and headers.
     ///
-    /// Threading parts into every read tool is mechanical but wide; the
-    /// helper is kept here so a follow-up commit can opt each tool in
-    /// without re-doing the design — the wrapper [`Self::effective_ids`] /
-    /// [`Self::effective_ids_for_read_args`] keep working unchanged while
-    /// the migration is in progress.
-    #[allow(dead_code)]
+    /// - `user` is taken from the middleware-injected
+    ///   [`ai_memory_core::ActorContext`] (rung 1 root, rung 2 DB user) —
+    ///   never from raw client-supplied headers, since user identity is
+    ///   security-critical.
+    /// - `session_id` comes from the same `ActorContext` when the auth
+    ///   middleware filled it; if not, falls back to the rung-4
+    ///   `X-Memory-Actor-Session-Id` request header. The session id is
+    ///   just a cache key for the active-project map — getting it wrong
+    ///   only routes the lookup to a different (or absent) slot, with no
+    ///   auth-bypass risk, so trusting the header here is safe.
+    ///
+    /// Returns the empty [`ActorKey`] when neither source has anything to
+    /// offer; that's the graceful-degradation signal for callers to fall
+    /// back to the single slot.
     fn actor_key_from_parts(
         parts: Option<&axum::http::request::Parts>,
     ) -> ai_memory_core::ActorKey {
@@ -558,13 +561,17 @@ impl AiMemoryServer {
             return ai_memory_core::ActorKey::default();
         };
         let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
-        match ctx {
-            None => ai_memory_core::ActorKey::default(),
-            Some(ctx) => ai_memory_core::ActorKey {
-                user: ctx.user.clone(),
-                session_id: ctx.session_id.clone(),
-            },
-        }
+        let user = ctx.and_then(|c| c.user.clone());
+        let session_id = ctx.and_then(|c| c.session_id.clone()).or_else(|| {
+            parts
+                .headers
+                .get("x-memory-actor-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        ai_memory_core::ActorKey { user, session_id }
     }
 
     /// Resolve which `(workspace_id, project_id)` a read tool should

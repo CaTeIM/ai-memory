@@ -509,11 +509,16 @@ async fn process(
     let session_id = resolve_session_id(&env)?;
     // Build the actor key used to scope the in-process `ActiveProject`
     // pointer. `user` is whatever the auth middleware extracted from this
-    // request; `session_id` comes from the envelope. Empty actor (anonymous
-    // + no session) is allowed — `set_for` falls back to the single slot.
+    // request; `session_id` is the RAW string from the payload (NOT the
+    // resolved UUID) — agents that forward an opaque session id over
+    // `X-Memory-Actor-Session-Id` on /mcp pass the same raw string, so set
+    // and get land on the same map slot. The MCP server's
+    // `actor_key_from_parts` mirrors this convention. Empty actor
+    // (anonymous + no session) is allowed — `set_for` falls back to the
+    // single slot.
     let actor_key = ai_memory_core::ActorKey {
         user: actor_user.clone(),
-        session_id: Some(session_id.to_string()),
+        session_id: env.session_id.clone(),
     };
     let (mut ws, mut proj) = resolve_project_ids(
         state,
