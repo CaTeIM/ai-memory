@@ -61,13 +61,51 @@ fn has_unknown_bare_column(token: &str) -> bool {
 }
 
 fn should_quote_fts5_token(token: &str) -> bool {
-    token.contains('-') && !(token.starts_with('"') && token.ends_with('"'))
+    if token.starts_with('"') && token.ends_with('"') {
+        return false;
+    }
+    // Quote any token carrying ASCII punctuation so FTS5 treats it as a literal
+    // phrase instead of erroring on its query grammar — e.g. a filename like
+    // `current.md` otherwise yields `fts5: syntax error near "."`. A trailing
+    // `*` (the FTS5 prefix operator) is allowed through bare; accented letters
+    // and digits are unicode (not ASCII punctuation) so recall keeps accents.
+    let core = token.strip_suffix('*').unwrap_or(token);
+    // `:` is column syntax (handled by `has_unknown_bare_column`, or preserved
+    // for known `title:`/`body:` columns) — it must not trigger quoting here.
+    core.chars().any(|c| c.is_ascii_punctuation() && c != ':')
 }
 
 fn quote_fts5_token(token: &str) -> String {
-    // FTS5 escapes `"` inside a quoted token by doubling it.
-    let escaped = token.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+    // FTS5 escapes `"` by doubling it. A token carrying a literal quote is an
+    // explicit-phrase fragment — keep the simple escaped form (don't expand it).
+    if token.contains('"') {
+        return format!("\"{}\"", token.replace('"', "\"\""));
+    }
+    // Otherwise emit BOTH the whole token and a punctuation-stripped sub-token
+    // phrase, OR'd, because the content tokenizer and the path index disagree
+    // on punctuation:
+    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '/_-'"
+    // keeps `/ _ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
+    // the single token `ai-memory`), while `ops::path_search_text` pre-expands
+    // `/ . - _` to spaces in the path index (so a path `ui-refresh-…` indexes
+    // the sub-tokens `ui`, `refresh`, …). `.` is a separator either way.
+    // Neither form alone matches both: `"ai-memory"` matches the content token
+    // but not the split path index; `"ai memory"` matches the path but not the
+    // content token. OR-ing the two makes a search for `ai-memory` / `ui-refresh`
+    // hit whichever surface indexed it. (Quoting both also neutralises the
+    // punctuation that would otherwise be FTS5 query grammar — the original
+    // `current.md` → `syntax error` bug.) With no punctuation the two coincide
+    // and we emit a single phrase.
+    let split = token
+        .chars()
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .collect::<String>();
+    let split = split.split_whitespace().collect::<Vec<_>>().join(" ");
+    if split.is_empty() || split == token {
+        format!("\"{token}\"")
+    } else {
+        format!("(\"{token}\" OR \"{split}\")")
+    }
 }
 
 #[cfg(test)]
@@ -77,8 +115,11 @@ mod tests {
     #[test]
     fn colon_is_not_column_syntax() {
         // Bare multi-word → OR-joined (no explicit operator present).
+        // `ai-memory` expands to BOTH the whole token (matches content) and
+        // the sub-token phrase (matches the split path index) — see
+        // `quote_fts5_token`.
         let q = prepare_fts5_query("pick: handoff ai-memory");
-        assert_eq!(q, "\"pick\" OR handoff OR \"ai-memory\"");
+        assert_eq!(q, "\"pick\" OR handoff OR (\"ai-memory\" OR \"ai memory\")");
     }
 
     #[test]
@@ -105,15 +146,68 @@ mod tests {
         assert_eq!(prepare_fts5_query("handoff"), "handoff");
     }
 
+    /// Regression: a filename like `current.md` used to pass through bare and
+    /// FTS5 errored with `syntax error near "."`. Quoting it as a phrase both
+    /// avoids the error and matches `architecture-current.md` (the tokens
+    /// `current` + `md` are adjacent in the indexed path).
+    #[test]
+    fn dotted_filename_token_is_quoted() {
+        // Whole token OR sub-token phrase. The split form (`current md`)
+        // matches the tokenised path; the whole form covers content tokens.
+        assert_eq!(
+            prepare_fts5_query("current.md"),
+            "(\"current.md\" OR \"current md\")"
+        );
+        assert_eq!(
+            prepare_fts5_query("00-index.md"),
+            "(\"00-index.md\" OR \"00 index md\")"
+        );
+        assert_eq!(
+            prepare_fts5_query("a/b/c.md"),
+            "(\"a/b/c.md\" OR \"a b c md\")"
+        );
+    }
+
+    /// Regression for the live-found bug: searching `ui-refresh` returned
+    /// nothing even though `follow-ups/ui-refresh-scroll-restoration.md`
+    /// exists. The old quoting produced `"ui-refresh"`, which FTS5 does NOT
+    /// match against the indexed `ui refresh`; the sub-token phrase
+    /// `"ui refresh"` does. See the real-FTS5 test in `ops.rs`.
+    #[test]
+    fn hyphenated_token_quotes_as_subtoken_phrase() {
+        assert_eq!(
+            prepare_fts5_query("ui-refresh"),
+            "(\"ui-refresh\" OR \"ui refresh\")"
+        );
+        assert_eq!(
+            prepare_fts5_query("scroll-restoration"),
+            "(\"scroll-restoration\" OR \"scroll restoration\")"
+        );
+    }
+
+    /// The FTS5 prefix operator (`term*`) must survive — a trailing `*` is not
+    /// quoted away.
+    #[test]
+    fn prefix_star_token_stays_bare() {
+        assert_eq!(prepare_fts5_query("curr*"), "curr*");
+    }
+
     #[test]
     fn empty_yields_empty() {
         assert_eq!(prepare_fts5_query("   "), "");
     }
 
     #[test]
-    fn quotes_are_escaped() {
-        let q = quote_fts5_token(r#"say "hello""#);
-        assert_eq!(q, r#""say ""hello""""#);
+    fn quote_emits_whole_and_subtoken_phrase() {
+        // Punctuated identifier → both forms OR'd.
+        assert_eq!(
+            quote_fts5_token("ai-memory"),
+            r#"("ai-memory" OR "ai memory")"#
+        );
+        // A literal-quote fragment keeps the simple escaped form (no expansion).
+        assert_eq!(quote_fts5_token(r#"say "hello""#), r#""say ""hello""""#);
+        // No punctuation → single phrase.
+        assert_eq!(quote_fts5_token("handoff"), r#""handoff""#);
     }
 
     #[test]
