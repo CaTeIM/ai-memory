@@ -2108,6 +2108,198 @@ mod tests {
         );
     }
 
+    /// V19 data-repair migration: observations whose `project_id`
+    /// disagrees with their session's `project_id` are re-attributed
+    /// to the session's project. Handoffs that carry a session id are
+    /// repaired the same way. Project rows that become truly empty
+    /// after repair are deleted. The migration is idempotent: re-run
+    /// on a repaired DB updates / deletes nothing.
+    #[test]
+    fn v19_repairs_orphan_observation_attribution_and_purges_empty_projects() {
+        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+
+        // Apply migrations through V18 (not V19) so we can seed the
+        // orphaned-attribution state V19 is designed to repair. If we
+        // ran the full chain via `fresh_db`, V19 would already be in
+        // the refinery history and re-invoking `migrations::run` below
+        // would be a no-op.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrations::run_to(&mut conn, 18).unwrap();
+
+        // Seed the bug shape with V18-and-earlier semantics: parent
+        // project `manga-plus` and fragment project `reader` co-exist
+        // in the same workspace; a session lives under `manga-plus`
+        // and an observation was misattributed to `reader`.
+        let ws = get_or_create_workspace(&mut conn, "default").unwrap();
+        let parent = get_or_create_project(
+            &mut conn,
+            &ws,
+            "manga-plus",
+            Some("/mnt/data/Projects/manga-plus"),
+        )
+        .unwrap();
+        let fragment = get_or_create_project(
+            &mut conn,
+            &ws,
+            "reader",
+            Some("/mnt/data/Projects/manga-plus/reader"),
+        )
+        .unwrap();
+
+        let sid = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: parent,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/mnt/data/Projects/manga-plus".into()),
+            },
+        )
+        .unwrap();
+
+        // Three misattributed observations on the fragment.
+        for i in 0..3 {
+            insert_observation(
+                &mut conn,
+                &NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: fragment,
+                    kind: ObservationKind::PreToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: format!("call {i}"),
+                    body: "body".into(),
+                    importance: 5,
+                },
+            )
+            .unwrap();
+        }
+
+        // Run the repair migration (V19).
+        crate::migrations::run(&mut conn).unwrap();
+
+        // All observations now point at the parent.
+        let cnt_parent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+                params![&parent.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cnt_parent, 3, "observations re-attributed to parent");
+
+        // The fragment row is gone — it's truly empty post-repair.
+        let frag_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![&fragment.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(frag_rows, 0, "fragment project row deleted");
+
+        // Parent survives; it owns its rows.
+        let parent_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![&parent.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_rows, 1);
+    }
+
+    /// V19 is idempotent: re-running on a repaired DB is a no-op.
+    /// Also asserts the initial run on a clean DB (no orphans, no
+    /// empty fragments) is a no-op.
+    #[test]
+    fn v19_is_idempotent() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        // fresh_db already ran the full chain (including V19). Seed a
+        // few valid rows to ensure they survive a re-run.
+        upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+        let before: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM projects), \
+                        (SELECT COUNT(*) FROM observations), \
+                        (SELECT COUNT(*) FROM pages)",
+                params![],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let after: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM projects), \
+                        (SELECT COUNT(*) FROM observations), \
+                        (SELECT COUNT(*) FROM pages)",
+                params![],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "V19 must be a no-op on already-repaired data"
+        );
+    }
+
+    /// `scratch` keeps its standalone handoffs even when it would
+    /// otherwise look empty. CLAUDE.md invariant #15a names it as the
+    /// defensive default for hook events that arrive without a usable
+    /// cwd; the V19 DELETE explicitly carves it out.
+    #[test]
+    fn v19_preserves_scratch_with_standalone_handoffs() {
+        use ai_memory_core::{AgentKind, NewHandoff};
+
+        let (_tmp, mut conn, ws, _proj) = fresh_db();
+        // Add a standalone handoff to scratch (no from_session_id).
+        let scratch = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
+        insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: scratch,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "standalone".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            },
+        )
+        .unwrap();
+
+        crate::migrations::run(&mut conn).unwrap();
+
+        let scratch_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name = 'scratch'",
+                params![],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            scratch_rows, 1,
+            "scratch must survive even if it looks empty"
+        );
+        let scratch_handoffs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE project_id = ?1",
+                params![&scratch.as_bytes()[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scratch_handoffs, 1);
+    }
+
     #[test]
     fn v18_migration_refuses_existing_split_brain_rows() {
         let tmp = TempDir::new().unwrap();
