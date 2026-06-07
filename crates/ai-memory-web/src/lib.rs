@@ -51,3 +51,11 @@ pub fn api_router(reader: ReaderPool, wiki: Wiki) -> Router {
     let state = Arc::new(WebState::new(reader, wiki));
     routes::build_api(state)
 }
+
+/// Standalone `GET /favicon.ico` router. Merge at the host-root level
+/// (NOT under `--base-path`, NOT nested under `/web`) so the browser's
+/// automatic `/favicon.ico` fetch actually reaches it. The handler is
+/// stateless — it returns the same embedded PNG as `/web/static/logo.png`.
+pub fn favicon_router() -> Router {
+    routes::build_favicon()
+}

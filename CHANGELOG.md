@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `GET /favicon.ico` now lives at the absolute host root, outside
+  `--base-path` and outside the `/web` nest, so the browser's
+  automatic favicon fetch actually reaches it. The 0.12.0 build mounted
+  the route inside the web router and ended up serving the icon only
+  at `/web/favicon.ico` — invisible to the browser's auto-fetch (the
+  icon still appeared via the in-page `<link rel="icon">` tag, so the
+  user-visible behaviour stayed correct, but the dedicated route was
+  unreachable). The new mount is also exempt from bearer auth and the
+  host allowlist so a fresh tab gets the icon without an HTTP Basic
+  prompt; the embedded PNG is the same one any visitor to `/web`
+  already sees, so the info-leak surface is nil. Surfaced by the
+  post-merge audit live test ([#79]).
 
 ## [0.12.0] - 2026-06-07
 ### Added

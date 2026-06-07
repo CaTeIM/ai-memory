@@ -339,6 +339,18 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             } else {
                 axum::Router::new().nest(&base_path, router)
             };
+            // Mount `/favicon.ico` at the absolute HOST root — outside the
+            // auth gate, outside `--base-path`, outside the `/web` nest.
+            // Browsers auto-fetch `<host>/favicon.ico` without auth headers
+            // regardless of where the app is mounted; routing it under
+            // `/web` (as PR #79 originally did) made it unreachable to the
+            // browser's automatic fetch. Negligible info leak — the icon
+            // is the same embedded PNG anyone hitting `/web` already sees.
+            let router = if args.enable_web {
+                router.merge(ai_memory_web::favicon_router())
+            } else {
+                router
+            };
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("binding {bind}"))?;
@@ -1459,6 +1471,9 @@ mod tests {
         } else {
             axum::Router::new().nest(&base, router)
         };
+        // Mirror the production favicon mount in serve handler: at the
+        // absolute host root, outside the base-path nest.
+        let router = router.merge(ai_memory_web::favicon_router());
         (tmp, router)
     }
 
@@ -1649,6 +1664,43 @@ mod tests {
             new_pos < old_pos,
             "injected base must appear before the pre-existing one (browser ignores duplicates after the first)"
         );
+    }
+
+    /// Post-merge audit (Phase 7 live test) caught that PR #79's
+    /// `/favicon.ico` route was nested inside `/web`, so it lived at
+    /// `/web/favicon.ico` and the browser's automatic root fetch always
+    /// 404'd. Fix: a separate `favicon_router()` mounted at the absolute
+    /// HOST root, outside `--base-path` and outside the `/web` nest.
+    /// This test pins both:
+    ///   * `/favicon.ico` at the host root returns the PNG.
+    ///   * Under `--base-path /wiki`, the favicon STAYS at root —
+    ///     browsers fetch `<host>/favicon.ico` regardless of where the
+    ///     app is mounted; the route must not move with the prefix.
+    #[tokio::test]
+    async fn favicon_lives_at_host_root_regardless_of_base_path() {
+        for base_path in ["", "/wiki"] {
+            let (_tmp, router) = based_web_router(base_path, "/web");
+            let resp = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/favicon.ico")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "/favicon.ico must be reachable at host root (base_path={base_path:?})"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("image/png"),
+            );
+        }
     }
 
     #[tokio::test]

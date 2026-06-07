@@ -367,12 +367,15 @@ GET /favicon.ico
 
 Returns the same transparent PNG the built-in web UI serves as the
 header logo. Browsers fetch this path automatically. The route is
-present whenever the web UI is enabled (`--enable-web`); the response
-is `image/png` despite the `.ico` URL — modern browsers accept PNG
-icons. Bearer auth applies as it does to `/web/*`: in a browser the
-favicon request rides the same HTTP Basic credentials the user
-pasted to load `/web`, so the icon appears once the session is
-authenticated.
+present whenever the web UI is enabled (`--enable-web`) and is
+mounted at the absolute host root — outside `--base-path` and outside
+the `/web` nest — so the browser's automatic fetch reaches it even
+under a subpath deployment. The response is `image/png` despite the
+`.ico` URL (modern browsers accept PNG icons), and the route is
+**exempt from bearer auth and host allowlist**: a browser opening a
+fresh tab gets the icon without an HTTP Basic prompt, and the
+embedded PNG is the same one any visitor to `/web` already sees, so
+the info-leak surface is nil.
 
 ## 5. Limits and pagination
 
