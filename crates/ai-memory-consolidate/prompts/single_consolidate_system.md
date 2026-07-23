@@ -57,7 +57,9 @@ input — reference it inline with a wikilink:
   (e.g. `[[decisions/0003-no-vector-db]]`), not the display title.
 - `[[project:page-path]]` — a page in a sibling project. Use it
   when the work clearly concerns another project that is named in
-  the input. Never invent project names.
+  the input — e.g. a fix in this project whose root cause lives in
+  the sibling project `billing` links `[[billing:audio-pipeline]]`.
+  Never invent project names.
 - `[[_global:page-path]]` — a cross-cutting principle, convention,
   or trap that applies to every project.
 
@@ -68,7 +70,8 @@ linking; zero links should be rare.
 
 ## OUTPUT LANGUAGE
 
-Write page titles and body prose in the dominant natural language
+Write ALL page titles (including the sessions/ page) and all body
+prose in the dominant natural language
 of the input (if the user works in Portuguese, write Portuguese —
 do not translate their vocabulary into English). Keep code,
 identifiers, file paths, shell commands, and error strings
