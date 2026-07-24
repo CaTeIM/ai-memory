@@ -24,6 +24,8 @@ pub enum ManagedHarness {
     Omp,
     /// Moonshot AI Kimi Code.
     Kimi,
+    /// Grok Build CLI (xAI).
+    Grok,
 }
 
 impl ManagedHarness {
@@ -38,6 +40,7 @@ impl ManagedHarness {
             "crush" => Some(Self::Crush),
             "omp" | "oh-my-pi" => Some(Self::Omp),
             "kimi" | "kimi-code" | "kimi-cli" => Some(Self::Kimi),
+            "grok" | "grok-build" => Some(Self::Grok),
             _ => None,
         }
     }
@@ -53,6 +56,7 @@ impl ManagedHarness {
             Self::Crush => AgentKind::Crush,
             Self::Omp => AgentKind::Omp,
             Self::Kimi => AgentKind::KimiCode,
+            Self::Grok => AgentKind::Grok,
         }
     }
 
@@ -67,6 +71,7 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::Grok => "grok",
         }
     }
 
@@ -81,6 +86,7 @@ impl ManagedHarness {
             Self::Crush => "crush",
             Self::Omp => "omp",
             Self::Kimi => "kimi",
+            Self::Grok => "grok",
         }
     }
 }
@@ -209,6 +215,18 @@ pub fn build_launch_plan(
                     expected = Some(id.to_string());
                 }
             }
+            ManagedHarness::Grok => {
+                let id = linked_session_id
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let selector = if linked_session_id.is_some() {
+                    "--resume"
+                } else {
+                    "--session-id"
+                };
+                args.extend([OsString::from(selector), OsString::from(&id)]);
+                expected = Some(id);
+            }
         }
     }
 
@@ -233,13 +251,17 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Crush => Some("--yolo"),
         ManagedHarness::Omp => None,
         ManagedHarness::Kimi => Some("--yolo"),
+        ManagedHarness::Grok => Some("--yolo"),
     };
     if let Some(flag) = flag {
         // Kimi's `--yolo` has hidden aliases (`--yes`, `--auto-approve`) and
         // conflicts with the distinct `--auto` mode, so any of those native
         // spellings already satisfies the wrapper's dangerous-mode request.
+        // Grok's `--yolo` is a hidden alias of the documented
+        // `--always-approve`; either spelling satisfies the request.
         let present: &[&str] = match harness {
             ManagedHarness::Kimi => &["--yolo", "-y", "--yes", "--auto-approve", "--auto"],
+            ManagedHarness::Grok => &["--yolo", "--always-approve"],
             _ => &[flag],
         };
         if !has_flag(args, present) {
@@ -265,6 +287,9 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
         ManagedHarness::Kimi => has_flag(args, &["--prompt", "-p"]),
+        ManagedHarness::Grok => {
+            has_flag(args, &["--single", "-p", "--prompt-file", "--prompt-json"])
+        }
     }
 }
 
@@ -401,6 +426,33 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "__plugin_run_node",
         ]
         .as_slice(),
+        // `agent` covers the stdio/headless/serve/leader runners, which manage
+        // their own session lifecycles and must not receive selectors.
+        ManagedHarness::Grok => [
+            "agent",
+            "completions",
+            "dashboard",
+            "doctor",
+            "export",
+            "help",
+            "inspect",
+            "leader",
+            "login",
+            "logout",
+            "mcp",
+            "memory",
+            "models",
+            "plugin",
+            "sessions",
+            "setup",
+            "trace",
+            "update",
+            "version",
+            "v",
+            "worktree",
+            "wrap",
+        ]
+        .as_slice(),
     };
     let first = args.first().and_then(|arg| arg.to_str());
     if first.is_some_and(|value| utility.contains(&value)) {
@@ -454,6 +506,21 @@ fn has_explicit_session_selector(harness: ManagedHarness, args: &[OsString]) -> 
                 "-C",
             ],
         ),
+        // A bare `--resume` opens Grok's native session picker; that is still
+        // an explicit user choice. `--fork-session` modifies how the explicit
+        // resume/continue selector behaves and never appears alone.
+        ManagedHarness::Grok => has_flag(
+            args,
+            &[
+                "--resume",
+                "-r",
+                "--continue",
+                "-c",
+                "--session-id",
+                "-s",
+                "--fork-session",
+            ],
+        ),
     }
 }
 
@@ -479,6 +546,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
         // A bare `--session`/`--resume` opens the picker: `flag_value`
         // returns `None` when no value follows, as intended.
         ManagedHarness::Kimi => flag_value(args, &["--session", "-S", "--resume", "-r"]),
+        ManagedHarness::Grok => flag_value(args, &["--resume", "-r", "--session-id", "-s"]),
     }
 }
 
@@ -560,6 +628,8 @@ fn environment_session_dir_with(
         ManagedHarness::Omp => value("PI_CODING_AGENT_DIR").map(|dir| dir.join("sessions")),
         // Sessions live under `<KIMI_CODE_HOME>/sessions/<bucket>/<id>/`.
         ManagedHarness::Kimi => value("KIMI_CODE_HOME").map(|dir| dir.join("sessions")),
+        // Sessions live under `<GROK_HOME>/sessions/<encoded-cwd>/<id>/`.
+        ManagedHarness::Grok => value("GROK_HOME").map(|dir| dir.join("sessions")),
     }
 }
 
@@ -794,6 +864,7 @@ mod tests {
             (ManagedHarness::Crush, Some("--yolo")),
             (ManagedHarness::Omp, None),
             (ManagedHarness::Kimi, Some("--yolo")),
+            (ManagedHarness::Grok, Some("--yolo")),
         ] {
             let mut args = Vec::new();
             apply_yolo(harness, &mut args);
@@ -1007,6 +1078,99 @@ mod tests {
             apply_yolo(ManagedHarness::Kimi, &mut args);
             assert_eq!(strings(&args), [already], "{already} must not duplicate");
         }
+    }
+
+    #[test]
+    fn grok_generates_then_resumes_native_session() {
+        let fresh = build_launch_plan(ManagedHarness::Grok, None, vec![], None).unwrap();
+        let id = fresh.expected_session_id.clone().unwrap();
+        assert_eq!(strings(&fresh.args), ["--session-id", id.as_str()]);
+
+        let resumed = build_launch_plan(
+            ManagedHarness::Grok,
+            None,
+            vec![OsString::from("--model"), OsString::from("grok-4.5")],
+            Some(&id),
+        )
+        .unwrap();
+        assert_eq!(
+            strings(&resumed.args),
+            ["--model", "grok-4.5", "--resume", id.as_str()]
+        );
+    }
+
+    #[test]
+    fn grok_explicit_selector_always_wins_including_bare_picker_and_fork() {
+        for native in [
+            vec![OsString::from("--resume"), OsString::from("chosen")],
+            vec![OsString::from("--session-id=chosen")],
+            vec![OsString::from("-c")],
+            vec![OsString::from("--fork-session")],
+            // Bare `--resume` opens the native picker; still an explicit
+            // choice, so nothing may be injected.
+            vec![OsString::from("--resume")],
+        ] {
+            let plan =
+                build_launch_plan(ManagedHarness::Grok, None, native.clone(), Some("linked"))
+                    .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_ne!(plan.expected_session_id.as_deref(), Some("linked"));
+        }
+    }
+
+    #[test]
+    fn grok_utility_subcommands_are_passed_through() {
+        for utility in ["agent", "sessions", "login", "export", "doctor", "wrap"] {
+            let plan = build_launch_plan(
+                ManagedHarness::Grok,
+                None,
+                vec![OsString::from(utility)],
+                Some("linked"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{utility}");
+            assert_eq!(strings(&plan.args), [utility]);
+        }
+    }
+
+    #[test]
+    fn grok_noninteractive_prompt_blocks_adoption() {
+        for args in [
+            vec![OsString::from("-p"), OsString::from("summarize")],
+            vec![OsString::from("--single"), OsString::from("summarize")],
+            vec![OsString::from("--prompt-file"), OsString::from("p.md")],
+        ] {
+            assert!(!allows_native_session_adoption(ManagedHarness::Grok, &args));
+        }
+        assert!(allows_native_session_adoption(
+            ManagedHarness::Grok,
+            &[OsString::from("--model"), OsString::from("grok-4.5")]
+        ));
+    }
+
+    #[test]
+    fn grok_yolo_respects_the_always_approve_alias() {
+        for already in ["--yolo", "--always-approve"] {
+            let mut args = vec![OsString::from(already)];
+            apply_yolo(ManagedHarness::Grok, &mut args);
+            assert_eq!(strings(&args), [already], "{already} must not duplicate");
+        }
+    }
+
+    #[test]
+    fn grok_build_name_is_an_alias_for_grok() {
+        for name in ["grok", "grok-build"] {
+            assert_eq!(ManagedHarness::from_name(name), Some(ManagedHarness::Grok));
+        }
+    }
+
+    #[test]
+    fn grok_home_environment_override_points_at_sessions_root() {
+        let get = |name: &str| (name == "GROK_HOME").then(|| OsString::from("/stores/grok"));
+        assert_eq!(
+            environment_session_dir_with(ManagedHarness::Grok, get).as_deref(),
+            Some(std::path::Path::new("/stores/grok/sessions"))
+        );
     }
 
     #[test]

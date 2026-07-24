@@ -136,6 +136,7 @@ async fn prepare_run(
             | AgentKind::Crush
             | AgentKind::Omp
             | AgentKind::KimiCode
+            | AgentKind::Grok
     ) {
         return error(
             StatusCode::BAD_REQUEST,
@@ -311,10 +312,10 @@ async fn run_context(
         Ok(None) => return error(StatusCode::NOT_FOUND, "active managed run not found"),
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
-    if context.agent != AgentKind::Crush {
+    if !matches!(context.agent, AgentKind::Crush | AgentKind::Grok) {
         return error(
             StatusCode::BAD_REQUEST,
-            "direct managed context is only supported for Crush",
+            "direct managed context is only supported for Crush and Grok",
         );
     }
     if context.context_delivered {
@@ -346,10 +347,10 @@ async fn accept_run_context(
         Ok(None) => return error(StatusCode::NOT_FOUND, "managed run not found"),
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
-    if status.agent != AgentKind::Crush {
+    if !matches!(status.agent, AgentKind::Crush | AgentKind::Grok) {
         return error(
             StatusCode::BAD_REQUEST,
-            "direct managed context is only supported for Crush",
+            "direct managed context is only supported for Crush and Grok",
         );
     }
     match state.writer.accept_managed_run_context(run_id).await {
@@ -892,6 +893,104 @@ mod tests {
         )
         .await;
         assert_eq!(automatic.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn grok_is_accepted_explicitly_but_not_in_the_automatic_pool() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+
+        let explicit = prepare_run(
+            State(state.clone()),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Grok,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "explicit".into(),
+            }),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let body = to_bytes(explicit.into_body(), 64 * 1024).await.unwrap();
+        let prepared: PrepareManagedRunResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prepared.resolved_agent, Some(AgentKind::Grok));
+        store
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: prepared.run_id,
+                native_session_id: Some("019f-session".into()),
+                source_cursor: None,
+                events: Vec::new(),
+                complete: true,
+                segment_path: None,
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+
+        let automatic = prepare_run(
+            State(state),
+            None,
+            Json(PrepareManagedRunRequest {
+                workspace: "default".into(),
+                project: "managed".into(),
+                cwd: "/repo".into(),
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                agent: AgentKind::Grok,
+                automatic_harness: true,
+                available_agents: vec![AgentKind::Grok],
+                workstream: None,
+                new_workstream: None,
+                lease_owner: "automatic".into(),
+            }),
+        )
+        .await;
+        assert_eq!(automatic.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn grok_run_context_uses_the_direct_delivery_gate() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let state = test_state(&store, temp.path());
+        let (workspace_id, project_id) = seed_scope(&store).await;
+        let input = prepare_input(workspace_id, project_id, AgentKind::Grok, "launcher");
+        let prepared = store.writer.prepare_workstream_run(input).await.unwrap();
+
+        let context = run_context(
+            State(state.clone()),
+            None,
+            AxumPath(prepared.run_id.to_string()),
+        )
+        .await;
+        assert_eq!(context.status(), StatusCode::OK);
+
+        let accept = accept_run_context(
+            State(state.clone()),
+            None,
+            AxumPath(prepared.run_id.to_string()),
+        )
+        .await;
+        assert_eq!(accept.status(), StatusCode::NO_CONTENT);
+
+        // Delivered context is not re-rendered.
+        let redelivered = run_context(State(state), None, AxumPath(prepared.run_id.to_string()))
+            .await
+            .into_body();
+        let body = to_bytes(redelivered, 64 * 1024).await.unwrap();
+        let response: ai_memory_core::ManagedRunContextResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(response.context.is_none());
     }
 
     #[tokio::test]
