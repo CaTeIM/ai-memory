@@ -1164,8 +1164,17 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
                 || trimmed.starts_with("<INSTRUCTIONS>")
         }
         AgentKind::ClaudeCode => trimmed.starts_with("<system-reminder>"),
-        // Grok injects an environment block into the first user message.
-        AgentKind::Grok => trimmed.starts_with("<user_info>"),
+        // Grok stores harness scaffolding inside `user` records rather than a
+        // separate record type: an environment block, then Claude-style
+        // reminders carrying project instructions, the skills catalogue, and
+        // the connected MCP servers. A single session's reminders measured
+        // 42KB against 270 bytes of real input, so importing them both leaks
+        // harness internals into the portable ledger and evicts real
+        // conversation from the startup packet budget. Genuine input arrives
+        // wrapped in `<user_query>`.
+        AgentKind::Grok => {
+            trimmed.starts_with("<user_info>") || trimmed.starts_with("<system-reminder>")
+        }
         _ => false,
     }
 }
@@ -2841,6 +2850,45 @@ mod tests {
         );
         let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
         assert!(cursor.prefix_sha256.is_some());
+    }
+
+    /// Grok keeps harness scaffolding in `user` records, unlike Kimi, which
+    /// isolates it in `config.update` records the adapter never reads. A real
+    /// session measured 42KB of reminders (skills catalogue plus connected MCP
+    /// servers) against 270 bytes of genuine input, which both leaked harness
+    /// internals into the ledger and evicted real conversation from the
+    /// startup packet budget.
+    #[test]
+    fn grok_adapter_excludes_injected_system_reminders_from_user_records() {
+        let records = [
+            json!({"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\n</user_info>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context\n</system-reminder>"}]}),
+            // Indented in real sessions, so the check must tolerate leading space.
+            json!({"type":"user","content":[{"type":"text","text":"  <system-reminder> The following skills are available for use: ego-browser…</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected: - ai-memory (16 tools)\n</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<user_query>\nfix the bug\n</user_query>"}]}),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            parse_grok(
+                record,
+                "019f-session",
+                &format!("record-{index}"),
+                &mut events,
+                &mut losses,
+            );
+        }
+
+        let contents: Vec<_> = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            ["<user_query>\nfix the bug\n</user_query>"],
+            "only genuine user input may reach the ledger"
+        );
     }
 
     #[test]

@@ -22,8 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   acknowledged only after the child spawns). Transcript import reads
   `$GROK_HOME/sessions/*/*/chat_history.jsonl` read-only with a
   prefix-validated cursor and content-hash event ids so rewind-driven journal
-  rewrites cannot duplicate history; system prompts, encrypted reasoning, and
-  the injected `<user_info>` block are excluded as loss annotations. Discovery
+  rewrites cannot duplicate history; system prompts and encrypted reasoning
+  are excluded as loss annotations, as are the harness-injected `<user_info>`
+  and `<system-reminder>` blocks Grok stores inside `user` records (project
+  instructions, the skills catalogue, and connected MCP servers), which would
+  otherwise leak harness internals into the portable ledger and evict real
+  conversation from the startup packet budget. Discovery
   matches checkouts through `summary.json`'s recorded `info.cwd` and honors
   `GROK_HOME`. Grok stays out of the bare-mode automatic pool. Verified
   against Grok Build CLI v0.2.111 ([#237]).
