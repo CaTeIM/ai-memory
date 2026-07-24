@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty body while still reporting a successful write, and the same
   applied to any other stdin reader (hooks fed by a pipe). The wrappers
   now pass `-i` whenever stdin is not a terminal, and keep `-t` for real
-  terminals only.
+  terminals only (#243).
 
 ## [1.18.0] - 2026-07-23
 
