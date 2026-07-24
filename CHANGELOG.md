@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client of the running server; the command now requires a reachable
   server and no longer works against an offline data directory.
 
+### Fixed
+- The Docker wrappers (`bin/ai-memory`, `bin/ai-memory.ps1`) kept stdin
+  attached only on a real terminal, so every piped or redirected
+  invocation reached the container with a closed stdin. `ai-memory
+  write-page --body -` therefore stored a page with frontmatter and an
+  empty body while still reporting a successful write, and the same
+  applied to any other stdin reader (hooks fed by a pipe). The wrappers
+  now pass `-i` whenever stdin is not a terminal, and keep `-t` for real
+  terminals only.
+
 ## [1.18.0] - 2026-07-23
 
 ### Added
