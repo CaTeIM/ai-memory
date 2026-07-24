@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client of the running server; the command now requires a reachable
   server and no longer works against an offline data directory.
 
+### Changed
+- The M8 access-counter reinforcement is now throttled: a page's
+  `access_count` / `last_accessed_at` is bumped at most once per minute
+  instead of on every search that returns it. `memory_query` previously
+  spawned a writer command per hit on each of its three search paths, so
+  repeated or overlapping queries flooded the single writer actor with
+  redundant reinforcement writes. A page's first sighting still bumps
+  immediately, and a continuously-hot page keeps earning one bump per
+  window, so recency ordering is unaffected; only the magnitude of
+  `access_count` grows more slowly under bursty search. The cooldown map
+  self-prunes, staying bounded by the pages searched within the window.
+
 ## [1.18.0] - 2026-07-23
 
 ### Added
