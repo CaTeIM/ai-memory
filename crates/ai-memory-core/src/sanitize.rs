@@ -37,6 +37,11 @@ use tracing::debug;
 
 use crate::NewObservation;
 
+/// Universal durable-body ceiling for lifecycle observations. Event adapters
+/// may impose smaller limits, but no sanitized observation can cross the store
+/// boundary above 16 KiB.
+pub const OBSERVATION_BODY_MAX_BYTES: usize = 16 * 1024;
+
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
@@ -189,13 +194,39 @@ impl<T> Sanitized<T> {
 }
 
 impl Sanitized<NewObservation> {
-    /// Apply the privacy strip to an observation's title + body.
+    /// Apply the privacy strip to an observation's title + body, then enforce
+    /// the universal durable-body ceiling after redaction.
     #[must_use]
     pub fn new(mut obs: NewObservation, sanitizer: &Sanitizer) -> Self {
         obs.title = sanitizer.scrub(&obs.title);
-        obs.body = sanitizer.scrub(&obs.body);
+        obs.body = truncate_utf8_bytes(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
         Self(obs)
     }
+}
+
+/// Truncate text to at most `max` UTF-8 bytes, reserving the ellipsis inside
+/// the requested cap and never splitting a code point.
+#[must_use]
+pub fn truncate_utf8_bytes(input: &str, max: usize) -> String {
+    if input.len() <= max {
+        return input.to_string();
+    }
+    if max < '…'.len_utf8() {
+        return String::new();
+    }
+    let limit = max - '…'.len_utf8();
+    let mut end = 0;
+    for (index, character) in input.char_indices() {
+        let next = index + character.len_utf8();
+        if next > limit {
+            break;
+        }
+        end = next;
+    }
+    let mut output = String::with_capacity(max);
+    output.push_str(&input[..end]);
+    output.push('…');
+    output
 }
 
 #[cfg(test)]
@@ -291,6 +322,39 @@ mod tests {
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED]"));
         assert!(scrubbed.body.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn observation_boundary_caps_after_sanitizing_without_splitting_utf8() {
+        let raw = NewObservation {
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: "large prompt".into(),
+            body: format!(
+                "OPENAI_API_KEY=sk-{} {} TAIL_SENTINEL",
+                "a".repeat(40),
+                "é".repeat(OBSERVATION_BODY_MAX_BYTES)
+            ),
+            importance: 8,
+        };
+        let scrubbed = Sanitized::new(raw, &s()).into_inner();
+        assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
+        assert!(scrubbed.body.contains("[REDACTED]"));
+        assert!(!scrubbed.body.contains("TAIL_SENTINEL"));
+        assert!(scrubbed.body.ends_with('…'));
+    }
+
+    #[test]
+    fn utf8_truncation_reserves_the_ellipsis_inside_the_cap() {
+        let truncated = truncate_utf8_bytes("abcééé", 7);
+        assert_eq!(truncated, "abc…");
+        assert_eq!(truncated.len(), 6);
+        assert_eq!(truncate_utf8_bytes("unchanged", 9), "unchanged");
+        assert!(truncate_utf8_bytes("large", 2).is_empty());
     }
 
     #[test]

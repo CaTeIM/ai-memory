@@ -392,6 +392,16 @@ Docker script bundles do not enforce it. Re-run `install-hooks --agent <agent>
 capability output reflects the selected integration. See the canonical
 [capture exclusions reference](marker-file.md#capture-exclusions).
 
+Lifecycle observation bodies are bounded separately from the 10 MiB HTTP
+request limit. User prompts and post-compaction summaries retain up to 16 KiB;
+notifications and tool excerpts retain up to 2 KB. Native `ai-memory hook`
+commands truncate those fields UTF-8-safely before they enter the local spool
+or wire. The server repeats the event-specific caps for every integration,
+including script and generated clients, then applies a 16 KiB backstop after
+sanitization before any observation reaches SQLite or FTS. Native hook commands
+invoke the installed binary directly, so upgrading that binary is enough to
+receive the client-side cap.
+
 Some agent harnesses attach the assistant's final turn to their `Stop` event —
 Claude Code sends it as a raw `last_assistant_message`. By default that text is
 never persisted: the native hook binary strips the raw field before it can reach

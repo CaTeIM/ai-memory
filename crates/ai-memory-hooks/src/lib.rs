@@ -42,7 +42,10 @@ pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CapturePolicy, CaptureProtocol,
     CaptureSource, ExtractionState, PolicyState, ToolFamily,
 };
-pub use payload::{HookEnvelope, HookEvent};
+pub use payload::{
+    HookEnvelope, HookEvent, NOTIFICATION_EXCERPT_MAX_BYTES, POST_COMPACTION_EXCERPT_MAX_BYTES,
+    USER_PROMPT_EXCERPT_MAX_BYTES, cap_lifecycle_body_for_client,
+};
 pub use router::{
     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, DEFAULT_INGEST_GATE_MAX_ENTRIES,
     DEFAULT_PROJECT_CACHE_MAX_ENTRIES, HookState, IngestGates, IngestRateLimiter, ProjectCache,

@@ -63,6 +63,9 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Zero-friction lifecycle capture.** Hooks fire-and-forget bounded,
   sanitized prompt, tool-lifecycle, and session-boundary observations. Direct
   launches keep this lightweight path; it is not a complete native transcript.
+  User prompts and post-compaction summaries retain up to 16 KiB;
+  notifications and tool excerpts retain up to 2 KB, with a 16 KiB durable
+  backstop for every observation body.
 - **Opt-in managed workstreams.** `ai-memory run claude`, then `ai-memory run
   codex --yolo`, then `ai-memory run kimi`, transparently resumes one logical
   workstream with native per-harness sessions, a portable visible-event ledger,

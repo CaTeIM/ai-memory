@@ -426,6 +426,12 @@ where
         }
         false
     };
+    if ai_memory_hooks::cap_lifecycle_body_for_client(
+        &mut json,
+        ai_memory_hooks::HookEvent::parse(&args.event),
+    ) {
+        payload = serde_json::to_string(&json)?;
+    }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     let policy = policy_cwd.as_deref().map(capture_policy);
     let tool_event = is_tool_event(&args.event);
