@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to connect related wiki pages with path-based wikilinks and to mirror the
   dominant natural language of the source material while preserving code,
   identifiers, paths, commands, error strings, and JSON field names. (#238)
+- The M8 access-counter reinforcement now bumps a page's `access_count` and
+  `last_accessed_at` at most once per minute instead of on every search that
+  returns it. A first sighting still bumps immediately, and a continuously hot
+  page remains eligible once per window, while the cooldown map self-prunes to
+  the pages searched within the window. This reduces redundant single-writer
+  work under bursty or overlapping searches while intentionally making
+  `access_count` a coarser retention signal. (#239)
 
 ### Fixed
 - `install-mcp --client claude-desktop` now detects an MSIX-packaged

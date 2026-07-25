@@ -101,7 +101,9 @@ from hook paths.
    explicit project, or explicit `scopes` mode, bounded raw observation
    FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
    pages across projects only. Page hits bump `access_count` +
-   `last_accessed_at` - the M8 reinforcement term.
+   `last_accessed_at` - the M8 reinforcement term. That bump is throttled
+   to at most once per page per minute, so a burst of overlapping searches
+   does not flood the writer actor with redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
