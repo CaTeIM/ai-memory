@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now always pass `-i`, while `-t` is added only when stdin and stdout are
   both terminals. `AI_MEMORY_NO_TTY=1` disables only TTY allocation and
   no longer disconnects stdin. (#243)
+- Managed `SessionStart` delivery now includes a pending single-use
+  handoff before the portable workstream ledger and optional project
+  brief. Handoff and ledger acknowledgements are claimed together only
+  after the complete response has been assembled; a failed or racing
+  ledger claim cannot consume the handoff or suppress retry delivery.
+  (#235)
 
 ## [1.18.0] - 2026-07-23
 
