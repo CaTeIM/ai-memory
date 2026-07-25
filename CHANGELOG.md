@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ambiguous. Unpackaged installs keep resolving to the plain path.
   (#250)
 
+- The Docker wrappers (`bin/ai-memory`, `bin/ai-memory.ps1`) kept stdin
+  attached only on a real terminal, so every piped or redirected
+  invocation reached the container with a closed stdin. `ai-memory
+  write-page --body -` therefore stored a page with frontmatter and an
+  empty body while still reporting a successful write, and the same
+  applied to any other stdin reader (hooks fed by a pipe). The wrappers
+  now always pass `-i`, while `-t` is added only when stdin and stdout are
+  both terminals. `AI_MEMORY_NO_TTY=1` disables only TTY allocation and
+  no longer disconnects stdin. (#243)
+
 ## [1.18.0] - 2026-07-23
 
 ### Added
