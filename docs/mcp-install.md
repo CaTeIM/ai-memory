@@ -238,7 +238,12 @@ Aliases: `copilot`, `github-copilot`.
 
 **Config file:**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json` for an
+  unpackaged/legacy install, or `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  for the MSIX-packaged install Anthropic has shipped by default since
+  February 2026 — `install-mcp` detects which one applies automatically
+  by checking for a `Claude_*` directory under
+  `%LOCALAPPDATA%\Packages`.
 - Linux: not officially distributed by Anthropic. Use Claude Code
   (terminal) instead.
 
@@ -271,6 +276,15 @@ stdio shim. Requires Node.js installed on the same machine.
 - If the MCP indicator doesn't appear after restart, check the logs:
   `~/Library/Logs/Claude/mcp*.log` (macOS) or `%APPDATA%\Claude\logs\`
   (Windows).
+- **Windows MSIX packaging:** a packaged Claude Desktop is an
+  AppContainer — Windows virtualizes `%APPDATA%` for it into an isolated
+  `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\` tree that an
+  unpackaged process (like this CLI) never sees at the plain path.
+  `install-mcp --client claude-desktop --apply` detects this and writes
+  to the packaged location automatically; if you're on an older build of
+  this CLI without that detection, pass `--config-file` pointed at the
+  `LocalCache` path directly (find the exact `Claude_<id>` folder name
+  under `%LOCALAPPDATA%\Packages`).
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
   <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>
 

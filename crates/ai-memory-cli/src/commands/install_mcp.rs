@@ -132,12 +132,27 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             }
             #[cfg(target_os = "windows")]
             {
-                // %APPDATA% is roughly ~/AppData/Roaming.
-                home()?
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("Claude")
-                    .join("claude_desktop_config.json")
+                // Since Anthropic's Feb 2026 move to MSIX packaging, a
+                // packaged Claude Desktop is an AppContainer: it never
+                // sees the real, shared %APPDATA% this unpackaged binary
+                // writes to. Windows silently virtualizes well-known
+                // paths for packaged processes into an isolated
+                // `AppData\Local\Packages\<PackageFamilyName>\LocalCache\...`
+                // tree instead — writing to the plain path produces a
+                // file the running app will never read (issue found
+                // 2026-07-16). Prefer the packaged location when a
+                // `Claude_*` package is present; only unpackaged/legacy
+                // Squirrel installs fall back to the plain path.
+                let home = home()?;
+                let local_packages_dir = home.join("AppData").join("Local").join("Packages");
+                match packaged_claude_desktop_config_path(&local_packages_dir) {
+                    Some(packaged) => packaged,
+                    None => home
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("Claude")
+                        .join("claude_desktop_config.json"),
+                }
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -175,6 +190,41 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .context("could not resolve current dir for .vscode/mcp.json default")?
             .join(".vscode")
             .join("mcp.json"),
+    })
+}
+
+/// Windows-only detection for an MSIX/AppX-packaged Claude Desktop.
+/// `local_packages_dir` is normally `%LOCALAPPDATA%\Packages`; a packaged
+/// Claude Desktop registers a `Claude_<PackageFamilyName>`-style directory
+/// there regardless of whether the app has ever been launched (Windows
+/// creates the package directory at install time, but the `LocalCache`
+/// subtree lazily on first run — so this checks for the package directory
+/// itself, not the config file, and lets the caller's atomic-write path
+/// create the remaining subdirectories). Returns `None` when no such
+/// directory exists (unpackaged/legacy Squirrel install, or a non-Windows
+/// test double), so callers fall back to the plain path. Sorted so the
+/// result is deterministic on the (unexpected) chance more than one
+/// `Claude_*` directory exists.
+fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(local_packages_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("Claude_"))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().map(|package_dir| {
+        package_dir
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json")
     })
 }
 
@@ -965,6 +1015,44 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_prefers_localcache_when_package_dir_exists() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_pzs8sxrjxfjjc")).unwrap();
+
+        let found = packaged_claude_desktop_config_path(packages.path()).unwrap();
+        assert_eq!(
+            found,
+            packages
+                .path()
+                .join("Claude_pzs8sxrjxfjjc")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_ignores_unrelated_and_non_dir_entries() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Microsoft.WindowsTerminal_abc123")).unwrap();
+        fs::write(packages.path().join("Claude_notadir"), b"").unwrap();
+
+        assert!(packaged_claude_desktop_config_path(packages.path()).is_none());
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_none_when_packages_dir_absent_or_empty() {
+        let missing = tempfile::TempDir::new().unwrap();
+        assert!(
+            packaged_claude_desktop_config_path(&missing.path().join("does-not-exist")).is_none()
+        );
+
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(packaged_claude_desktop_config_path(empty.path()).is_none());
     }
 
     #[test]

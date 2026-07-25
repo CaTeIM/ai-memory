@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client of the running server; the command now requires a reachable
   server and no longer works against an offline data directory.
 
+### Fixed
+- `install-mcp --client claude-desktop` now detects an MSIX-packaged
+  Claude Desktop on Windows (the default distribution since February
+  2026) and writes to its virtualized
+  `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  instead of the plain `%APPDATA%\Claude\` path, which a packaged,
+  AppContainer-sandboxed Claude Desktop never reads. Previously this
+  silently wrote a config file the running app ignored, so the MCP
+  server never appeared after restart. Unpackaged/legacy installs are
+  unaffected and keep resolving to the plain path.
+
 ## [1.18.0] - 2026-07-23
 
 ### Added
