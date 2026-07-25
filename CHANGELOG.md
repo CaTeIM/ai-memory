@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GROK_HOME`. Grok stays out of the bare-mode automatic pool. Verified
   against Grok Build CLI v0.2.111 ([#237]).
 
+### Fixed
+- `install-mcp --client claude-desktop` now detects an MSIX-packaged
+  Claude Desktop on Windows and writes to its virtualized
+  `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  instead of the plain `%APPDATA%\Claude\` path. Previously this
+  silently wrote a config file the running app ignored, so the MCP
+  server never appeared after restart. The detector uses Windows'
+  resolved local and roaming app-data roots, prefers an existing config
+  when multiple package directories exist, and fails with an explicit
+  `--config-file` recovery instruction when the active package is
+  ambiguous. Unpackaged installs keep resolving to the plain path.
+  (#250)
+
 ## [1.18.0] - 2026-07-23
 
 ### Added
