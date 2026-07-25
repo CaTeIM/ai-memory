@@ -872,6 +872,24 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_system_prompts_require_graph_links_and_input_language() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(prompt.contains("## WIKILINKS"), "{name} prompt");
+            assert!(prompt.contains("## OUTPUT LANGUAGE"), "{name} prompt");
+            assert!(prompt.contains("[[project:page-path]]"), "{name} prompt");
+            assert!(prompt.contains("[[_global:page-path]]"), "{name} prompt");
+            assert!(
+                prompt.contains("dominant natural language of the input"),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("JSON keys stay in English"),
+                "{name} prompt"
+            );
+        }
+    }
+
+    #[test]
     fn build_request_elides_raw_observations_from_current_body() {
         let raw_dump = (0..2_000)
             .map(|i| format!("- `other` @ 1970-01-01T00:00:00Z — raw-entry-{i}"))

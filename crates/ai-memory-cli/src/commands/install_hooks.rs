@@ -818,21 +818,59 @@ fn apply_to_claude_code_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let path = match &args.config_file {
-        Some(p) => p.clone(),
-        None => claude_settings_path()?,
-    };
     let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
+    apply_to_claude_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_claude_code_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "claude-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "claude-code");
-    let strategy = args.project_strategy.baked();
+    let payload = crate::commands::render_shared::build_claude_code_script_payload_for_test(
+        &command_dir,
+        server_url,
+        auth_token,
+        Some(data_dir),
+        args.project_strategy.baked(),
+        args.capture_assistant,
+    );
+    apply_to_claude_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_claude_code_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "claude-code");
     let payload = build_claude_code_payload_with_data_dir(
         &command_dir,
         server_url,
         auth_token,
         Some(data_dir),
-        strategy,
+        args.project_strategy.baked(),
         args.capture_assistant,
     );
+    apply_to_claude_code_settings_with_payload(payload, args)
+}
+
+fn apply_to_claude_code_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None => claude_settings_path()?,
+    };
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -1048,21 +1086,62 @@ fn apply_to_codex_settings(
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "codex")?;
+    apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_codex_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "codex", staging_data_local)?;
+    let command_dir = staged_command_dir(&staged, "codex");
+    let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
+        &super::render_shared::CODEX_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "codex",
+        Some(data_dir),
+        args.project_strategy.baked(),
+    );
+    apply_to_codex_settings_with_payload(payload, args)
+}
+
+fn apply_to_codex_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let command_dir = staged_command_dir(staged, "codex");
+    let payload = build_profile_payload_for_agent(
+        &super::render_shared::CODEX_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "codex",
+        Some(data_dir),
+        args.project_strategy.baked(),
+    );
+    apply_to_codex_settings_with_payload(payload, args)
+}
+
+fn apply_to_codex_settings_with_payload(
+    payload: serde_json::Value,
+    args: &InstallHooksArgs,
+) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => codex_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "codex")?;
-    let command_dir = staged_command_dir(&staged, "codex");
-    let strategy = args.project_strategy.baked();
-    let outcome = merge_codex_hooks(
-        &command_dir,
-        server_url,
-        auth_token,
-        data_dir,
-        strategy,
-        &path,
-    )?;
+    let outcome = merge_codex_payload(payload, &path)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -1087,6 +1166,7 @@ fn apply_to_codex_settings(
     Ok(())
 }
 
+#[cfg(test)]
 fn merge_codex_hooks(
     staged: &Path,
     server_url: &str,
@@ -1107,6 +1187,10 @@ fn merge_codex_hooks(
         Some(data_dir),
         project_strategy,
     );
+    merge_codex_payload(payload, config_path)
+}
+
+fn merge_codex_payload(payload: serde_json::Value, config_path: &Path) -> Result<ApplyOutcome> {
     let our_hooks = payload
         .get("hooks")
         .and_then(|v| v.as_object())
@@ -4922,6 +5006,72 @@ model = "gpt-5"
         assert!(parsed["hooks"]["SessionStart"].is_array());
     }
 
+    /// The test-only Codex wrapper must stage scripts under its injected
+    /// data-local root and wire that stable path into the generated config.
+    #[test]
+    fn codex_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_codex_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &InstallHooksArgs {
+                agent: AgentChoice::Codex,
+                capture_assistant: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("codex")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let command = parsed
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("SessionStart command should be present");
+        assert!(
+            command.contains(&staged_script.to_string_lossy().into_owned()),
+            "generated command must reference staged script {}: {command}",
+            staged_script.display()
+        );
+    }
+
     // ----------------------------------------------------------------
     // Gemini tests
     // ----------------------------------------------------------------
@@ -5308,6 +5458,73 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 path.display()
             );
         }
+    }
+
+    /// The test-only Claude Code wrapper must stage scripts under its injected
+    /// data-local root and wire that stable path into the generated config.
+    #[test]
+    fn claude_code_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("settings.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_claude_code_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            staging_tmp.path(),
+            &InstallHooksArgs {
+                agent: AgentChoice::ClaudeCode,
+                capture_assistant: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("claude-code")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let command = parsed
+            .pointer("/hooks/SessionStart/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("SessionStart command should be present");
+        assert!(
+            command.contains(&staged_script.to_string_lossy().into_owned()),
+            "generated command must reference staged script {}: {command}",
+            staged_script.display()
+        );
     }
 
     #[test]

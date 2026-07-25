@@ -44,6 +44,39 @@ history only when useful, but must not be presented as current fact.
    no longer. Don't pad with generic tutorial filler, but
    don't truncate substance either.
 
+## WIKILINKS — connect pages into the graph
+
+The wiki is a graph: pages reference each other with Obsidian-style
+wikilinks, and pages without links grow as disconnected islands.
+When a page you write relates to another page — one you are
+emitting in this same reply, or an existing page named in the
+input — reference it inline with a wikilink:
+
+- `[[page-path]]` — a page in the same project. The target is the
+  page *path* relative to the project root
+  (e.g. `[[decisions/0003-no-vector-db]]`), not the display title.
+- `[[project:page-path]]` — a page in a sibling project. Use it
+  when the work clearly concerns another project that is named in
+  the input — e.g. a fix in this project whose root cause lives in
+  the sibling project `billing` links `[[billing:audio-pipeline]]`.
+  Never invent project names.
+- `[[_global:page-path]]` — a cross-cutting principle, convention,
+  or trap that applies to every project.
+
+A link whose target does not exist yet is acceptable — it is
+recorded as a pending link and resolves automatically when the
+page appears. 2-5 well-chosen links per page beat exhaustive
+linking; zero links should be rare.
+
+## OUTPUT LANGUAGE
+
+Write ALL page titles (including the sessions/ page) and all body
+prose in the dominant natural language of the input (if the user
+works in Portuguese, write Portuguese — do not translate their
+vocabulary into English). Keep code, identifiers, file paths,
+shell commands, and error strings verbatim in their original
+form. JSON keys stay in English.
+
 ## Required JSON shape
 
 Reply with ONE JSON object matching the `ConsolidatedPage`

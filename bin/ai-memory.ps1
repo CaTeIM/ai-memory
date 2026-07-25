@@ -44,9 +44,11 @@ $HomePath = (Resolve-Path -LiteralPath $HOME).Path
 $WorkPath = (Get-Location).Path
 $HookHostRoot = ($HomePath -replace '\\', '/') + "/.local/share/ai-memory/hooks"
 
-$DockerArgs = @("run", "--rm")
+$DockerArgs = @("run", "--rm", "-i")
+# Keep stdin attached in every mode. `AI_MEMORY_NO_TTY` suppresses only the
+# pseudo-terminal allocation.
 if (-not $env:AI_MEMORY_NO_TTY -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-    $DockerArgs += "-it"
+    $DockerArgs += "-t"
 }
 
 $DockerArgs += @(

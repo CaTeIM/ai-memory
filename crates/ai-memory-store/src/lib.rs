@@ -60,7 +60,7 @@ pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
     PreparedWorkstreamRun, StoredManagedRunStatus, WorkstreamSelection,
 };
-pub use writer::WriterHandle;
+pub use writer::{StartupContextAcceptance, WriterHandle};
 
 /// Filename used inside the data dir's `db/` subdirectory.
 pub const DB_FILENAME: &str = "memory.sqlite";
@@ -122,9 +122,9 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        ActorContext, AgentKind, LinkTarget, ManagedRunId, NewObservation, NewPage, NewSession,
-        NewWorkstreamEvent, ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized,
-        Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        ActorContext, AgentKind, LinkTarget, ManagedRunId, NewHandoff, NewObservation, NewPage,
+        NewSession, NewWorkstreamEvent, ObservationId, ObservationKind, PageId, PagePath,
+        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -4416,6 +4416,84 @@ mod tests {
                 .await
                 .unwrap(),
             "cancelled runs cannot accept context"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_context_claim_is_atomic_and_single_use() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "startup-claim").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        let insert_handoff = || NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+        };
+
+        let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
+        let accepted = store
+            .writer
+            .accept_startup_context(
+                Some(first_handoff),
+                AgentKind::Codex,
+                None,
+                Some(run.run_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            StartupContextAcceptance {
+                handoff_accepted: true,
+                managed_context_accepted: true,
+            }
+        );
+        assert!(
+            store
+                .reader
+                .latest_open_handoff(ws, proj, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let second_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
+        let rejected = store
+            .writer
+            .accept_startup_context(
+                Some(second_handoff),
+                AgentKind::Codex,
+                None,
+                Some(run.run_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected,
+            StartupContextAcceptance::default(),
+            "an already-delivered managed packet must reject the whole claim"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_open_handoff(ws, proj, None)
+                .await
+                .unwrap()
+                .map(|handoff| handoff.id),
+            Some(second_handoff),
+            "a failed managed claim must roll back the handoff transition"
         );
     }
 

@@ -517,13 +517,31 @@ pub(crate) fn link_native_session(
 
 /// Mark the assigned synchronization packet delivered to SessionStart.
 pub(crate) fn accept_context(conn: &mut Connection, run_id: ManagedRunId) -> StoreResult<bool> {
-    let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
+    let accepted = accept_context_in_transaction(&tx, run_id, false)?;
+    tx.commit()?;
+    Ok(accepted)
+}
+
+pub(crate) fn claim_context_in_transaction(
+    tx: &Transaction<'_>,
+    run_id: ManagedRunId,
+) -> StoreResult<bool> {
+    accept_context_in_transaction(tx, run_id, true)
+}
+
+fn accept_context_in_transaction(
+    tx: &Transaction<'_>,
+    run_id: ManagedRunId,
+    require_undelivered: bool,
+) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
     let run: Option<(Vec<u8>, String, Option<String>, i64)> = tx
         .query_row(
             "SELECT workstream_id, agent_kind, native_session_id, sync_through \
-             FROM managed_runs WHERE id = ?1 AND state = 'active'",
-            params![run_id.as_bytes()],
+             FROM managed_runs WHERE id = ?1 AND state = 'active' \
+               AND (?2 = 0 OR context_delivered = 0)",
+            params![run_id.as_bytes(), i64::from(require_undelivered)],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
@@ -543,7 +561,6 @@ pub(crate) fn accept_context(conn: &mut Connection, run_id: ManagedRunId) -> Sto
             params![sync_through, now, workstream, agent, native_session],
         )?;
     }
-    tx.commit()?;
     Ok(true)
 }
 
