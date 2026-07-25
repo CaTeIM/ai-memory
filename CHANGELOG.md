@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-07-25
+
 ### Fixed
 - Claude Desktop's rendered Windows MCP instructions now distinguish the
   unpackaged `%APPDATA%` config from the detected MSIX `LocalCache` config, and
@@ -34,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory finalize-session` now uses this endpoint instead of opening
   the local SQLite index directly, so every CLI command is a thin HTTP
   client of the running server; the command now requires a reachable
-  server and no longer works against an offline data directory.
+  server and no longer works against an offline data directory. (#236)
 - Managed workstream support for Grok Build CLI: `ai-memory run grok` (alias
   `grok-build`) creates fresh sessions with a wrapper-generated `--session-id`,
   resumes linked sessions with `--resume`, maps wrapper `--yolo` onto Grok's
@@ -2381,7 +2383,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.18.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.0...HEAD
+[1.19.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.0
 [1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0
 [1.17.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.3
 [1.17.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.2
