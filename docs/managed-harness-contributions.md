@@ -1,8 +1,8 @@
 # Adding a managed harness
 
 Managed-workstream support is narrower than MCP or lifecycle-hook support. This
-release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP.
-Gemini CLI, Devin CLI, Cursor, Grok Build CLI, and the other integrations in
+release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and
+Grok Build CLI. Gemini CLI, Devin CLI, Cursor, and the other integrations in
 the README support matrix do not become managed merely because ai-memory can
 capture their hooks.
 

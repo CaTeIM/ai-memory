@@ -1083,48 +1083,14 @@ async fn fetch_and_accept_handoff(
     actor_user: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-    if let Some(raw_run_id) = query.managed_run.as_deref() {
-        let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
-            warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
-            return Ok(None);
-        };
-        if let Some(native_session_id) = query
-            .session_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let _ = state
-                .writer
-                .link_managed_run_session(run_id, agent, native_session_id)
-                .await?;
-        }
-        let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
-            warn!(managed_run = %run_id, "managed SessionStart has no active run");
-            return Ok(None);
-        };
-        if context.agent != agent {
-            warn!(
-                managed_run = %run_id,
-                expected = %context.agent.as_str(),
-                actual = %agent.as_str(),
-                "managed SessionStart agent mismatch"
-            );
-            return Ok(None);
-        }
-        let brief_md =
-            resolve_requested_session_brief(state, &query, actor_user.as_deref()).await?;
-        if context.context_delivered {
-            return Ok(brief_md);
-        }
-        let rendered = render_managed_context(
-            &context.events,
-            &context.workstream_name,
-            context.workstream_id,
-            context.sync_after,
-        );
-        let _ = state.writer.accept_managed_run_context(run_id).await?;
-        return Ok(combine_handoff_and_brief(rendered, brief_md));
-    }
+    // A managed run's ledger is additive, not a replacement. Returning it here
+    // skipped `latest_open_handoff` below, so a session launched by
+    // `ai-memory run` never consumed the handoff a previous session left for
+    // it — the slot just stayed open, and the next managed session missed it
+    // too. The brief already reaches the managed path (it is recomposed per
+    // session, so resolving it twice was harmless); the handoff is single-use
+    // and had no second chance.
+    let managed = fetch_managed_context(state, &query, agent).await?;
     // `/handoff` has no session_id in the request — `per_session` mode
     // therefore falls back to the single slot (graceful degradation),
     // while `per_actor` keys by `user` alone.
@@ -1144,49 +1110,108 @@ async fn fetch_and_accept_handoff(
         false,
     )
     .await?;
-    let handoff_md = {
-        let handoff = state
-            .reader
-            .latest_open_handoff(ws, proj, query.cwd.clone())
-            .await?;
-        match handoff {
-            Some(h) => {
-                state.writer.accept_handoff(h.id, agent, None).await?;
-                Some(render_handoff_markdown(&h))
-            }
-            None => None,
-        }
-    };
+    let handoff = state
+        .reader
+        .latest_open_handoff(ws, proj, query.cwd.clone())
+        .await?;
+    let handoff_md = handoff.as_ref().map(render_handoff_markdown);
     // The brief is additive and non-destructive: unlike the handoff (a
-    // single-use slot consumed above), it is recomposed on every opted-in
+    // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj).await?;
-    Ok(combine_handoff_and_brief(handoff_md, brief_md))
+    // Handoff first: it is a short curated pointer and must not be buried
+    // under a ledger that can run tens of KB. The existing ledger-then-brief
+    // order is preserved. Claim both single-use inputs only after every
+    // fallible read and render has succeeded, and in one transaction so a
+    // failed or racing managed claim cannot consume the handoff by itself.
+    let acceptance = if handoff.is_some() || managed.is_some() {
+        state
+            .writer
+            .accept_startup_context(
+                handoff.as_ref().map(|handoff| handoff.id),
+                agent,
+                None,
+                managed.as_ref().map(|managed| managed.run_id),
+            )
+            .await?
+    } else {
+        ai_memory_store::StartupContextAcceptance::default()
+    };
+    let handoff_md = if acceptance.handoff_accepted {
+        handoff_md
+    } else {
+        None
+    };
+    let managed_md = if acceptance.managed_context_accepted {
+        managed.and_then(|managed| managed.markdown)
+    } else {
+        None
+    };
+    Ok(combine_handoff_and_brief(
+        handoff_md,
+        combine_handoff_and_brief(managed_md, brief_md),
+    ))
 }
 
-async fn resolve_requested_session_brief(
+struct PendingManagedContext {
+    run_id: ManagedRunId,
+    markdown: Option<String>,
+}
+
+/// Render the managed-run ledger for this SessionStart, if there is one.
+///
+/// Returns `None` — never an early exit for the caller — when the run is
+/// unusable (bad id, no active run, agent mismatch) or its context was
+/// already delivered. The pending handoff still has to reach the agent in
+/// every one of those cases.
+async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
-    actor_user: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    if !crate::payload::query_flag_truthy(query.briefing.as_deref()) {
+    agent: AgentKind,
+) -> anyhow::Result<Option<PendingManagedContext>> {
+    let Some(raw_run_id) = query.managed_run.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
+        warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
+        return Ok(None);
+    };
+    if let Some(native_session_id) = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let _ = state
+            .writer
+            .link_managed_run_session(run_id, agent, native_session_id)
+            .await?;
+    }
+    let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
+        warn!(managed_run = %run_id, "managed SessionStart has no active run");
+        return Ok(None);
+    };
+    if context.agent != agent {
+        warn!(
+            managed_run = %run_id,
+            expected = %context.agent.as_str(),
+            actual = %agent.as_str(),
+            "managed SessionStart agent mismatch"
+        );
         return Ok(None);
     }
-    let actor_key = ai_memory_core::ActorKey {
-        user: actor_user.map(str::to_owned),
-        session_id: None,
-    };
-    let (ws, proj) = resolve_project_ids_inner(
-        state,
-        query.cwd.as_deref(),
-        query.workspace.as_deref(),
-        query.project.as_deref(),
-        ProjectStrategy::parse(query.project_strategy.as_deref()),
-        &actor_key,
-        false,
-    )
-    .await?;
-    render_requested_session_brief(state, query, ws, proj).await
+    if context.context_delivered {
+        return Ok(None);
+    }
+    let rendered = render_managed_context(
+        &context.events,
+        &context.workstream_name,
+        context.workstream_id,
+        context.sync_after,
+    );
+    Ok(Some(PendingManagedContext {
+        run_id,
+        markdown: rendered,
+    }))
 }
 
 async fn render_requested_session_brief(
@@ -2324,11 +2349,17 @@ async fn consolidate_or_synth(
             "{}: LLM consolidation written",
             checkpoint_label
         );
-        let _ = state.wiki.commit_all(&format!(
-            "{}(session {}): checkpoint",
-            checkpoint_label,
-            short_id(&session_id.to_string()),
-        ));
+        let _ = state
+            .wiki
+            .commit_all(&format!(
+                "{}(session {}): checkpoint",
+                checkpoint_label,
+                short_id(&session_id.to_string()),
+            ))
+            .map_err(|e| {
+                tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
+                e
+            });
         return Ok(());
     }
     let observations = state.reader.observations_for_session(session_id).await?;
@@ -2352,11 +2383,17 @@ async fn consolidate_or_synth(
             actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await?;
-    let _ = state.wiki.commit_all(&format!(
-        "{}(session {}): checkpoint",
-        checkpoint_label,
-        short_id(&session_id.to_string()),
-    ));
+    let _ = state
+        .wiki
+        .commit_all(&format!(
+            "{}(session {}): checkpoint",
+            checkpoint_label,
+            short_id(&session_id.to_string()),
+        ))
+        .map_err(|e| {
+            tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
+            e
+        });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
     Ok(())
 }
@@ -5646,6 +5683,118 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_session_start_delivers_ledger_and_pending_handoff() {
+        use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
+        use ai_memory_store::{FinishWorkstreamRun, PrepareWorkstreamRun, WorkstreamSelection};
+
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let prepare = PrepareWorkstreamRun {
+            workspace_id: state.workspace_id,
+            project_id: state.project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: cwd.clone(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test:1".into(),
+        };
+        // First run: nothing to replay, but it leaves a portable event behind.
+        let first = state
+            .writer
+            .prepare_workstream_run(prepare.clone())
+            .await
+            .unwrap();
+        state
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: first.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: Some("cursor-1".into()),
+                events: vec![NewWorkstreamEvent {
+                    event_id: "event-1".into(),
+                    agent: AgentKind::Codex,
+                    native_session_id: "native-1".into(),
+                    source_record_id: Some("record-1".into()),
+                    kind: WorkstreamEventKind::Message,
+                    role: Some("assistant".into()),
+                    content: "LEDGER-MARKER".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({}),
+                }],
+                complete: true,
+                segment_path: Some("segment-1.jsonl".into()),
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        // Second run: this is the SessionStart that has a ledger to deliver.
+        let run = state.writer.prepare_workstream_run(prepare).await.unwrap();
+
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: vec!["resume the curated thread".to_string()],
+                files_touched: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: Some(run.run_id.to_string()),
+            session_id: Some("native-2".into()),
+        };
+        let rendered = fetch_and_accept_handoff(&state, query.clone(), None)
+            .await
+            .unwrap();
+
+        let rendered = rendered.expect("managed SessionStart must return context");
+        assert!(
+            rendered.contains("LEDGER-MARKER"),
+            "managed SessionStart must still deliver the workstream ledger: {rendered}"
+        );
+        assert!(
+            rendered.contains("HANDOFF-MARKER"),
+            "the managed ledger must not swallow the pending handoff: {rendered}"
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, state.project_id, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a handoff delivered on a managed SessionStart must be marked accepted"
+        );
+        assert!(
+            fetch_and_accept_handoff(&state, query, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the combined handoff and managed packet must be delivered only once"
         );
     }
 

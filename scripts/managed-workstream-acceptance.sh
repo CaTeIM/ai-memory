@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${AI_MEMORY_ACCEPTANCE_BIN:-"$ROOT/target/debug/ai-memory"}
 KEEP=${AI_MEMORY_ACCEPTANCE_KEEP:-0}
 DETERMINISTIC_ONLY=${AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY:-0}
-HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi"}
+HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi grok"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-workstream-acceptance.XXXXXX")
 DATA="$TMP/data"
 REPO="$TMP/repo"
@@ -138,6 +138,32 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
       "$(date +%s)000" "$sentinel" >>"$wire"
     printf '{"type":"context.append_message","time":%s,"message":{"role":"assistant","content":[{"type":"text","text":"%s reply"}],"toolCalls":[]}}\n' \
       "$(date +%s)000" "$sentinel" >>"$wire"
+    ;;
+  grok)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume <id>`
+    # (returning) selectors the way the real CLI does.
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      case "$previous_arg" in
+        --session-id | --resume) session_id=$arg ;;
+      esac
+      previous_arg=$arg
+    done
+    [ -n "$session_id" ] || session_id="019f-fake-$(date +%s)-$$"
+    # The bucket directory name is a URL-encoded cwd in the real layout, but
+    # discovery must read summary.json's info.cwd instead of parsing it.
+    session_dir="${GROK_HOME:?grok fake mode requires GROK_HOME}/sessions/%2Ffixture%2Fbucket/$session_id"
+    mkdir -p "$session_dir"
+    chat="$session_dir/chat_history.jsonl"
+    if [ ! -f "$session_dir/summary.json" ]; then
+      printf '{"info":{"id":"%s","cwd":"%s"}}\n' "$session_id" "$PWD" >"$session_dir/summary.json"
+      printf '{"type":"system","content":"fake grok system prompt"}\n' >"$chat"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-GROK}
+    printf '{"type":"user","content":[{"type":"text","text":"%s"}]}\n' "$sentinel" >>"$chat"
+    printf '{"type":"assistant","content":"%s reply"}\n' "$sentinel" >>"$chat"
     ;;
 esac
 EOF
@@ -410,6 +436,111 @@ jq -e \
   exit 1
 }
 
+# Grok fake-mode fixture: the fake grok honors the wrapper's `--session-id`
+# (fresh) and `--resume <id>` (returning) selectors, writes the native store
+# layout ($GROK_HOME/sessions/<bucket>/<id>/summary.json plus
+# chat_history.jsonl), and appends the round sentinel. The returning launch
+# must also receive the undelivered workstream packet through `--rules`.
+GROK_FAKE_HOME="$CONFIG/grok-fake"
+mkdir -p "$GROK_FAKE_HOME"
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-ONE" \
+    "$BIN" --data-dir "$DATA" run --new edge-grok --executable "$FAKE" \
+      grok >"$LOGS/edge-grok-first.log" 2>&1
+)
+grep -qx -- '--session-id' "$TMP/grok-first-argv.log" || {
+  printf 'fresh grok launch did not receive a wrapper session id\n' >&2
+  cat "$TMP/grok-first-argv.log" >&2
+  exit 1
+}
+if grep -qx -- '--rules' "$TMP/grok-first-argv.log"; then
+  printf 'fresh grok launch on an empty workstream unexpectedly received --rules\n' >&2
+  exit 1
+fi
+grok_session_id=$(basename "$(find "$GROK_FAKE_HOME/sessions" -mindepth 2 -maxdepth 2 -type d -print -quit)")
+[ -n "$grok_session_id" ] || {
+  printf 'fake grok did not create a native session store\n' >&2
+  exit 1
+}
+grok_ws_hex=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT lower(hex(id)) FROM workstreams WHERE name = 'edge-grok' ORDER BY selected_at DESC LIMIT 1;")
+[ "${#grok_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-grok workstream id\n' >&2
+  exit 1
+}
+grok_ws_id="${grok_ws_hex:0:8}-${grok_ws_hex:8:4}-${grok_ws_hex:12:4}-${grok_ws_hex:16:4}-${grok_ws_hex:20:12}"
+grok_first_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$grok_ws_id" --limit 100 --json "AMWS-FAKE-GROK-ONE")
+jq -e --arg id "$grok_session_id" \
+  '[.[] | select(.agent == "grok" and .role == "assistant" and (.content | contains("AMWS-FAKE-GROK-ONE")) and .native_session_id == $id)] | length == 1' \
+  <<<"$grok_first_hits" >/dev/null || {
+  printf 'grok chat_history.jsonl sentinel was not imported\n' >&2
+  tail -80 "$LOGS/edge-grok-first.log" >&2
+  exit 1
+}
+# Returning to the same grok session must resume it (`--resume <id>`) and,
+# because that session already produced every workstream event, receive no
+# context packet.
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-TWO" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-grok --executable "$FAKE" \
+      grok-build >"$LOGS/edge-grok-second.log" 2>&1
+)
+grep -A1 -x -- '--resume' "$TMP/grok-second-argv.log" | grep -qx "$grok_session_id" || {
+  printf 'returning grok launch did not resume the linked session\n' >&2
+  cat "$TMP/grok-second-argv.log" >&2
+  exit 1
+}
+if grep -qx -- '--rules' "$TMP/grok-second-argv.log"; then
+  printf 'same-session grok resume unexpectedly received a context packet\n' >&2
+  exit 1
+fi
+grok_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$grok_ws_id" --limit 100 --json "AMWS-FAKE-GROK")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-GROK-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-GROK-TWO")))] | length == 1)' \
+  <<<"$grok_second_hits" >/dev/null || {
+  printf 'grok incremental import duplicated or missed a round sentinel\n' >&2
+  tail -80 "$LOGS/edge-grok-second.log" >&2
+  exit 1
+}
+
+# A fresh grok session joining the established edge-kimi workstream must
+# receive that workstream's history through `--rules`, with historical tool
+# activity labelled as completed evidence.
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-CROSS" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      grok >"$LOGS/edge-grok-cross.log" 2>&1
+)
+grep -qx -- '--session-id' "$TMP/grok-cross-argv.log" || {
+  printf 'grok joining an established workstream did not start a fresh session\n' >&2
+  cat "$TMP/grok-cross-argv.log" >&2
+  exit 1
+}
+grep -qx -- '--rules' "$TMP/grok-cross-argv.log" || {
+  printf 'grok joining an established workstream did not receive --rules context\n' >&2
+  cat "$TMP/grok-cross-argv.log" >&2
+  exit 1
+}
+grep -q 'AMWS-FAKE-KIMI' "$TMP/grok-cross-argv.log" || {
+  printf 'the grok --rules packet did not carry the prior harness history\n' >&2
+  exit 1
+}
+
 # A blank first launch remains eligible for one-time native-session adoption.
 # Use a pseudo-terminal because redirected/scripted launches deliberately skip
 # the chooser.
@@ -484,6 +615,7 @@ harnesses=()
 for requested_harness in "${requested_harnesses[@]}"; do
   case "$requested_harness" in
     kimi-code | kimi-cli) harness=kimi ;;
+    grok-build) harness=grok ;;
     *) harness=$requested_harness ;;
   esac
   if command -v "$harness" >/dev/null 2>&1; then
@@ -509,10 +641,11 @@ OMP_EXTENSION="$CONFIG/omp/ai-memory.ts"
 OMP_AGENT_DIR="$CONFIG/omp/agent"
 CRUSH_DATA_DIR="$CONFIG/crush/data"
 KIMI_ACCEPTANCE_HOME="$CONFIG/kimi-home"
+GROK_ACCEPTANCE_HOME="$CONFIG/grok-home"
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")" "$(dirname "$CODEX_HOOKS")" \
   "$(dirname "$OPENCODE_PLUGIN")" "$(dirname "$PI_EXTENSION")" \
   "$(dirname "$OMP_EXTENSION")" "$OMP_AGENT_DIR" "$OPENCODE_DATA_HOME/opencode" \
-  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME"
+  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME" "$GROK_ACCEPTANCE_HOME"
 
 # Redirect native transcript stores into the fixture while reusing only the
 # minimum authentication material required for real model calls.
@@ -564,6 +697,15 @@ for relative in credentials/kimi-code.json oauth/kimi-code device_id; do
   if [ -f "$HOME/.kimi-code/$relative" ]; then
     mkdir -p "$KIMI_ACCEPTANCE_HOME/$(dirname "$relative")"
     cp "$HOME/.kimi-code/$relative" "$KIMI_ACCEPTANCE_HOME/$relative"
+  fi
+done
+
+# Grok resolves everything below $GROK_HOME. Seed the isolated home with the
+# operator's login state and settings only; native sessions, logs, and caches
+# remain isolated.
+for relative in auth.json config.toml; do
+  if [ -f "$HOME/.grok/$relative" ]; then
+    cp "$HOME/.grok/$relative" "$GROK_ACCEPTANCE_HOME/$relative"
   fi
 done
 
@@ -669,6 +811,10 @@ run_harness() {
       native_args=(-p "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_KIMI_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_KIMI_MODEL" "$prompt")
       ;;
+    grok)
+      native_args=(-p "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_GROK_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_GROK_MODEL" "$prompt")
+      ;;
     *)
       printf 'unsupported acceptance harness: %s\n' "$harness" >&2
       return 1
@@ -696,6 +842,10 @@ run_harness() {
       >"$log" 2>&1
   elif [ "$harness" = kimi ]; then
     (cd "$REPO" && KIMI_CODE_HOME="$KIMI_ACCEPTANCE_HOME" \
+      "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
+      >"$log" 2>&1
+  elif [ "$harness" = grok ]; then
+    (cd "$REPO" && GROK_HOME="$GROK_ACCEPTANCE_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
   else
