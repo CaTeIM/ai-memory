@@ -1,11 +1,23 @@
 //! Wire envelope received on `POST /hook`.
 
-use ai_memory_core::{AgentKind, ObservationKind};
+use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, truncate_utf8_bytes};
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
     ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
 };
+
+/// Durable excerpt ceiling for user prompts. Prompts retain more working
+/// context than tool/notification summaries while remaining bounded.
+pub const USER_PROMPT_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for post-compaction summaries.
+pub const POST_COMPACTION_EXCERPT_MAX_BYTES: usize = OBSERVATION_BODY_MAX_BYTES;
+
+/// Durable excerpt ceiling for notifications.
+pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
+
+const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
 
 /// Query-string parameters on `POST /hook`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -744,7 +756,8 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 
 fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String> {
     match event {
-        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"]),
+        HookEvent::UserPrompt => extract_content(raw, &["prompt", "message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, USER_PROMPT_EXCERPT_MAX_BYTES)),
         HookEvent::PostToolUse => {
             let tool = extract_string(raw, &["tool", "tool_name", "name"])
                 .or_else(|| extract_string_path(raw, &[&["toolCall", "name"]]))
@@ -757,8 +770,10 @@ fn best_body_excerpt(event: HookEvent, raw: &serde_json::Value) -> Option<String
                     .unwrap_or_else(|| "(no output captured)".into());
             Some(format!("tool: {tool}\n---\n{}", truncate_excerpt(&result)))
         }
-        HookEvent::Notification => extract_content(raw, &["message", "text"]),
-        HookEvent::PostCompaction => extract_content(raw, &["summary"]),
+        HookEvent::Notification => extract_content(raw, &["message", "text"])
+            .map(|body| truncate_utf8_bytes(&body, NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => extract_content(raw, &["summary"])
+            .map(|body| truncate_utf8_bytes(&body, POST_COMPACTION_EXCERPT_MAX_BYTES)),
         _ => None,
     }
 }
@@ -776,31 +791,72 @@ fn truncate_for_title(s: &str) -> String {
 }
 
 fn truncate_excerpt(s: &str) -> String {
-    truncate_utf8_bytes(s, 2_000)
+    truncate_utf8_bytes(s, TOOL_EXCERPT_MAX_BYTES)
 }
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, reserving the
-/// ellipsis within the cap (never beyond it). Shared by the tool-excerpt cap
-/// and the opt-in assistant excerpt cap (#196) so there is one UTF-8-safe
-/// truncation, two named caps.
-pub(crate) fn truncate_utf8_bytes(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    // Reserve the ellipsis within the byte cap, not beyond it.
-    let limit = max.saturating_sub('…'.len_utf8());
-    let mut buf = String::with_capacity(max);
-    let mut end = 0;
-    for (idx, ch) in s.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > limit {
-            break;
+/// Cap core lifecycle body fields before the native hook writes its local
+/// spool entry. The server independently reapplies the same per-event limits
+/// while constructing [`HookEnvelope`], and the typed persistence boundary has
+/// a universal backstop.
+pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEvent) -> bool {
+    let Some((keys, max_bytes)) = core_body_cap(event) else {
+        return false;
+    };
+    let mut changed = cap_candidate_group(raw, keys, max_bytes);
+    for container in ["payload", "event"] {
+        if let Some(nested) = raw.get_mut(container) {
+            changed |= cap_candidate_group(nested, keys, max_bytes);
         }
-        end = next;
     }
-    buf.push_str(&s[..end]);
-    buf.push('…');
-    buf
+    changed
+}
+
+fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
+    match event {
+        HookEvent::UserPrompt => Some((
+            &["prompt", "message", "text"],
+            USER_PROMPT_EXCERPT_MAX_BYTES,
+        )),
+        HookEvent::Notification => Some((&["message", "text"], NOTIFICATION_EXCERPT_MAX_BYTES)),
+        HookEvent::PostCompaction => Some((&["summary"], POST_COMPACTION_EXCERPT_MAX_BYTES)),
+        _ => None,
+    }
+}
+
+fn cap_candidate_group(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let mut changed = cap_object_fields(value, keys, max_bytes);
+    if let Some(properties) = value.get_mut("properties") {
+        changed |= cap_object_fields(properties, keys, max_bytes);
+        if let Some(info) = properties.get_mut("info") {
+            changed |= cap_object_fields(info, keys, max_bytes);
+        }
+    }
+    for container in ["info", "path"] {
+        if let Some(nested) = value.get_mut(container) {
+            changed |= cap_object_fields(nested, keys, max_bytes);
+        }
+    }
+    changed
+}
+
+fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in keys {
+        let Some(field) = object.get_mut(*key) else {
+            continue;
+        };
+        let Some(text) = value_to_text(field) else {
+            continue;
+        };
+        if text.len() > max_bytes {
+            *field = serde_json::Value::String(truncate_utf8_bytes(&text, max_bytes));
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn normalize_extension_name(value: Option<&str>) -> Option<String> {
@@ -1441,6 +1497,76 @@ mod tests {
         let title = env.title_hint.unwrap();
         assert!(title.chars().count() <= 80);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn core_lifecycle_bodies_use_named_utf8_safe_caps() {
+        for (event, field, cap) in [
+            ("user-prompt", "prompt", USER_PROMPT_EXCERPT_MAX_BYTES),
+            ("notification", "message", NOTIFICATION_EXCERPT_MAX_BYTES),
+            (
+                "post-compaction",
+                "summary",
+                POST_COMPACTION_EXCERPT_MAX_BYTES,
+            ),
+        ] {
+            let body = format!("{}éTAIL_SENTINEL", "x".repeat(cap - 1));
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({(field): body}),
+            );
+            let excerpt = env.body_excerpt.expect("bounded body excerpt");
+            assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
+            assert!(excerpt.ends_with('…'), "{event} omitted truncation marker");
+            assert!(
+                !excerpt.contains("TAIL_SENTINEL"),
+                "{event} retained content after the cap"
+            );
+        }
+    }
+
+    #[test]
+    fn client_body_cap_covers_supported_nested_candidate_shapes() {
+        let mut raw = serde_json::json!({
+            "prompt": "x".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1),
+            "payload": {
+                "properties": {
+                    "info": {
+                        "message": [{"type": "text", "text": "y".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)}]
+                    }
+                }
+            },
+            "event": {
+                "info": {
+                    "text": "z".repeat(USER_PROMPT_EXCERPT_MAX_BYTES + 1)
+                }
+            }
+        });
+        assert!(cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        for value in [
+            &raw["prompt"],
+            &raw["payload"]["properties"]["info"]["message"],
+            &raw["event"]["info"]["text"],
+        ] {
+            let text = value.as_str().expect("oversized value flattened to text");
+            assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+            assert!(text.ends_with('…'));
+        }
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::UserPrompt
+        ));
+        assert!(!cap_lifecycle_body_for_client(
+            &mut raw,
+            HookEvent::SessionStart
+        ));
     }
 
     /// Kimi Code's content-block `prompt` must flatten into the title

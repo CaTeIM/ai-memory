@@ -235,6 +235,50 @@ fn opted_in_non_stop_event_is_inert() {
 }
 
 #[test]
+fn oversized_core_bodies_are_capped_before_the_local_spool() {
+    for (event, field, cap) in [
+        (
+            "user-prompt-submit",
+            "prompt",
+            ai_memory_hooks::USER_PROMPT_EXCERPT_MAX_BYTES,
+        ),
+        (
+            "notification",
+            "message",
+            ai_memory_hooks::NOTIFICATION_EXCERPT_MAX_BYTES,
+        ),
+        (
+            "post-compaction",
+            "summary",
+            ai_memory_hooks::POST_COMPACTION_EXCERPT_MAX_BYTES,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let payload = serde_json::json!({
+            "session_id": "bounded-spool",
+            (field): format!("{}TAIL_SENTINEL", "x".repeat(cap + 8))
+        })
+        .to_string();
+        let output = run_hook_event(tmp.path(), event, payload.as_bytes());
+        assert!(
+            output.status.success(),
+            "{event}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = spooled_body(tmp.path());
+        assert!(
+            !body.contains("TAIL_SENTINEL"),
+            "{event} spool was not capped"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("spooled body remains JSON");
+        let excerpt = json[field].as_str().expect("body field is text");
+        assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
+        assert!(excerpt.ends_with('…'));
+    }
+}
+
+#[test]
 fn every_spooled_event_carries_a_persistent_ingest_key() {
     // The idempotency key is minted ONCE at spool time and baked into the
     // entry's URL: every retry of that entry re-sends the same key, so the

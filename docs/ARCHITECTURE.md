@@ -151,6 +151,7 @@ normalises them to exactly one of these `ObservationKind` values:
 | `pre-tool-use` | Agent is about to call a tool. |
 | `post-tool-use` | Agent finished a tool call. |
 | `pre-compact` | Agent is about to compact or compress its context. |
+| `post-compaction` | Agent compacted context and supplied a post-facto summary or checkpoint. |
 | `notification` | Agent emitted a notification-style event. |
 | `stop` | Agent finished an interactive turn or stopped naturally. |
 | `session-end` | Agent session ended; summary/handoff path may run. |
@@ -166,6 +167,15 @@ nullable observation metadata; `kind` stays canonical. This is an
 extension seam, not a runtime plugin system: external processors must use
 the existing HTTP/MCP APIs and cannot bypass the sanitizer, hook
 backpressure, or single-writer SQLite actor.
+
+Lifecycle bodies have content limits independent of the 10 MiB HTTP request
+limit. User prompts and post-compaction summaries are capped UTF-8-safely at
+16 KiB; notification and tool excerpts are capped at 2 KB. Native
+`ai-memory hook` commands apply the event-specific cap before local spooling
+and transport, and the server repeats it when parsing every request so direct
+and older clients cannot bypass it. The typed sanitizer boundary then applies a
+16 KiB backstop to every durable observation body after redaction. The
+separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 
 ## Storage architecture
 

@@ -7378,6 +7378,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn oversized_prompt_is_bounded_in_storage_and_fts() {
+        const TAIL_SENTINEL: &str = "PROMPT_TAIL_MUST_NOT_BE_INDEXED_249";
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session_id = "bounded-prompt";
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": "/repo",
+                    "prompt": format!(
+                        "PROMPT_HEAD_IS_INDEXED {} {TAIL_SENTINEL}",
+                        "x".repeat(crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES)
+                    )
+                }),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": session_id }),
+        ))
+        .unwrap();
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let prompt = observations
+            .iter()
+            .find(|observation| observation.kind == ObservationKind::UserPrompt)
+            .expect("prompt observation");
+        assert!(prompt.body.len() <= ai_memory_core::OBSERVATION_BODY_MAX_BYTES);
+        assert!(prompt.body.ends_with('…'));
+        assert!(!prompt.body.contains(TAIL_SENTINEL));
+        assert!(
+            state
+                .reader
+                .search_observations_for_project(
+                    prompt.workspace_id,
+                    prompt.project_id,
+                    TAIL_SENTINEL.into(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .reader
+                .search_observations_for_project(
+                    prompt.workspace_id,
+                    prompt.project_id,
+                    "PROMPT_HEAD_IS_INDEXED".into(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn unknown_capture_protocol_version_protects_recognized_file_tool() {
         let env = HookEnvelope::from_query_and_body(

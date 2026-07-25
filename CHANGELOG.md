@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `access_count` a coarser retention signal. (#239)
 
 ### Fixed
+- Lifecycle `user-prompt` and `post-compaction` bodies are now truncated
+  UTF-8-safely at 16 KiB, while notification and tool excerpts remain capped at
+  2 KB. Native hook commands apply the event cap before local spooling or
+  transport, the server repeats it for direct and older clients, and the
+  sanitized observation boundary independently caps every durable body at
+  16 KiB so neither SQLite nor observation FTS can grow to the 10 MiB HTTP
+  transport limit. (#249)
 - `ai-memory run <harness>` now verifies an ai-memory-injected native resume
   target still exists in that harness's read-only session store. A confirmed
   orphan starts a fresh native session and repoints the same workstream instead
