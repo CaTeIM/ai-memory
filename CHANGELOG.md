@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The opt-in managed-workstream real-harness acceptance runner now verifies
+  context delivery from the managed-run cursor/acknowledgement state and a new
+  persisted assistant event instead of requiring the model to quote a prior
+  sentinel. Large Claude Code hook packets can be file-backed, so acceptance no
+  longer passes or fails based on whether the model chooses to use `Read`.
+  The deterministic fake Grok leg covers the same assertion path. (#242)
+
 ### Added
 - `install-mcp --client claude-code --session-aware` now registers an
   ai-memory-owned stdio bridge that forwards Claude Code's

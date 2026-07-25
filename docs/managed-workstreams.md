@@ -339,7 +339,21 @@ native session and verifies automatic fresh-session recovery and repointing.
 Native session creation, read-only extraction, cross-harness injection, and
 returning resume paths are all exercised. Docker wrapper host execution and
 remote URL preservation are covered separately by the `ai-memory-cli`
-packaging tests. Set
+packaging tests.
+
+The real-harness phase treats the model as the system under transport, not as
+the test oracle. For each leg it records the prior ledger sequence, then
+requires a newly imported assistant event from that harness. When a context
+delta is expected, it first verifies that the prior ledger endpoint is newer
+than that harness's delivery cursor, then requires the latest managed run to
+report that exact endpoint as `sync_through` with `context_delivered = 1`. It
+does not require the model to quote a prior sentinel: Claude Code may
+externalize a large hook result to a file, and whether a model chooses to read
+that file is not a deterministic continuity signal. The deterministic fake
+Grok cross-harness fixture exercises the same assertion helper without
+credentials or model calls.
+
+Set
 `AI_MEMORY_ACCEPTANCE_HARNESSES="kimi-cli codex"` to select a
 Kimi-to-Codex-to-Kimi round trip (Kimi aliases normalize to the installed
 `kimi` executable), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
