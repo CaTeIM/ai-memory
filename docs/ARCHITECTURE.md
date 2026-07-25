@@ -78,7 +78,9 @@ from hook paths.
    call `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
-   multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
+   multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
+   prompts preserve the source material's dominant natural language and ask
+   the model to connect related pages with path-based wikilinks.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
    newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
