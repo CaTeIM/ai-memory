@@ -166,9 +166,10 @@ priors are at the [bottom](#influences-and-prior-art).
   briefly if the previous launcher is still finalizing; handled failures release
   the workstream immediately. If a linked native transcript was deleted,
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
-  that recovery for one harness. Managed mode currently covers Claude Code, Codex,
-  OpenCode, Pi, Crush, Kimi Code, and OMP; direct harness launches remain
-  unchanged. See [Managed cross-harness workstreams](docs/managed-workstreams.md).
+  that recovery for one harness. Managed mode currently covers Claude Code,
+  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI; direct harness
+  launches remain unchanged. See
+  [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok

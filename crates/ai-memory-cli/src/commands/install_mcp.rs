@@ -876,7 +876,10 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Claude Desktop — write to claude_desktop_config.json:\n\
          #   - macOS:    ~/Library/Application Support/Claude/claude_desktop_config.json\n\
-         #   - Windows:  %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (unpackaged): %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (MSIX):       %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json\n\
+         #     --apply detects the installed form; if multiple MSIX packages\n\
+         #     are present, select the active one with --config-file.\n\
          #   - Linux:    Claude Desktop is not officially distributed for Linux;\n\
          #               use Claude Code or another HTTP client instead.\n\
          #\n\
@@ -1058,6 +1061,17 @@ mod tests {
             config_file: None,
             session_aware: false,
         }
+    }
+
+    #[test]
+    fn claude_desktop_render_lists_packaged_and_unpacked_windows_paths() {
+        let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
+        assert!(rendered.contains(r"%APPDATA%\Claude\claude_desktop_config.json"));
+        assert!(rendered.contains(
+            r"%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json"
+        ));
+        assert!(rendered.contains("--apply detects the installed form"));
+        assert!(rendered.contains("--config-file"));
     }
 
     #[test]

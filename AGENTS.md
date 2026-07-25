@@ -115,7 +115,8 @@ or prompt routing for learning review.
 ## Technology stack
 
 - **Rust edition 2024, toolchain 1.95** (pinned in `rust-toolchain.toml`),
-  workspace resolver 3. Current workspace version: 1.17.3.
+  workspace resolver 3. The authoritative workspace version is
+  `workspace.package.version` in `Cargo.toml`.
 - **Async runtime:** `tokio` (full features).
 - **MCP/HTTP:** `rmcp` 1.7 (server SDK) + `axum` 0.8 for MCP HTTP, hooks,
   admin, `/api/v1`, and the built-in `/web` UI; `tower` / `tower-http`.

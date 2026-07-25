@@ -1606,7 +1606,36 @@ pub struct WritePageArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn architecture_lists_every_visible_cli_subcommand() {
+        let architecture = include_str!("../../../docs/ARCHITECTURE.md");
+        let cli_section = architecture
+            .split_once("## CLI subcommand surface")
+            .expect("architecture must have a CLI subcommand section")
+            .1;
+        let command_block = cli_section
+            .split_once("```")
+            .expect("CLI subcommand section must have a fenced block")
+            .1
+            .split_once("```")
+            .expect("CLI subcommand fence must be closed")
+            .0;
+        let documented = command_block.split_whitespace().collect::<BTreeSet<_>>();
+        let command = Cli::command();
+        let visible = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            documented, visible,
+            "docs/ARCHITECTURE.md CLI subcommands must match `ai-memory --help`"
+        );
+    }
 
     #[test]
     fn claude_session_aware_mcp_flag_parses() {

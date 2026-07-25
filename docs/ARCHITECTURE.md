@@ -340,18 +340,20 @@ the explicit `install-mcp --client claude-code --session-aware` option.
 ## CLI subcommand surface
 
 ```
-init                 status               search
+init                 status               run
+workstream-search    audit-contamination  search
 read-page            write-page           delete-page
 serve                reset                backup
 restore              reindex              install-hooks
 hook                 install-mcp          commit
 checkpoints          restore-page         llm-test
-forget-sweep         lint                 auto-improve
-auto-improve-report  curator              pending-writes       embed
-generate-auth-token  setup-agent          bootstrap
-install-instructions install-skills        reorg
-rename-project       move-project         audit-contamination
-uninstall            auth                 user
+forget-sweep         lint                 curator
+auto-improve-report  auto-improve         finalize-session
+pending-writes       embed                generate-auth-token
+setup-agent          bootstrap            install-instructions
+install-skills       reorg                purge-project
+rename-project       move-project         uninstall
+auth                 user                 completions
 ```
 
 Run `ai-memory --help` for the full tree.
