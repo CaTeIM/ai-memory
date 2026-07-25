@@ -68,6 +68,19 @@ ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
 
+`--session-aware` is an optional Claude Code MCP mode:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+It replaces the static HTTP MCP entry with a local ai-memory stdio bridge that
+still connects to the configured remote server and bearer token, while
+forwarding Claude's lifecycle session id. Pair it with
+`[auto_scope] mode = "per_session"` when the same operator runs concurrent
+Claude Code sessions in different projects. The default static HTTP
+registration remains appropriate for one active project at a time.
+
 If `CLAUDE_CONFIG_DIR` is set, the claude-code installers match Claude Code's
 own config resolution: `install-mcp` writes the MCP registration to
 `$CLAUDE_CONFIG_DIR/.claude.json` (instead of `~/.claude.json`),
@@ -365,6 +378,11 @@ For a local loopback server with no bearer token:
 ai-memory install-mcp   --client claude-code --apply
 ai-memory install-hooks --agent  claude-code --apply
 ```
+
+For concurrent Claude Code sessions, set `[auto_scope] mode = "per_session"` in
+the server config and add `--session-aware` to the `install-mcp` command. This
+works for local and LAN servers; the generated stdio bridge keeps using
+`AI_MEMORY_SERVER_URL` / `--server-url` and `AI_MEMORY_AUTH_TOKEN`.
 
 For a bearer-protected local or LAN server, export the endpoint first. The MCP
 URL includes `/mcp`; the hook URL is the bare origin.

@@ -52,6 +52,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
         ..args
     };
+    validate_args(&args)?;
     if args.apply {
         return apply_to_config_file(&args);
     }
@@ -92,13 +93,20 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
     DEFAULT_MCP_URL.to_string()
 }
 
-fn mcp_server_url_from_base(server_url: &str) -> String {
+pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
     let trimmed = server_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/mcp") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/mcp")
     }
+}
+
+fn validate_args(args: &InstallMcpArgs) -> Result<()> {
+    if args.session_aware && !matches!(args.client, McpClient::ClaudeCode) {
+        bail!("--session-aware is supported only for --client claude-code");
+    }
+    Ok(())
 }
 
 /// Default MCP config-file path for a client (ignores any
@@ -361,6 +369,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
 }
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    validate_args(args)?;
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
@@ -468,10 +477,22 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let mut entry = serde_json::Map::new();
     match args.client {
         McpClient::ClaudeCode => {
-            entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(server_url));
-            if let Some(b) = &bearer {
-                entry.insert("headers".into(), json!({"Authorization": b}));
+            if args.session_aware {
+                entry.insert("type".into(), json!("stdio"));
+                entry.insert("command".into(), json!("ai-memory"));
+                entry.insert(
+                    "args".into(),
+                    json!(["mcp-bridge", "--server-url", server_url]),
+                );
+                if let Some(token) = &args.auth_token {
+                    entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
+                }
+            } else {
+                entry.insert("type".into(), json!("http"));
+                entry.insert("url".into(), json!(server_url));
+                if let Some(b) = &bearer {
+                    entry.insert("headers".into(), json!({"Authorization": b}));
+                }
             }
         }
         McpClient::ClaudeDesktop => {
@@ -716,7 +737,18 @@ fn upsert_toml_mcp_server(doc: &mut toml_edit::DocumentMut, name: &str, server: 
 
 fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<String> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let cli_line = if let Some(b) = &bearer {
+    let cli_line = if args.session_aware {
+        let env = args
+            .auth_token
+            .as_deref()
+            .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
+            .unwrap_or_default();
+        format!(
+            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            name = args.name,
+            url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        )
+    } else if let Some(b) = &bearer {
         format!(
             "claude mcp add --transport http {name} {url} \\\n    --header \"Authorization: {b}\"",
             name = args.name,
@@ -1012,6 +1044,7 @@ mod tests {
             auth_token: None,
             apply: false,
             config_file: None,
+            session_aware: false,
         }
     }
 
@@ -1023,6 +1056,7 @@ mod tests {
             auth_token: Some("test-token-deadbeef".into()),
             apply: false,
             config_file: None,
+            session_aware: false,
         }
     }
 
@@ -1153,6 +1187,71 @@ mod tests {
         assert!(
             !out.contains("~/.claude.json"),
             "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
+    #[test]
+    fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.session_aware = true;
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(
+            entry["args"],
+            json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
+        );
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "test-token-deadbeef");
+        assert!(entry.get("url").is_none());
+        assert!(entry.get("headers").is_none());
+
+        let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
+        assert!(rendered.contains("claude mcp add --transport stdio"));
+        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+    }
+
+    #[test]
+    fn claude_code_session_aware_apply_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_file = tmp.path().join(".claude.json");
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("http://192.168.0.90:49374/mcp".into());
+        args.config_file = Some(config_file.clone());
+        args.session_aware = true;
+        args.apply = true;
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_file).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["args"],
+            json!([
+                "mcp-bridge",
+                "--server-url",
+                "http://192.168.0.90:49374/mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn session_aware_rejects_non_claude_clients() {
+        let mut args = args_for(McpClient::Codex);
+        args.session_aware = true;
+
+        let error = build_json_mcp_entry(&args).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("supported only for --client claude-code"),
+            "{error:#}"
         );
     }
 

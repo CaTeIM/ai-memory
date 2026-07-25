@@ -22,7 +22,7 @@
 | macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Local supported profiles default to host-native hook commands; Claude Code may use its Windows exec form, while other agents use native single command strings matching their hook schema. PowerShell/Git Bash scripts are compatibility fallbacks. See [`docs/windows.md`](docs/windows.md). |
-| Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
+| Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. `install-mcp --session-aware` optionally enables per-session auto-scope isolation through a local stdio bridge. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
 | Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
@@ -122,7 +122,8 @@ priors are at the [bottom](#influences-and-prior-art).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
-  session-aware current-project routing.
+  session-aware current-project routing; Claude Code has a built-in opt-in
+  bridge via `install-mcp --session-aware`.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`,
   `audit-contamination`, `lint`, `curator`, `auto-improve`,
@@ -338,6 +339,26 @@ prompt and tool call now lands in ai-memory, and the next session you
 open in this project will see a handoff with where you left off.
 On macOS, the native release binary is also supported and recommended when you
 do not need Docker; see [`docs/macos.md`](docs/macos.md).
+
+If two Claude Code sessions use the same server concurrently, enable
+per-session routing on the server and replace only the `ai-memory` MCP entry
+with the optional bridge:
+
+```toml
+# <ai-memory data dir>/config.toml
+[auto_scope]
+mode = "per_session"
+```
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The bridge still connects to the configured local or remote HTTP server and
+forwards its bearer token, but also attaches Claude's lifecycle session id to
+every MCP request. Existing static HTTP installs remain the default. See
+[`docs/auto-scope.md`](docs/auto-scope.md) for Claude's `/clear` and
+implicit-resume limitations.
 
 The `install-mcp` / `install-hooks` commands use
 `AI_MEMORY_SERVER_URL` / `AI_MEMORY_AUTH_TOKEN` when set; otherwise
