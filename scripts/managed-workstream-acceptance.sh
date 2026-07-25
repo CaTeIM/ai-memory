@@ -85,6 +85,83 @@ done
   exit 1
 }
 
+workstream_hex() {
+  local name=$1
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT lower(hex(id)) FROM workstreams WHERE name = '$name' ORDER BY selected_at DESC LIMIT 1;"
+}
+
+latest_workstream_sequence() {
+  local hex=$1
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT COALESCE(MAX(sequence), 0) FROM workstream_events WHERE workstream_id = x'$hex';"
+}
+
+current_delivery_cursor() {
+  local hex=$1
+  local agent=$2
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT COALESCE((
+       SELECT delivery_cursor FROM workstream_native_sessions
+        WHERE workstream_id = x'$hex'
+          AND agent_kind = '$agent'
+          AND is_current = 1
+     ), 0);"
+}
+
+# Assert the deterministic boundaries of one real or fake managed leg:
+# the harness produced a new assistant event, and any assigned context delta
+# was acknowledged by its hook/launcher delivery path. Model recall is not a
+# protocol oracle: large hook results may be file-backed, and whether a model
+# chooses to read that file must not decide acceptance.
+assert_managed_leg() {
+  local hex=$1
+  local expected_agent=$2
+  local before_sequence=$3
+  local before_delivery=$4
+  local expect_context=$5
+  local log=$6
+  local native_id delivery sync_after sync_through context_delivered
+
+  native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT native_session_id FROM workstream_events
+       WHERE workstream_id = x'$hex'
+         AND sequence > $before_sequence
+         AND agent_kind = '$expected_agent'
+         AND role = 'assistant'
+       ORDER BY sequence DESC LIMIT 1;")
+  [ -n "$native_id" ] || {
+    printf '%s did not persist a new assistant event after ledger sequence %s\n' \
+      "$expected_agent" "$before_sequence" >&2
+    tail -120 "$log" >&2
+    return 1
+  }
+
+  if [ "$expect_context" = 1 ]; then
+    if [ "$before_sequence" -le "$before_delivery" ]; then
+      printf '%s had no managed context delta to assign (ledger: %s, cursor: %s)\n' \
+        "$expected_agent" "$before_sequence" "$before_delivery" >&2
+      tail -120 "$log" >&2
+      return 1
+    fi
+    delivery=$(sqlite3 -separator '|' "$DATA/db/memory.sqlite" \
+      "SELECT sync_after, sync_through, context_delivered
+         FROM managed_runs
+        WHERE workstream_id = x'$hex' AND agent_kind = '$expected_agent'
+        ORDER BY started_at DESC LIMIT 1;")
+    IFS='|' read -r sync_after sync_through context_delivered <<<"$delivery"
+    if [ -z "$delivery" ] || [ "${sync_through:-0}" -ne "$before_sequence" ] ||
+      [ "${context_delivered:-0}" -ne 1 ]; then
+      printf '%s did not acknowledge its assigned managed context delta (state: %s)\n' \
+        "$expected_agent" "${delivery:-missing}" >&2
+      tail -120 "$log" >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$native_id"
+}
+
 FAKE="$TMP/fake-harness.sh"
 cat >"$FAKE" <<'EOF'
 #!/usr/bin/env bash
@@ -555,6 +632,8 @@ jq -e \
 # A fresh grok session joining the established edge-kimi workstream must
 # receive that workstream's history through `--rules`, with historical tool
 # activity labelled as completed evidence.
+grok_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
+grok_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" grok)
 (
   cd "$REPO"
   GROK_HOME="$GROK_FAKE_HOME" \
@@ -578,6 +657,9 @@ grep -q 'AMWS-FAKE-KIMI' "$TMP/grok-cross-argv.log" || {
   printf 'the grok --rules packet did not carry the prior harness history\n' >&2
   exit 1
 }
+assert_managed_leg "$kimi_ws_hex" grok "$grok_cross_before" \
+  "$grok_cross_delivery" 1 \
+  "$LOGS/edge-grok-cross.log" >/dev/null
 
 # A blank first launch remains eligible for one-time native-session adoption.
 # Use a pseudo-terminal because redirected/scripted launches deliberately skip
@@ -771,21 +853,6 @@ install_hook pi "$PI_EXTENSION"
 install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
 
-uuid_from_hex() {
-  local hex=$1
-  printf '%s-%s-%s-%s-%s\n' \
-    "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
-}
-
-workstream_id() {
-  local name=$1
-  local hex
-  hex=$(sqlite3 "$DATA/db/memory.sqlite" \
-    "SELECT lower(hex(id)) FROM workstreams WHERE name = '$name' ORDER BY selected_at DESC LIMIT 1;")
-  [ "${#hex}" -eq 32 ] || return 1
-  uuid_from_hex "$hex"
-}
-
 agent_wire_name() {
   case "$1" in
     claude) printf 'claude-code\n' ;;
@@ -802,18 +869,22 @@ uppercase() {
 run_harness() {
   local harness=$1
   local current=$2
-  local previous=$3
-  local first_run=$4
+  local first_run=$3
+  local expect_context=$4
   local log="$LOGS/real-$harness-$current.log"
   local prompt
   local expected_agent
+  local before_sequence=0
+  local before_delivery=0
+  local existing_hex
   local -a wrapper_args native_args
   expected_agent=$(agent_wire_name "$harness")
-  if [ -z "$previous" ]; then
-    prompt="Do not use tools. Reply with exactly: $current"
-  else
-    prompt="Do not use tools. In the newest assistant event from the injected ai-memory managed-workstream context, find the final whitespace-delimited token beginning with AMWS-. Reply with exactly that token, one space, then $current."
+  existing_hex=$(workstream_hex "$WORKSTREAM_NAME")
+  if [ -n "$existing_hex" ]; then
+    before_sequence=$(latest_workstream_sequence "$existing_hex")
+    before_delivery=$(current_delivery_cursor "$existing_hex" "$expected_agent")
   fi
+  prompt="Reply with exactly: $current"
   if [ "$first_run" = 1 ]; then
     wrapper_args=(--new "$WORKSTREAM_NAME")
   else
@@ -891,48 +962,55 @@ run_harness() {
       "${wrapper_args[@]}" "$harness" "${native_args[@]}") >"$log" 2>&1
   fi
 
-  local id results event native_id
-  id=$(workstream_id "$WORKSTREAM_NAME")
-  results=$("$BIN" --data-dir "$DATA" workstream-search \
-    --workstream-id "$id" --limit 100 --json "$current")
-  event=$(jq -c --arg agent "$expected_agent" --arg current "$current" \
-    '[.[] | select(.agent == $agent and .role == "assistant" and (.content | contains($current)))] | last // empty' \
-    <<<"$results")
-  [ -n "$event" ] || {
-    printf '%s did not persist an assistant event containing %s\n' "$harness" "$current" >&2
+  local hex native_id
+  hex=$(workstream_hex "$WORKSTREAM_NAME")
+  [ "${#hex}" -eq 32 ] || {
+    printf 'could not resolve workstream %s after the %s leg\n' \
+      "$WORKSTREAM_NAME" "$harness" >&2
     tail -120 "$log" >&2
     return 1
   }
-  if [ -n "$previous" ] && ! jq -e --arg previous "$previous" \
-    '.content | contains($previous)' <<<"$event" >/dev/null; then
-    printf '%s did not demonstrate receipt of prior sentinel %s\n' "$harness" "$previous" >&2
-    jq -r '.content' <<<"$event" >&2
+  if ! native_id=$(assert_managed_leg "$hex" "$expected_agent" \
+    "$before_sequence" "$before_delivery" "$expect_context" "$log"); then
     return 1
   fi
-  native_id=$(jq -r '.native_session_id' <<<"$event")
   printf '%s\n' "$native_id"
 }
 
 WORKSTREAM_NAME="native-acceptance-$(date +%s)-$$"
 RUN_TAG="$(date +%s)-$$"
-previous=""
 first_harness=${harnesses[0]}
+first_agent=$(agent_wire_name "$first_harness")
 first_native=""
+previous_agent=""
 index=0
 for harness in "${harnesses[@]}"; do
   current="AMWS-$RUN_TAG-$(uppercase "$harness")"
+  current_agent=$(agent_wire_name "$harness")
   first_run=0
+  expect_context=0
   [ "$index" -ne 0 ] || first_run=1
-  native_id=$(run_harness "$harness" "$current" "$previous" "$first_run")
+  if [ -n "$previous_agent" ] && [ "$current_agent" != "$previous_agent" ]; then
+    expect_context=1
+  fi
+  if ! native_id=$(run_harness "$harness" "$current" "$first_run" \
+    "$expect_context"); then
+    exit 1
+  fi
   if [ "$index" -eq 0 ]; then
     first_native=$native_id
   fi
-  previous=$current
+  previous_agent=$current_agent
   index=$((index + 1))
 done
 
 return_sentinel="AMWS-$RUN_TAG-$(uppercase "$first_harness")-RETURN"
-returned_native=$(run_harness "$first_harness" "$return_sentinel" "$previous" 0)
+return_expects_context=0
+[ "$first_agent" = "$previous_agent" ] || return_expects_context=1
+if ! returned_native=$(run_harness "$first_harness" "$return_sentinel" 0 \
+  "$return_expects_context"); then
+  exit 1
+fi
 [ "$returned_native" = "$first_native" ] || {
   printf '%s resumed native session %s, expected %s\n' \
     "$first_harness" "$returned_native" "$first_native" >&2
