@@ -14,6 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the local SQLite index directly, so every CLI command is a thin HTTP
   client of the running server; the command now requires a reachable
   server and no longer works against an offline data directory.
+- Managed workstream support for Grok Build CLI: `ai-memory run grok` (alias
+  `grok-build`) creates fresh sessions with a wrapper-generated `--session-id`,
+  resumes linked sessions with `--resume`, maps wrapper `--yolo` onto Grok's
+  native `--yolo`/`--always-approve`, and delivers the bounded workstream
+  context packet through Grok's native `--rules` flag (system-prompt append,
+  acknowledged only after the child spawns). Transcript import reads
+  `$GROK_HOME/sessions/*/*/chat_history.jsonl` read-only with a
+  prefix-validated cursor and content-hash event ids so rewind-driven journal
+  rewrites cannot duplicate history; system prompts and encrypted reasoning
+  are excluded as loss annotations, as are the harness-injected `<user_info>`
+  and `<system-reminder>` blocks Grok stores inside `user` records (project
+  instructions, the skills catalogue, and connected MCP servers), which would
+  otherwise leak harness internals into the portable ledger and evict real
+  conversation from the startup packet budget. Discovery
+  matches checkouts through `summary.json`'s recorded `info.cwd` and honors
+  `GROK_HOME`. Grok stays out of the bare-mode automatic pool. Verified
+  against Grok Build CLI v0.2.111 ([#237]).
 
 ## [1.18.0] - 2026-07-23
 
