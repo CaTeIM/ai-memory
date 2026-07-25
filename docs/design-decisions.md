@@ -300,10 +300,13 @@ are excluded explicitly.
 
 A renewable single-writer lease resolves precedence and concurrency instead of
 attempting bidirectional file synchronization. SessionStart receives a bounded
-unseen delta; the full visible ledger stays searchable. Repository checkpoints
-are evidence at run boundaries and never commit, stash, reset, or otherwise
-mutate the checkout. The markdown wiki remains the durable knowledge surface;
-the managed ledger is an operational continuity substrate.
+unseen delta without replacing an explicitly pending handoff. When both exist,
+the curated handoff is rendered first and their delivery claims commit
+atomically after the complete startup response is assembled. The full visible
+ledger stays searchable. Repository checkpoints are evidence at run boundaries
+and never commit, stash, reset, or otherwise mutate the checkout. The markdown
+wiki remains the durable knowledge surface; the managed ledger is an
+operational continuity substrate.
 
 Native-session adoption is restricted to bootstrapping an otherwise-empty
 workstream. The interactive launcher may offer recent sessions recorded for the

@@ -57,7 +57,7 @@ pub struct PurgeSummary {
     pub embeddings_deleted: u64,
 }
 use jiff::Timestamp;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
@@ -1242,11 +1242,22 @@ pub fn accept_handoff(
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
 ) -> StoreResult<()> {
+    let tx = conn.transaction()?;
+    accept_handoff_in_transaction(&tx, handoff_id, accepting_agent, accepting_session)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn accept_handoff_in_transaction(
+    tx: &Transaction<'_>,
+    handoff_id: &HandoffId,
+    accepting_agent: AgentKind,
+    accepting_session: Option<&SessionId>,
+) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
-    let tx = conn.transaction()?;
-    let (ws, proj) = handoff_scope(&tx, handoff_id)?;
+    let (ws, proj) = handoff_scope(tx, handoff_id)?;
     let changed = tx.execute(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
          accepted_by_session = ?3 \
@@ -1256,7 +1267,7 @@ pub fn accept_handoff(
     // Only a real state transition ('open' -> 'accepted') is audited.
     if changed > 0 {
         audit(
-            &tx,
+            tx,
             "accept_handoff",
             ws.as_ref(),
             proj.as_ref(),
@@ -1265,8 +1276,7 @@ pub fn accept_handoff(
             now,
         )?;
     }
-    tx.commit()?;
-    Ok(())
+    Ok(changed > 0)
 }
 
 /// Mark an open handoff expired so it will no longer be consumed.

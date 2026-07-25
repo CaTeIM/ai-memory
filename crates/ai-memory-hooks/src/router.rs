@@ -1090,7 +1090,7 @@ async fn fetch_and_accept_handoff(
     // too. The brief already reaches the managed path (it is recomposed per
     // session, so resolving it twice was harmless); the handoff is single-use
     // and had no second chance.
-    let managed_md = fetch_managed_context(state, &query, agent).await?;
+    let managed = fetch_managed_context(state, &query, agent).await?;
     // `/handoff` has no session_id in the request — `per_session` mode
     // therefore falls back to the single slot (graceful degradation),
     // while `per_actor` keys by `user` alone.
@@ -1110,30 +1110,52 @@ async fn fetch_and_accept_handoff(
         false,
     )
     .await?;
-    let handoff_md = {
-        let handoff = state
-            .reader
-            .latest_open_handoff(ws, proj, query.cwd.clone())
-            .await?;
-        match handoff {
-            Some(h) => {
-                state.writer.accept_handoff(h.id, agent, None).await?;
-                Some(render_handoff_markdown(&h))
-            }
-            None => None,
-        }
-    };
+    let handoff = state
+        .reader
+        .latest_open_handoff(ws, proj, query.cwd.clone())
+        .await?;
+    let handoff_md = handoff.as_ref().map(render_handoff_markdown);
     // The brief is additive and non-destructive: unlike the handoff (a
-    // single-use slot consumed above), it is recomposed on every opted-in
+    // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj).await?;
     // Handoff first: it is a short curated pointer and must not be buried
     // under a ledger that can run tens of KB. The existing ledger-then-brief
-    // order is preserved.
+    // order is preserved. Claim both single-use inputs only after every
+    // fallible read and render has succeeded, and in one transaction so a
+    // failed or racing managed claim cannot consume the handoff by itself.
+    let acceptance = if handoff.is_some() || managed.is_some() {
+        state
+            .writer
+            .accept_startup_context(
+                handoff.as_ref().map(|handoff| handoff.id),
+                agent,
+                None,
+                managed.as_ref().map(|managed| managed.run_id),
+            )
+            .await?
+    } else {
+        ai_memory_store::StartupContextAcceptance::default()
+    };
+    let handoff_md = if acceptance.handoff_accepted {
+        handoff_md
+    } else {
+        None
+    };
+    let managed_md = if acceptance.managed_context_accepted {
+        managed.and_then(|managed| managed.markdown)
+    } else {
+        None
+    };
     Ok(combine_handoff_and_brief(
         handoff_md,
         combine_handoff_and_brief(managed_md, brief_md),
     ))
+}
+
+struct PendingManagedContext {
+    run_id: ManagedRunId,
+    markdown: Option<String>,
 }
 
 /// Render the managed-run ledger for this SessionStart, if there is one.
@@ -1146,7 +1168,7 @@ async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
     agent: AgentKind,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<PendingManagedContext>> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
         return Ok(None);
     };
@@ -1186,8 +1208,10 @@ async fn fetch_managed_context(
         context.workstream_id,
         context.sync_after,
     );
-    let _ = state.writer.accept_managed_run_context(run_id).await?;
-    Ok(rendered)
+    Ok(Some(PendingManagedContext {
+        run_id,
+        markdown: rendered,
+    }))
 }
 
 async fn render_requested_session_brief(
@@ -5732,23 +5756,20 @@ mod tests {
             .await
             .unwrap();
 
-        let rendered = fetch_and_accept_handoff(
-            &state,
-            HandoffQuery {
-                agent: Some("codex".into()),
-                cwd: Some(cwd),
-                workspace: Some("default".into()),
-                project: Some("scratch".into()),
-                project_strategy: None,
-                briefing: None,
-                briefing_budget: None,
-                managed_run: Some(run.run_id.to_string()),
-                session_id: Some("native-2".into()),
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        let query = HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: Some(run.run_id.to_string()),
+            session_id: Some("native-2".into()),
+        };
+        let rendered = fetch_and_accept_handoff(&state, query.clone(), None)
+            .await
+            .unwrap();
 
         let rendered = rendered.expect("managed SessionStart must return context");
         assert!(
@@ -5767,6 +5788,13 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a handoff delivered on a managed SessionStart must be marked accepted"
+        );
+        assert!(
+            fetch_and_accept_handoff(&state, query, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the combined handoff and managed packet must be delivered only once"
         );
     }
 

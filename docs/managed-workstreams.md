@@ -94,8 +94,11 @@ consume the later adoption opportunity.
    The UserPromptSubmit hook issues the `/handoff` GET with the native
    `session_id` in the query; the server links the session and renders the
    packet atomically, and Kimi Code injects the hook's stdout as a user
-   message before the turn. Direct launches continue to use the existing
-   single-use handoff path.
+   message before the turn. A pending single-use handoff remains additive:
+   it is placed before the managed packet, and both delivery claims commit
+   together only after the full handoff/packet/brief response is assembled.
+   Direct launches continue to use the same handoff path without a managed
+   packet.
 4. When the child exits, ai-memory reads the native transcript store without
    modifying it. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
