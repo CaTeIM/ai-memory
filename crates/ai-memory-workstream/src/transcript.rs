@@ -167,6 +167,26 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Check whether one exact native session still exists in the harness's
+/// read-only transcript store. `Ok(false)` means the resume target is
+/// definitely absent; store access or schema failures remain errors so callers
+/// do not mistake an unreadable store for a deleted session.
+pub fn native_session_exists(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    if harness == ManagedHarness::OpenCode {
+        return Ok(opencode_updated(home, session_dir, native_session_id)?.is_some());
+    }
+    if harness == ManagedHarness::Crush {
+        return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
+    }
+    Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
+}
+
 /// Wait briefly for buffered transcript writers to settle before importing.
 pub async fn wait_for_transcript_flush(
     harness: ManagedHarness,
@@ -2044,10 +2064,19 @@ mod tests {
             let sessions = list_native_sessions(harness, temp.path(), &cwd, Some(&root), 8)
                 .await
                 .unwrap();
+            let expected_id = format!("{}-id", harness.as_str());
             assert_eq!(sessions.len(), 1, "{} candidates", harness.as_str());
-            assert_eq!(
-                sessions[0].native_session_id,
-                format!("{}-id", harness.as_str())
+            assert_eq!(sessions[0].native_session_id, expected_id);
+            assert!(
+                native_session_exists(harness, temp.path(), &cwd, Some(&root), &expected_id)
+                    .unwrap(),
+                "{} existing session",
+                harness.as_str()
+            );
+            assert!(
+                !native_session_exists(harness, temp.path(), &cwd, Some(&root), "missing").unwrap(),
+                "{} missing session",
+                harness.as_str()
             );
         }
     }
@@ -2097,6 +2126,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["newer", "older"]
         );
+        assert!(
+            native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "newer"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2142,6 +2191,13 @@ mod tests {
                 .map(|candidate| candidate.native_session_id.as_str())
                 .collect::<Vec<_>>(),
             ["newer", "older"]
+        );
+        assert!(
+            native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "newer").unwrap()
+        );
+        assert!(
+            !native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "missing")
+                .unwrap()
         );
 
         let first = export_crush(&cwd, None, "newer", None).unwrap();
@@ -2487,6 +2543,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_deref(), Some(wire_b.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "session_aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2788,6 +2864,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_deref(), Some(chat_a.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "019f-session-aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
         assert!(!transcript_file(
             ManagedHarness::Grok,
             &chat_a.parent().unwrap().join("events.jsonl")

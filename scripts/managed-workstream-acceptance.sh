@@ -313,6 +313,8 @@ mapfile -t auto_claude_first <"$TMP/auto-claude-first-argv.log"
   exit 1
 }
 auto_claude_id=${auto_claude_first[1]}
+printf '{"sessionId":"%s","cwd":"%s"}\n' "$auto_claude_id" "$REPO" \
+  >"$AUTO_CLAUDE_HOME/projects/fixture/$auto_claude_id.jsonl"
 (
   cd "$REPO"
   HOME="$AUTO_HOME" CODEX_HOME="$AUTO_CODEX_HOME" \
@@ -433,6 +435,42 @@ jq -e \
   <<<"$kimi_second_hits" >/dev/null || {
   printf 'kimi incremental import duplicated or missed a round sentinel\n' >&2
   tail -80 "$LOGS/edge-kimi-second.log" >&2
+  exit 1
+}
+
+# Deleting the linked native store must heal the established workstream instead
+# of feeding the dead id back to Kimi forever.
+rm -rf "$kimi_session_dir"
+(
+  cd "$REPO"
+  KIMI_CODE_HOME="$KIMI_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kimi \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kimi-orphan-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIMI-RECOVERED" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      kimi >"$LOGS/edge-kimi-orphan.log" 2>&1
+)
+if grep -q . "$TMP/kimi-orphan-argv.log"; then
+  printf 'orphaned kimi session was not replaced by a fresh launch\n' >&2
+  cat "$TMP/kimi-orphan-argv.log" >&2
+  exit 1
+fi
+grep -q "linked kimi session .* is missing from its native store" \
+  "$LOGS/edge-kimi-orphan.log"
+kimi_recovered_dir=$(find "$KIMI_FAKE_HOME/sessions" -mindepth 2 -maxdepth 2 -type d -print -quit)
+[ -n "$kimi_recovered_dir" ] || {
+  printf 'orphan recovery did not create a replacement kimi session\n' >&2
+  exit 1
+}
+kimi_recovered_id=$(basename "$kimi_recovered_dir")
+[ "$kimi_recovered_id" != "$kimi_session_id" ] || {
+  printf 'orphan recovery reused the deleted kimi session id\n' >&2
+  exit 1
+}
+kimi_current_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT native_session_id FROM workstream_native_sessions WHERE workstream_id = x'${kimi_ws_hex}' AND agent_kind = 'kimi-code' AND is_current = 1;")
+[ "$kimi_current_id" = "$kimi_recovered_id" ] || {
+  printf 'orphan recovery did not repoint the kimi workstream\n' >&2
   exit 1
 }
 

@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `access_count` a coarser retention signal. (#239)
 
 ### Fixed
+- `ai-memory run <harness>` now verifies an ai-memory-injected native resume
+  target still exists in that harness's read-only session store. A confirmed
+  orphan starts a fresh native session and repoints the same workstream instead
+  of retrying the dead id forever. The new wrapper-owned `--fresh` flag forces
+  the same per-workstream recovery without a resume attempt or adoption prompt;
+  explicit native resume/session/fork selectors remain authoritative and
+  cannot be combined with `--fresh`. (#240)
 - `install-mcp --client claude-desktop` now detects an MSIX-packaged
   Claude Desktop on Windows and writes to its virtualized
   `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`

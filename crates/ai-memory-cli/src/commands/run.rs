@@ -16,7 +16,8 @@ use ai_memory_core::{
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
     allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, inspect_repository, list_native_sessions, wait_for_transcript_flush,
+    export_transcript, has_native_session_selector, inspect_repository, list_native_sessions,
+    native_session_exists, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
@@ -57,6 +58,8 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
+    let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let force_fresh = args.fresh || trailing_fresh;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -85,7 +88,7 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let executable = args.executable.map(PathBuf::into_os_string);
     ensure_executable_available(provisional_harness, executable.as_deref())?;
     let project = resolve_project_name(config, args.project.as_deref())?;
-    let may_adopt_native_session = args.new_workstream.is_none();
+    let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let prepare = PrepareManagedRunRequest {
         workspace: args.workspace,
@@ -151,12 +154,29 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
     let native_grok_rules = user_supplied_grok_rules(&native_args);
-    let mut plan = acquired_try!(build_launch_plan(
+    let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
         executable.clone(),
         native_args.clone(),
         prepared.native_session_id.as_deref(),
+        force_fresh,
+        &home,
+        &repository.cwd,
     ));
+    if let Some(orphaned_session) = orphaned_session {
+        eprintln!(
+            "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+            harness.as_str(),
+            display_session_id(&orphaned_session),
+            prepared.workstream_name
+        );
+    } else if force_fresh && plan.mode == LaunchMode::Session {
+        eprintln!(
+            "ai-memory: starting a fresh {} session in workstream '{}'",
+            harness.as_str(),
+            prepared.workstream_name
+        );
+    }
     if automatic_harness
         && prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
@@ -532,6 +552,63 @@ fn remove_wrapper_yolo(args: &mut Vec<OsString>) -> bool {
     let before = args.len();
     args.retain(|arg| arg != OsStr::new("--yolo"));
     args.len() != before
+}
+
+fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--fresh"));
+    args.len() != before
+}
+
+fn build_preflighted_launch_plan(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    force_fresh: bool,
+    home: &Path,
+    cwd: &Path,
+) -> Result<(LaunchPlan, Option<String>)> {
+    let explicit_selector = has_native_session_selector(harness, &native_args);
+    if force_fresh && explicit_selector {
+        return Err(anyhow!(
+            "--fresh cannot be combined with a native session, resume, continue, or fork selector"
+        ));
+    }
+    let linked_session_id = if force_fresh { None } else { linked_session_id };
+    let plan = build_launch_plan(
+        harness,
+        executable.clone(),
+        native_args.clone(),
+        linked_session_id,
+    )?;
+    let Some(linked_session_id) = linked_session_id else {
+        return Ok((plan, None));
+    };
+    if explicit_selector || plan.mode != LaunchMode::Session {
+        return Ok((plan, None));
+    }
+    match native_session_exists(
+        harness,
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        linked_session_id,
+    ) {
+        Ok(true) => Ok((plan, None)),
+        Ok(false) => Ok((
+            build_launch_plan(harness, executable, native_args, None)?,
+            Some(linked_session_id.to_string()),
+        )),
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+                harness.as_str(),
+                display_session_id(linked_session_id)
+            );
+            Ok((plan, None))
+        }
+    }
 }
 
 fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsStr>) -> Result<()> {
@@ -1344,6 +1421,121 @@ mod tests {
             .to_vec();
         assert!(remove_wrapper_yolo(&mut args));
         assert_eq!(args, ["resume", "native-id"].map(OsString::from));
+    }
+
+    #[test]
+    fn wrapper_fresh_parses_before_or_after_the_harness() {
+        let cli = Cli::try_parse_from(["ai-memory", "run", "--fresh", "codex"]).unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.fresh);
+        assert!(args.native_args.is_empty());
+
+        let mut trailing = ["--fresh", "--model", "opus"].map(OsString::from).to_vec();
+        assert!(remove_wrapper_fresh(&mut trailing));
+        assert_eq!(trailing, ["--model", "opus"].map(OsString::from));
+    }
+
+    #[test]
+    fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let session_root = temp.path().join("pi-sessions");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&session_root).unwrap();
+        let transcript = session_root.join("linked.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session","id":"linked","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        let native_args = [
+            OsString::from("--session-dir"),
+            session_root.as_os_str().to_os_string(),
+        ]
+        .to_vec();
+
+        let (resumed, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            native_args.clone(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "--session"));
+        assert!(resumed.args.iter().any(|arg| arg == "linked"));
+
+        std::fs::remove_file(transcript).unwrap();
+        let (fresh, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            native_args.clone(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(orphaned.as_deref(), Some("linked"));
+        assert!(fresh.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!fresh.args.iter().any(|arg| arg == "linked"));
+
+        let (explicit, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            [
+                native_args,
+                [OsString::from("--session"), OsString::from("chosen")].to_vec(),
+            ]
+            .concat(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    #[test]
+    fn force_fresh_bypasses_an_existing_link_and_rejects_native_selectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (fresh, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            Some("linked"),
+            true,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert!(fresh.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!fresh.args.iter().any(|arg| arg == "--resume"));
+
+        let error = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            [OsString::from("--resume"), OsString::from("chosen")].to_vec(),
+            Some("linked"),
+            true,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--fresh cannot be combined"));
     }
 
     #[tokio::test]
