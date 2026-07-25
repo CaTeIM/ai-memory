@@ -78,7 +78,9 @@ from hook paths.
    call `memory_handoff_begin` before quitting when a handoff is needed.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
-   multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
+   multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
+   prompts preserve the source material's dominant natural language and ask
+   the model to connect related pages with path-based wikilinks.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
    newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
@@ -120,6 +122,9 @@ session, and marks lifecycle calls with an invocation-scoped run id.
 SessionStart injects an unseen bounded event range; Crush receives it through a
 temporary supported global-context path because it lacks SessionStart. The host
 imports the native transcript tail and a Git checkpoint when the child exits.
+An explicitly pending handoff is delivered before the managed event range;
+their single-use delivery claims share one writer transaction after the
+complete startup response has been assembled.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger

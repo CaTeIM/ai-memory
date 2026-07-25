@@ -283,11 +283,11 @@ Top-line rules carved into the codebase:
 ## 15. Managed workstreams use a portable ledger, not native format conversion
 
 Managed cross-harness continuity is explicitly opt-in through `ai-memory run`.
-Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP launches
-retain the existing hook and single-use handoff behavior. There is no
-process-global mode or manual harness switch: the wrapper selects the current
-repository/worktree workstream and each adapter applies that harness's native
-create/resume syntax.
+Direct Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build
+CLI launches retain the existing hook and single-use handoff behavior. There is
+no process-global mode or manual harness switch: the wrapper selects the
+current repository/worktree workstream and each adapter applies that harness's
+native create/resume syntax.
 
 One logical workstream owns one native session per harness plus an append-only
 portable event ledger. We rejected converting a Claude transcript into a fake
@@ -300,10 +300,13 @@ are excluded explicitly.
 
 A renewable single-writer lease resolves precedence and concurrency instead of
 attempting bidirectional file synchronization. SessionStart receives a bounded
-unseen delta; the full visible ledger stays searchable. Repository checkpoints
-are evidence at run boundaries and never commit, stash, reset, or otherwise
-mutate the checkout. The markdown wiki remains the durable knowledge surface;
-the managed ledger is an operational continuity substrate.
+unseen delta without replacing an explicitly pending handoff. When both exist,
+the curated handoff is rendered first and their delivery claims commit
+atomically after the complete startup response is assembled. The full visible
+ledger stays searchable. Repository checkpoints are evidence at run boundaries
+and never commit, stash, reset, or otherwise mutate the checkout. The markdown
+wiki remains the durable knowledge surface; the managed ledger is an
+operational continuity substrate.
 
 Native-session adoption is restricted to bootstrapping an otherwise-empty
 workstream. The interactive launcher may offer recent sessions recorded for the

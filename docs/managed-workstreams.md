@@ -1,8 +1,8 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP. Direct
-agent launches
+between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok
+Build CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
@@ -28,7 +28,7 @@ second copy of each harness's option schema. Other wrapper options come first:
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH] [--yolo]
-              [claude|codex|opencode|pi|crush|omp|kimi] [native arguments...]
+              [claude|codex|opencode|pi|crush|omp|kimi|grok] [native arguments...]
 ```
 
 The default is the most recently selected workstream for the current repository
@@ -44,8 +44,8 @@ it resumes
 the newest session automatically. For an established workstream, server state
 takes precedence: ai-memory resumes the most recently linked harness that still
 has a usable local session. It never chooses a newer but obsolete session from
-another harness merely because that file has a later timestamp. OMP remains
-available explicitly but is not in the automatic pool.
+another harness merely because that file has a later timestamp. OMP and Grok
+remain available explicitly but are not in the automatic pool.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -94,8 +94,11 @@ consume the later adoption opportunity.
    The UserPromptSubmit hook issues the `/handoff` GET with the native
    `session_id` in the query; the server links the session and renders the
    packet atomically, and Kimi Code injects the hook's stdout as a user
-   message before the turn. Direct launches continue to use the existing
-   single-use handoff path.
+   message before the turn. A pending single-use handoff remains additive:
+   it is placed before the managed packet, and both delivery claims commit
+   together only after the full handoff/packet/brief response is assembled.
+   Direct launches continue to use the same handoff path without a managed
+   packet.
 4. When the child exits, ai-memory reads the native transcript store without
    modifying it. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
@@ -130,6 +133,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
+| Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 or Codex's `resume` wins. ai-memory links the selected native session and resets
@@ -138,7 +142,8 @@ Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
 through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
-`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, and `KIMI_CODE_HOME`.
+`PI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`, and
+`GROK_HOME`.
 The Pi-family adapter
 also recognizes a complete `.jsonl.<nonce>.tmp` atomic-write file when a native
 process exits before renaming it; incomplete final JSONL records are never
@@ -156,7 +161,7 @@ ai-memory does not add a duplicate when the translated native flag is already
 present.
 
 Managed support is intentionally narrower than the general integration matrix.
-Gemini CLI, Devin CLI, Cursor, Grok Build CLI, and other agents may
+Gemini CLI, Devin CLI, Cursor, and other agents may
 have MCP or lifecycle-hook support without native managed resume. Contributors
 adding another managed harness must follow the [managed-harness contribution
 protocol](managed-harness-contributions.md), including read-only extraction,
@@ -202,6 +207,23 @@ stat fallback) are neither discovered nor imported in v1. The native
 contract was verified against Kimi Code v0.29.0. The managed launcher accepts
 `kimi`, `kimi-code`, and `kimi-cli`; all three resolve the installed `kimi`
 executable.
+
+Grok needs no ai-memory hook installation for managed delivery either. Grok
+ignores `SessionStart` stdout and its `UserPromptSubmit` hook is passive, so
+the launcher fetches the bounded context packet from the server and passes it
+through Grok's native `--rules` flag, which appends the text to that session's
+system prompt. Delivery is acknowledged only after the child spawns. Because
+`--rules` is single-use in Grok's argument parser, a natively supplied
+`--rules`/`--append-system-prompt` wins and the packet stays undelivered until
+a later managed run can accept it. Grok can rewrite `chat_history.jsonl` in
+place on rewind, so the import cursor stores a prefix hash and replays from
+the beginning when it no longer matches, with content-hash event ids
+deduplicating records already in the workstream. Sibling session files
+(`events.jsonl`, `updates.jsonl`, `rewind_points.jsonl`) carry harness
+internals and are never read as transcripts; discovery reads
+`summary.json`'s `info.cwd` and never parses the URL-encoded bucket name. The
+managed launcher accepts `grok` and `grok-build`. The native contract was
+verified against Grok Build CLI v0.2.111.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into
