@@ -219,6 +219,9 @@ pub enum RunHarnessChoice {
     /// Moonshot AI Kimi Code.
     #[value(name = "kimi", alias = "kimi-code", alias = "kimi-cli")]
     Kimi,
+    /// Grok Build CLI (xAI).
+    #[value(alias = "grok-build")]
+    Grok,
 }
 
 /// Arguments for `workstream-search`.

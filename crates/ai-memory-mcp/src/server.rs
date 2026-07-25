@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, projection::cap_text_with_marker,
@@ -345,6 +346,14 @@ pub struct AiMemoryServer {
     /// keeps manual runs at least as strict as the operator's configured
     /// Phase 1/2 budgets instead of falling back to compiled defaults.
     auto_improve_review_config: AutoImproveReviewConfig,
+    /// Cooldown clock for the M8 access-bump reinforcement: the last
+    /// instant each page's access counter was bumped. A page returned by
+    /// many searches in quick succession is bumped at most once per
+    /// [`ACCESS_BUMP_COOLDOWN`] instead of on every search, which keeps
+    /// repeated or overlapping queries from flooding the single writer
+    /// actor with redundant reinforcement writes. Shared across `Clone`s
+    /// so every request handler consults the same clock.
+    access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -794,6 +803,7 @@ impl AiMemoryServer {
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
+            access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -2567,17 +2577,64 @@ fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
         .collect()
 }
 
+/// A page's access counter is bumped at most once per this window. Repeated
+/// or overlapping searches routinely return the same hot pages; without a
+/// cooldown every search spawned a writer command per page, so a burst of
+/// queries flooded the single writer actor with redundant M8 reinforcement
+/// writes. One bump per minute is ample resolution for a signal that feeds
+/// day/week-scale retention scoring.
+const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Pick the page ids due for an access bump, updating the cooldown clock in
+/// place: a page is due when it has not been bumped within `cooldown`.
+/// Entries that have aged past `cooldown` are pruned in the same pass, so the
+/// map stays bounded by the recent working set rather than growing with every
+/// distinct page ever searched. Kept pure and synchronous so the throttle
+/// policy is unit-testable without a store or async runtime.
+fn select_bumpable(
+    seen: &mut HashMap<PageId, Instant>,
+    ids: Vec<PageId>,
+    now: Instant,
+    cooldown: Duration,
+) -> Vec<PageId> {
+    use std::collections::hash_map::Entry;
+
+    seen.retain(|_, last| now.duration_since(*last) < cooldown);
+    let mut fresh = Vec::new();
+    for id in ids {
+        // After the prune, an occupied slot means "still within cooldown" —
+        // skip it, and do not refresh its timestamp: refreshing would starve
+        // a continuously-hot page of its once-per-window bump entirely.
+        if let Entry::Vacant(slot) = seen.entry(id) {
+            slot.insert(now);
+            fresh.push(id);
+        }
+    }
+    fresh
+}
+
 impl AiMemoryServer {
-    /// Fire-and-forget access-counter bump for the M8 reinforcement
-    /// term. Failures are logged at warn but never surfaced to the
-    /// caller.
+    /// Fire-and-forget access-counter bump for the M8 reinforcement term,
+    /// throttled to at most one bump per page per [`ACCESS_BUMP_COOLDOWN`]
+    /// (see [`select_bumpable`]). Failures are logged at warn but never
+    /// surfaced to the caller.
     fn spawn_access_bump(&self, ids: Vec<PageId>) {
         if ids.is_empty() {
             return;
         }
+        let fresh = {
+            let mut seen = self
+                .access_bump_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            select_bumpable(&mut seen, ids, Instant::now(), ACCESS_BUMP_COOLDOWN)
+        };
+        if fresh.is_empty() {
+            return;
+        }
         let writer = self.writer.clone();
         tokio::spawn(async move {
-            if let Err(e) = writer.bump_access(ids).await {
+            if let Err(e) = writer.bump_access(fresh).await {
                 tracing::warn!(error = %e, "access bump failed");
             }
         });
@@ -6657,5 +6714,41 @@ mod tests {
                 "error must carry diagnostic text for the agent",
             );
         }
+    }
+
+    #[test]
+    fn access_bump_throttle_dedups_within_cooldown_and_reallows_after() {
+        let cooldown = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let a = PageId::new();
+        let b = PageId::new();
+        let c = PageId::new();
+        let mut seen = HashMap::new();
+
+        // First sighting of both pages → both due, in input order.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a, b], t0, cooldown),
+            vec![a, b]
+        );
+
+        // The same hot pages 30s later (inside the window) → nothing due, so
+        // the writer actor is spared the redundant reinforcement writes.
+        let t30 = t0 + Duration::from_secs(30);
+        assert!(select_bumpable(&mut seen, vec![a, b], t30, cooldown).is_empty());
+
+        // A fresh page mixed in with the cooling ones → only the fresh one.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a, b, c], t30, cooldown),
+            vec![c]
+        );
+
+        // Past the window, `a` is due again.
+        let t90 = t0 + Duration::from_secs(90);
+        assert_eq!(select_bumpable(&mut seen, vec![a], t90, cooldown), vec![a]);
+
+        // Aged-out entries are pruned, so the map never grows without bound.
+        let t_far = t0 + Duration::from_secs(1_000);
+        assert!(select_bumpable(&mut seen, Vec::new(), t_far, cooldown).is_empty());
+        assert!(seen.is_empty(), "aged-out entries must be pruned");
     }
 }

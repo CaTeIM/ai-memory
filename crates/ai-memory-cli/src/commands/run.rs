@@ -150,6 +150,7 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
         provisional_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
+    let native_grok_rules = user_supplied_grok_rules(&native_args);
     let mut plan = acquired_try!(build_launch_plan(
         harness,
         executable.clone(),
@@ -253,6 +254,25 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     } else {
         None
     };
+    let grok_context = if harness == ManagedHarness::Grok && plan.mode == LaunchMode::Session {
+        // `--rules` is single-use in Grok's argument parser, so a user-supplied
+        // rules flag wins and the packet stays undelivered (it is redelivered
+        // on the next managed run that can accept it).
+        if native_grok_rules {
+            eprintln!(
+                "ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"
+            );
+            None
+        } else {
+            acquired_try!(fetch_grok_context(&endpoint, &run_path).await)
+        }
+    } else {
+        None
+    };
+    if let Some(context) = &grok_context {
+        plan.args
+            .extend([OsString::from("--rules"), OsString::from(context)]);
+    }
     if interrupted_before_spawn.load(Ordering::SeqCst) {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
@@ -307,15 +327,18 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
             ));
         }
     };
-    if harness == ManagedHarness::Crush
+    if (harness == ManagedHarness::Crush || grok_context.is_some())
         && let Err(error) = post_empty_with_retry(
             &endpoint,
             &format!("{run_path}/context/accept"),
-            "acknowledging Crush managed context",
+            "acknowledging managed context",
         )
         .await
     {
-        eprintln!("ai-memory: {error}; the context may be delivered again on the next Crush run");
+        eprintln!(
+            "ai-memory: {error}; the context may be delivered again on the next {} run",
+            harness.as_str()
+        );
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -568,6 +591,30 @@ fn executable_file(path: &Path) -> bool {
     {
         true
     }
+}
+
+fn user_supplied_grok_rules(native_args: &[OsString]) -> bool {
+    native_args.iter().any(|arg| {
+        arg.to_str().is_some_and(|value| {
+            ["--rules", "--append-system-prompt"]
+                .iter()
+                .any(|name| value == *name || value.starts_with(&format!("{name}=")))
+        })
+    })
+}
+
+/// Grok appends `--rules` text to its session system prompt, so the packet is
+/// delivered as an argument instead of a file. Acceptance happens only after
+/// the child spawns, matching the Crush contract.
+async fn fetch_grok_context(endpoint: &ServerEndpoint, run_path: &str) -> Result<Option<String>> {
+    let response: ManagedRunContextResponse = post_json(
+        endpoint,
+        &format!("{run_path}/context"),
+        &serde_json::json!({}),
+    )
+    .await
+    .context("loading the managed context for Grok; the agent was not started")?;
+    Ok(response.context)
 }
 
 async fn prepare_crush_context(
@@ -982,6 +1029,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::Grok => ManagedHarness::Grok,
     }
 }
 
@@ -993,6 +1041,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::Grok => Some(ManagedHarness::Grok),
         _ => None,
     }
 }
@@ -1024,6 +1073,24 @@ mod tests {
                 updated_at: SystemTime::UNIX_EPOCH,
             },
         ]
+    }
+
+    #[test]
+    fn native_grok_rules_flags_suppress_context_injection() {
+        for args in [
+            vec![OsString::from("--rules"), OsString::from("be terse")],
+            vec![OsString::from("--rules=be terse")],
+            vec![
+                OsString::from("--append-system-prompt"),
+                OsString::from("x"),
+            ],
+        ] {
+            assert!(user_supplied_grok_rules(&args), "{args:?}");
+        }
+        assert!(!user_supplied_grok_rules(&[
+            OsString::from("--model"),
+            OsString::from("grok-4.5")
+        ]));
     }
 
     #[test]

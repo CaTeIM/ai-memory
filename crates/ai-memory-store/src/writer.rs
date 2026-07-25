@@ -31,6 +31,15 @@ use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
 };
 
+/// Result of atomically claiming the startup context assembled for one hook.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartupContextAcceptance {
+    /// The requested single-use handoff changed from open to accepted.
+    pub handoff_accepted: bool,
+    /// The requested managed synchronization packet changed to delivered.
+    pub managed_context_accepted: bool,
+}
+
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
     GetOrCreateWorkspace {
@@ -293,6 +302,13 @@ pub(crate) enum WriteCmd {
     AcceptManagedRunContext {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    AcceptStartupContext {
+        handoff_id: Option<HandoffId>,
+        accepting_agent: AgentKind,
+        accepting_session: Option<SessionId>,
+        managed_run_id: Option<ManagedRunId>,
+        reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
         input: FinishWorkstreamRun,
@@ -1175,6 +1191,30 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically claim the handoff and managed ledger selected for one
+    /// SessionStart response.
+    ///
+    /// When a managed run was requested but is no longer claimable, the
+    /// handoff remains open and both result fields are false.
+    pub async fn accept_startup_context(
+        &self,
+        handoff_id: Option<HandoffId>,
+        accepting_agent: AgentKind,
+        accepting_session: Option<SessionId>,
+        managed_run_id: Option<ManagedRunId>,
+    ) -> StoreResult<StartupContextAcceptance> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AcceptStartupContext {
+            handoff_id,
+            accepting_agent,
+            accepting_session,
+            managed_run_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
@@ -1586,6 +1626,41 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::AcceptManagedRunContext { run_id, reply } => {
                 let result = crate::workstream::accept_context(&mut conn, run_id);
                 send_or_warn(reply, result, "accept_managed_run_context");
+            }
+            WriteCmd::AcceptStartupContext {
+                handoff_id,
+                accepting_agent,
+                accepting_session,
+                managed_run_id,
+                reply,
+            } => {
+                let result = (|| {
+                    let tx = conn.transaction()?;
+                    let managed_context_accepted = match managed_run_id {
+                        Some(run_id) => {
+                            crate::workstream::claim_context_in_transaction(&tx, run_id)?
+                        }
+                        None => false,
+                    };
+                    if managed_run_id.is_some() && !managed_context_accepted {
+                        return Ok(StartupContextAcceptance::default());
+                    }
+                    let handoff_accepted = match handoff_id {
+                        Some(handoff_id) => ops::accept_handoff_in_transaction(
+                            &tx,
+                            &handoff_id,
+                            accepting_agent,
+                            accepting_session.as_ref(),
+                        )?,
+                        None => false,
+                    };
+                    tx.commit()?;
+                    Ok(StartupContextAcceptance {
+                        handoff_accepted,
+                        managed_context_accepted,
+                    })
+                })();
+                send_or_warn(reply, result, "accept_startup_context");
             }
             WriteCmd::FinishWorkstreamRun { input, reply } => {
                 let result = crate::workstream::finish_run(&mut conn, &input);
