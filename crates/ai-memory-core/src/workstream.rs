@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AgentKind, ManagedRunId, WorkstreamId};
 
+/// Versioned origin marker placed at the start of every managed workstream
+/// context packet. Native transcript adapters use it to prevent a harness from
+/// feeding a persisted-and-read delivery packet back into the portable ledger.
+pub const MANAGED_WORKSTREAM_PACKET_MARKER: &str =
+    "<!-- ai-memory:managed-workstream-packet:v1 -->";
+
 /// Semantic event families preserved in the portable workstream ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

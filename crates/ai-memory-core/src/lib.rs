@@ -53,6 +53,7 @@ pub use sanitize::{
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ManagedRunContextResponse, ManagedRunStatus, NewWorkstreamEvent, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse, ManagedRunStatus,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse, WorkstreamCheckpoint,
+    WorkstreamEvent, WorkstreamEventKind,
 };

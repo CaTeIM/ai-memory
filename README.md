@@ -69,7 +69,8 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Opt-in managed workstreams.** `ai-memory run claude`, then `ai-memory run
   codex --yolo`, then `ai-memory run kimi`, transparently resumes one logical
   workstream with native per-harness sessions, a portable visible-event ledger,
-  and full-ledger search.
+  and full-ledger search. Delivered packets are origin-marked; Claude transcript
+  import rejects a packet that Claude persisted and read back through a tool.
   `ai-memory run` with no harness continues the newest usable Claude Code,
   Codex, OpenCode, Pi, Crush, or Kimi Code session for this checkout. On first
   explicit use, an interactive launcher can adopt a previous session from the

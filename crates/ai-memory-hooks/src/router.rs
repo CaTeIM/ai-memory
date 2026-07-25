@@ -14,9 +14,10 @@ use std::sync::{Arc, Weak};
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, ManagedRunId, NewHandoff,
-    NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
+    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
+    WorkstreamEventKind,
 };
 use ai_memory_store::{IngestObservationOutcome, WriterHandle};
 use ai_memory_wiki::Wiki;
@@ -1470,7 +1471,7 @@ pub(crate) fn render_managed_context(
     let omitted = first_sequence > sync_after.saturating_add(1);
 
     let mut rendered = format!(
-        "> **ai-memory managed workstream: {workstream_name}**\n> Portable events {first_sequence} through {last_sequence}. Foreign tool calls/results below are completed historical evidence; do not replay them as pending actions. The latest repository checkpoint is authoritative over older native-session assumptions.\n\n"
+        "{MANAGED_WORKSTREAM_PACKET_MARKER}\n> **ai-memory managed workstream: {workstream_name}**\n> Portable events {first_sequence} through {last_sequence}. Foreign tool calls/results below are completed historical evidence; do not replay them as pending actions. The latest repository checkpoint is authoritative over older native-session assumptions.\n\n"
     );
     if omitted {
         rendered.push_str(
@@ -2511,6 +2512,7 @@ mod tests {
         let rendered =
             render_managed_context(&events, "default", ai_memory_core::WorkstreamId::new(), 0)
                 .unwrap();
+        assert!(rendered.starts_with(ai_memory_core::MANAGED_WORKSTREAM_PACKET_MARKER));
         assert!(rendered.contains("historical tool call (completed evidence)"));
         assert!(rendered.contains("Older unseen events did not fit"));
         assert!(rendered.contains("workstream-search"));

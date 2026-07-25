@@ -114,7 +114,12 @@ resume, continue, session, or fork selector.
    modifying it. Visible user/assistant messages, completed tool calls/results,
    compaction summaries, and a non-mutating Git checkpoint enter an append-only
    workstream ledger. Hidden reasoning and unsupported/private records are
-   excluded and recorded as extraction-loss annotations.
+   excluded and recorded as extraction-loss annotations. Each delivered
+   workstream packet begins with a versioned origin marker. If Claude Code
+   persists that packet and its `Read` tool returns it, the Claude transcript
+   normalizer excludes the marked result instead of feeding delivered history
+   into the ledger again. It also recognizes the pre-marker packet header for
+   compatibility with existing native sessions.
 5. Imports use deterministic event ids, incremental source cursors, immutable
    sanitized JSONL segments, and bounded batches. A retry cannot duplicate
    history. The native process's exit code is preserved.
