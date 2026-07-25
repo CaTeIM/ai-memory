@@ -34,7 +34,8 @@ pub enum Command {
     /// Print runtime status (counts, paths, version).
     Status(StatusArgs),
     /// Launch an agent in an opt-in, cross-harness managed workstream.
-    /// Every argument after the harness name is forwarded unchanged.
+    /// Native arguments are forwarded except exact wrapper flags such as
+    /// `--yolo` and `--fresh`.
     Run(RunArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
@@ -189,6 +190,10 @@ pub struct RunArgs {
     /// equivalent dangerous-mode option.
     #[arg(long)]
     pub yolo: bool,
+    /// Start a new native session in the selected workstream instead of
+    /// resuming or adopting an existing harness session.
+    #[arg(long)]
+    pub fresh: bool,
     /// Agent harness to launch. When omitted, continue the newest managed or
     /// checkout-local session among the auto-detected harnesses.
     #[arg(value_enum)]

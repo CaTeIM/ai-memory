@@ -22,12 +22,14 @@ ai-memory run
 ```
 
 Everything after the harness name is native argv except the wrapper-owned exact
-flag `--yolo`. No `--` separator is needed, and ai-memory does not maintain a
-second copy of each harness's option schema. Other wrapper options come first:
+flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
+not maintain a second copy of each harness's option schema. Other wrapper
+options come first:
 
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
-              [--workstream NAME | --new NAME] [--executable PATH] [--yolo]
+              [--workstream NAME | --new NAME] [--executable PATH]
+              [--yolo] [--fresh]
               [claude|codex|opencode|pi|crush|omp|kimi|grok] [native arguments...]
 ```
 
@@ -74,6 +76,15 @@ native session for the new workstream. Scripted/noninteractive invocations and
 launches without terminal input skip the chooser and start fresh. A launch that
 exits before producing either a native session or portable history does not
 consume the later adoption opportunity.
+
+Before adding an ai-memory-owned resume selector, the launcher checks the exact
+linked id in the harness's native store without modifying it. If the transcript
+was deleted, cleared, or lost with a sandbox overlay, ai-memory starts a fresh
+native session and repoints the same workstream when that session is observed.
+An unreadable or malformed store is reported but is not mistaken for a missing
+session. Use `ai-memory run --fresh <harness>` to deliberately skip the linked
+session and the adoption chooser. `--fresh` cannot be combined with a native
+resume, continue, session, or fork selector.
 
 ## What happens on each run
 
@@ -318,10 +329,12 @@ seeded with the operator's provider configuration. The deterministic phase
 also covers first-run adoption, bare-mode selection and empty-directory
 failure, wrapper `--yolo`, lease exclusion, Crush context cleanup, a fake-mode
 Kimi store/resume/import round trip, and the established-workstream guard
-against obsolete sessions. Native session creation, read-only extraction,
-cross-harness injection, and returning resume paths are all exercised. Docker
-wrapper host execution and remote URL preservation are covered separately by
-the `ai-memory-cli` packaging tests. Set
+against obsolete sessions. The fake Kimi round trip also deletes the linked
+native session and verifies automatic fresh-session recovery and repointing.
+Native session creation, read-only extraction, cross-harness injection, and
+returning resume paths are all exercised. Docker wrapper host execution and
+remote URL preservation are covered separately by the `ai-memory-cli`
+packaging tests. Set
 `AI_MEMORY_ACCEPTANCE_HARNESSES="kimi-cli codex"` to select a
 Kimi-to-Codex-to-Kimi round trip (Kimi aliases normalize to the installed
 `kimi` executable), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model

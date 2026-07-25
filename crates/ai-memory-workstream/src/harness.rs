@@ -137,7 +137,7 @@ pub fn build_launch_plan(
     .or_else(|| environment_session_dir(harness));
     let mut expected = explicit_session_id(harness, &args);
     let mode = launch_mode(harness, &args);
-    if mode == LaunchMode::Session && !has_explicit_session_selector(harness, &args) {
+    if mode == LaunchMode::Session && !has_native_session_selector(harness, &args) {
         match harness {
             ManagedHarness::Claude => {
                 let id = linked_session_id
@@ -275,7 +275,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
 #[must_use]
 pub fn allows_native_session_adoption(harness: ManagedHarness, native_args: &[OsString]) -> bool {
     launch_mode(harness, native_args) == LaunchMode::Session
-        && !has_explicit_session_selector(harness, native_args)
+        && !has_native_session_selector(harness, native_args)
         && !noninteractive_invocation(harness, native_args)
 }
 
@@ -462,7 +462,10 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
     }
 }
 
-fn has_explicit_session_selector(harness: ManagedHarness, args: &[OsString]) -> bool {
+/// Whether the caller supplied a native resume, continue, fork, or session
+/// selector. Wrapper recovery must not override an explicit native choice.
+#[must_use]
+pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -> bool {
     match harness {
         ManagedHarness::Claude => has_flag(
             args,

@@ -58,9 +58,10 @@ authoritative for an established workstream.
 
 Implement fresh, resume, and explicit-selector behavior in
 `crates/ai-memory-workstream/src/harness.rs`. Preserve every user argument and
-its order except the exact wrapper-owned `--yolo` token. An explicit native
-selector always wins over ai-memory's linked session. Help, version, login,
-doctor, export, and similar utility commands must not receive session flags.
+its order except the exact wrapper-owned `--yolo` and `--fresh` tokens. An
+explicit native selector always wins over ai-memory's linked session. Help,
+version, login, doctor, export, and similar utility commands must not receive
+session flags.
 
 Generate a session id only when the native CLI officially accepts a caller
 provided id. Otherwise let the harness create the session, then discover it by
@@ -68,6 +69,12 @@ exact checkout and launch time. Do not infer a session from "newest globally."
 
 Map `--yolo` only to a verified native option and avoid duplicates. If the
 harness has no equivalent, add no flag and document that fact.
+
+Support wrapper `--fresh` by checking the exact linked id in the native store
+before injecting a resume selector. A confirmed missing id starts fresh; an
+unreadable or malformed store remains an error rather than being treated as
+absence. Reject `--fresh` when the user also supplied a native resume, session,
+continue, or fork selector.
 
 ## 4. Discover and export read-only
 
@@ -128,8 +135,9 @@ precedence, directory renames, or conflicts.
 
 A managed-harness PR should include focused coverage for:
 
-- fresh launch, linked resume, explicit-selector precedence, argv order,
-  utility passthrough, path overrides, and `--yolo` mapping;
+- fresh launch, linked resume, missing-linked-session recovery,
+  explicit-selector precedence, argv order, utility passthrough, path
+  overrides, `--yolo` mapping, and wrapper `--fresh`;
 - candidate ordering, exact-checkout isolation, timestamp handling, read-only
   access, incremental cursors, stable ids, incomplete records, visible record
   inclusion, and private record exclusion;
