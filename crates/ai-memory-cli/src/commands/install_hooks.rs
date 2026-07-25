@@ -243,20 +243,42 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                     &server_url,
                     auth,
                     &config.data_dir,
+                    None,
                     &args,
                 )
             }
             AgentChoice::Codex => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-                apply_to_codex_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_codex_settings(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    None,
+                    &args,
+                )
             }
             AgentChoice::Cursor => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-                apply_to_cursor_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_cursor_settings(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    None,
+                    &args,
+                )
             }
             AgentChoice::GeminiCli => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-                apply_to_gemini_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_gemini_settings(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    None,
+                    &args,
+                )
             }
             AgentChoice::AntigravityCli => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
@@ -265,12 +287,13 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
                     &server_url,
                     auth,
                     &config.data_dir,
+                    None,
                     &args,
                 )
             }
             AgentChoice::Grok => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-                apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, None, &args)
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Devin => {
@@ -280,7 +303,14 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             AgentChoice::Openclaw => openclaw_plugin::apply(&server_url, auth, &args),
             AgentChoice::KimiCode => {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
-                apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_kimi_code_config(
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    None,
+                    &args,
+                )
             }
         };
     }
@@ -816,13 +846,14 @@ fn apply_to_claude_code_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => claude_settings_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "claude-code")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "claude-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "claude-code");
     let strategy = args.project_strategy.baked();
     let payload = build_claude_code_payload_with_data_dir(
@@ -881,13 +912,14 @@ fn apply_to_grok_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => grok_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "grok")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "grok", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "grok");
     let strategy = args.project_strategy.baked();
     let payload = build_grok_payload_with_data_dir(
@@ -1046,13 +1078,14 @@ fn apply_to_codex_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => codex_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "codex")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "codex", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "codex");
     let strategy = args.project_strategy.baked();
     let outcome = merge_codex_hooks(
@@ -1157,13 +1190,14 @@ fn apply_to_cursor_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => cursor_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "cursor")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "cursor", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "cursor");
     let strategy = args.project_strategy.baked();
     let outcome = merge_cursor_hooks(
@@ -1249,13 +1283,14 @@ fn apply_to_gemini_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => gemini_settings_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "gemini-cli", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
     let strategy = args.project_strategy.baked();
     let outcome = merge_gemini_hooks(
@@ -1333,13 +1368,15 @@ fn apply_to_antigravity_settings(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => antigravity_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
+    let staged =
+        stage_hook_scripts_with_override(hooks_dir, "antigravity-cli", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
     let strategy = args.project_strategy.baked();
     let outcome = merge_antigravity_hooks(
@@ -1416,13 +1453,14 @@ fn apply_to_kimi_code_config(
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
+    staging_data_local: Option<&Path>,
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
         None => kimi_code_config_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "kimi-code")?;
+    let staged = stage_hook_scripts_with_override(hooks_dir, "kimi-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "kimi-code");
     let strategy = args.project_strategy.baked();
     let outcome = merge_kimi_code_hooks(
@@ -2686,6 +2724,24 @@ fn stage_hook_scripts(source_dir: &Path, agent_label: &str) -> Result<PathBuf> {
     let data_dir = dirs::data_local_dir()
         .context("could not locate the user data-local directory (e.g. ~/.local/share)")?;
     stage_hook_scripts_in(source_dir, agent_label, &data_dir)
+}
+
+/// Same as [`stage_hook_scripts`], but lets a caller substitute an
+/// isolated `data_local_override` in place of the real, ambient
+/// `dirs::data_local_dir()`. Every `apply_to_*_settings` entry point
+/// threads its own `staging_data_local: Option<&Path>` through here so
+/// a future test can stage into a `TempDir` instead of racing other
+/// tests (and real installs) over the shared
+/// `~/.local/share/ai-memory/hooks/<agent>/` tree.
+fn stage_hook_scripts_with_override(
+    source_dir: &Path,
+    agent_label: &str,
+    data_local_override: Option<&Path>,
+) -> Result<PathBuf> {
+    match data_local_override {
+        Some(dir) => stage_hook_scripts_in(source_dir, agent_label, dir),
+        None => stage_hook_scripts(source_dir, agent_label),
+    }
 }
 
 fn stage_hook_scripts_in(
@@ -4922,6 +4978,71 @@ model = "gpt-5"
         assert!(parsed["hooks"]["SessionStart"].is_array());
     }
 
+    /// `apply_to_codex_settings`'s `staging_data_local` override must be
+    /// honoured: scripts land under the injected dir, never under the
+    /// real, ambient `dirs::data_local_dir()` tree. Codex represents the
+    /// "delegates staging to a merge_*_hooks helper" shape (as do cursor,
+    /// gemini, antigravity, kimi-code); see `claude_code_apply_stages_into_injected_dir`
+    /// for the "inline merge logic" shape (as do grok, devin).
+    #[test]
+    fn codex_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_codex_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            Some(staging_tmp.path()),
+            &InstallHooksArgs {
+                agent: AgentChoice::Codex,
+                capture_assistant: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("codex")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            parsed["hooks"]["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
+    }
+
     // ----------------------------------------------------------------
     // Gemini tests
     // ----------------------------------------------------------------
@@ -5308,6 +5429,73 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 path.display()
             );
         }
+    }
+
+    /// `apply_to_claude_code_settings`'s `staging_data_local` override must
+    /// be honoured: scripts land under the injected dir, never under the
+    /// real, ambient `dirs::data_local_dir()` tree. Claude Code represents
+    /// the "inline merge logic" shape (as do grok, devin); see
+    /// `codex_apply_stages_into_injected_dir` for the "delegates to a
+    /// merge_*_hooks helper" shape (as do cursor, gemini, antigravity,
+    /// kimi-code).
+    #[test]
+    fn claude_code_apply_stages_into_injected_dir() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("settings.json");
+        let staging_tmp = TempDir::new().unwrap();
+
+        apply_to_claude_code_settings(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            Some(staging_tmp.path()),
+            &InstallHooksArgs {
+                agent: AgentChoice::ClaudeCode,
+                capture_assistant: false,
+                hooks_dir: Some(hooks_tmp.path().to_path_buf()),
+                server_url: Some("http://127.0.0.1:49374".to_string()),
+                auth_token: None,
+                config_file: Some(config_path.clone()),
+                project_strategy: ProjectStrategyArg::Basename,
+                as_user: None,
+                apply: false,
+            },
+        )
+        .unwrap();
+
+        let staged_script = staging_tmp
+            .path()
+            .join("ai-memory")
+            .join("hooks")
+            .join("claude-code")
+            .join("session-start.sh");
+        assert!(
+            staged_script.is_file(),
+            "expected hook script staged at {}, override was not honoured",
+            staged_script.display()
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            parsed["hooks"]["SessionStart"].is_array(),
+            "SessionStart hook should be present"
+        );
     }
 
     #[test]
