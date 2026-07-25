@@ -172,9 +172,9 @@ chooser.
 the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-skip-permissions`, Codex
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
-Crush `--yolo`, and Kimi Code `--yolo`. OMP currently needs no added flag.
-ai-memory does not add a duplicate when the translated native flag is already
-present.
+Crush `--yolo`, Kimi Code `--yolo`, and Grok Build CLI `--yolo` (equivalent to
+its `--always-approve` option). OMP currently needs no added flag. ai-memory
+does not add a duplicate when the translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
 Gemini CLI, Devin CLI, Cursor, and other agents may
@@ -283,11 +283,11 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 ## Privacy and storage boundaries
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, or OMP private stores. The launched harness retains normal ownership of its own
-session writes. Adapters read only documented or observed local session formats.
-Provider credentials, encrypted content, system/developer prompt records, and
-hidden reasoning are not copied. The server sanitizer runs before both the
-SQLite FTS ledger and immutable files under
+Kimi Code, OMP, or Grok private stores. The launched harness retains normal
+ownership of its own session writes. Adapters read only documented or observed
+local session formats. Provider credentials, encrypted content,
+system/developer prompt records, and hidden reasoning are not copied. The
+server sanitizer runs before both the SQLite FTS ledger and immutable files under
 `<data_dir>/raw/workstreams/<workstream-id>/segments/` are written.
 
 The ledger is an operational continuity substrate, not a replacement for the
@@ -316,8 +316,8 @@ checkout to match exactly.
 ## Manual acceptance
 
 The opt-in acceptance runner exercises launcher edge cases and then orchestrates
-the locally installed Claude, Codex, OpenCode, Pi, Crush, OMP, and Kimi CLIs
-through one real workstream:
+the locally installed Claude, Codex, OpenCode, Pi, Crush, OMP, Kimi, and Grok
+CLIs through one real workstream:
 
 ```bash
 scripts/managed-workstream-acceptance.sh

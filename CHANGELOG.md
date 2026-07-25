@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Claude Desktop's rendered Windows MCP instructions now distinguish the
+  unpackaged `%APPDATA%` config from the detected MSIX `LocalCache` config, and
+  contributor, managed-workstream, and CLI reference docs no longer omit
+  recently shipped harnesses or commands. (#256)
 - The opt-in managed-workstream real-harness acceptance runner now verifies
   context delivery from the managed-run cursor/acknowledgement state and a new
   persisted assistant event instead of requiring the model to quote a prior

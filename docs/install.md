@@ -17,7 +17,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Managed cross-harness workstreams](managed-workstreams.md)
   (`ai-memory run`, transparent native resume, and argument forwarding)
 - [LLM provider tiers + self-hosted Ollama](#llm-provider-tiers)
-- [Subcommand reference](#subcommand-reference)
+- [Common subcommands](#common-subcommands)
 - [Managed routing snippets and Agent Skills](#managed-routing-snippets-and-agent-skills)
 - [Operating without auth](#operating-without-auth) (local-only)
 - [Keeping ai-memory up to date](#keeping-ai-memory-up-to-date)
@@ -1180,7 +1180,10 @@ falls back to the tolerant parser only when that raw strict call fails.
 
 ---
 
-## Subcommand reference
+## Common subcommands
+
+This is the operational shortlist. Run `ai-memory --help` for the authoritative
+full command tree.
 
 Two ways to invoke a subcommand against the docker deploy:
 
