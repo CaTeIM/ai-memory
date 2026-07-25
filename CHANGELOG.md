@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GROK_HOME`. Grok stays out of the bare-mode automatic pool. Verified
   against Grok Build CLI v0.2.111 ([#237]).
 
+### Changed
+- Single-page, batch, and bootstrap consolidation prompts now ask the model
+  to connect related wiki pages with path-based wikilinks and to mirror the
+  dominant natural language of the source material while preserving code,
+  identifiers, paths, commands, error strings, and JSON field names. (#238)
+
 ### Fixed
 - `install-mcp --client claude-desktop` now detects an MSIX-packaged
   Claude Desktop on Windows and writes to its virtualized

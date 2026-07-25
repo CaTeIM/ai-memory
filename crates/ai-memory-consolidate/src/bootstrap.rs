@@ -1357,6 +1357,16 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_system_prompt_requires_graph_links_and_input_language() {
+        assert!(SYSTEM_PROMPT.contains("## WIKILINKS"));
+        assert!(SYSTEM_PROMPT.contains("## OUTPUT LANGUAGE"));
+        assert!(SYSTEM_PROMPT.contains("[[project:page-path]]"));
+        assert!(SYSTEM_PROMPT.contains("[[_global:page-path]]"));
+        assert!(SYSTEM_PROMPT.contains("dominant natural language of the input"));
+        assert!(SYSTEM_PROMPT.contains("JSON keys stay in English"));
+    }
+
+    #[test]
     fn git_collection_drops_trivial_commits() {
         let tmp = TempDir::new().unwrap();
         make_repo(tmp.path()).expect("git setup");

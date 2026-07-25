@@ -71,11 +71,11 @@ linking; zero links should be rare.
 ## OUTPUT LANGUAGE
 
 Write ALL page titles (including the sessions/ page) and all body
-prose in the dominant natural language
-of the input (if the user works in Portuguese, write Portuguese —
-do not translate their vocabulary into English). Keep code,
-identifiers, file paths, shell commands, and error strings
-verbatim in their original form. JSON keys stay in English.
+prose in the dominant natural language of the input (if the user
+works in Portuguese, write Portuguese — do not translate their
+vocabulary into English). Keep code, identifiers, file paths,
+shell commands, and error strings verbatim in their original
+form. JSON keys stay in English.
 
 ## Required JSON shape
 
