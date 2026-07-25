@@ -302,15 +302,12 @@ esac
 
 maybe_warn_outdated || true
 
-# `-t` only makes sense on a real terminal, but `-i` must be passed whenever
-# stdin is a pipe/redirect too: subcommands that read stdin (`write-page
-# --body -`, `hook`) otherwise see an immediately-closed stdin inside the
-# container and silently persist an empty body.
-TTY_ARGS=()
+# Keep stdin attached in every mode. This covers pipes and redirects, plus the
+# easy-to-miss terminal-stdin/redirected-stdout case. `AI_MEMORY_NO_TTY`
+# suppresses only the pseudo-terminal allocation.
+TTY_ARGS=(-i)
 if [ -z "${AI_MEMORY_NO_TTY:-}" ] && [ -t 0 ] && [ -t 1 ]; then
-  TTY_ARGS=(-it)
-elif [ ! -t 0 ]; then
-  TTY_ARGS=(-i)
+  TTY_ARGS+=(-t)
 fi
 
 # The CLI runs INSIDE the container but renders hook config for the HOST, which

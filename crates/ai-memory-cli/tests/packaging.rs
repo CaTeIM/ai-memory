@@ -285,6 +285,37 @@ fn wrapper_keeps_stdin_attached_when_it_is_a_pipe() {
     );
 }
 
+#[test]
+fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
+    let posix = read_repo("bin/ai-memory");
+    assert!(
+        posix.contains("TTY_ARGS=(-i)"),
+        "POSIX wrapper must attach stdin before inspecting terminal state"
+    );
+    assert!(
+        posix.contains("TTY_ARGS+=(-t)"),
+        "POSIX wrapper must add TTY allocation separately"
+    );
+    assert!(
+        !posix.contains("TTY_ARGS=(-it)"),
+        "combined flags can drop stdin when only stdout is redirected"
+    );
+
+    let powershell = read_repo("bin/ai-memory.ps1");
+    assert!(
+        powershell.contains("$DockerArgs = @(\"run\", \"--rm\", \"-i\")"),
+        "PowerShell wrapper must attach stdin before inspecting console state"
+    );
+    assert!(
+        powershell.contains("$DockerArgs += \"-t\""),
+        "PowerShell wrapper must add TTY allocation separately"
+    );
+    assert!(
+        !powershell.contains("$DockerArgs += \"-it\""),
+        "PowerShell must not couple stdin attachment to TTY allocation"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_run_wrapper_uses_host_binary_path_and_remote_server_without_docker() {
