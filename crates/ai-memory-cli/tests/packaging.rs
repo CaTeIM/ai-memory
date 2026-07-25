@@ -300,6 +300,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
         !posix.contains("TTY_ARGS=(-it)"),
         "combined flags can drop stdin when only stdout is redirected"
     );
+    assert!(
+        posix.contains("CLAUDE_CODE_SESSION_ID"),
+        "POSIX wrapper must forward Claude's session id into the bridge container"
+    );
 
     let powershell = read_repo("bin/ai-memory.ps1");
     assert!(
@@ -313,6 +317,10 @@ fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
     assert!(
         !powershell.contains("$DockerArgs += \"-it\""),
         "PowerShell must not couple stdin attachment to TTY allocation"
+    );
+    assert!(
+        powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
+        "PowerShell wrapper must forward Claude's session id into the bridge container"
     );
 }
 

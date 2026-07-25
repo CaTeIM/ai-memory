@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
         // `HookDrain` is handled in the fast-path above (before config/tracing).
         Command::HookDrain(_args) => commands::hook::run_drain(Some(config.data_dir.clone())).await,
         Command::InstallMcp(args) => commands::install_mcp::run(&config, args),
+        Command::McpBridge(args) => commands::mcp_bridge::run(&config, args).await,
         Command::Commit(args) => commands::commit::run(&config, args).await,
         Command::Checkpoints(args) => commands::checkpoints::run(&config, args).await,
         Command::RestorePage(args) => commands::restore_page::run(&config, args).await,

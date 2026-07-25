@@ -108,6 +108,26 @@ MCP client config files can only declare static URL/auth headers. Static
 configs cannot inject the current agent-run session id into every tool
 call.
 
+Claude Code can opt into ai-memory's session-aware stdio bridge:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The bridge reads the `CLAUDE_CODE_SESSION_ID` that Claude supplies to its stdio
+MCP subprocess and forwards it as `X-Memory-Actor-Session-Id` while preserving
+the configured remote endpoint and bearer token. Existing Claude Code installs
+stay on the static HTTP transport unless this flag is used.
+
+Claude Code's stdio MCP subprocess keeps the id it received at startup across
+`/clear`, even though subsequent hooks receive the new id. On
+`--continue`/`--resume` without an explicit id, Claude may also give the MCP
+subprocess the startup id rather than the resumed id. Restart Claude Code after
+`/clear` when exact session-key continuity matters, and prefer
+`--resume <session-id>` for explicit resumes. The bridge deliberately fails
+when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
+the shared single slot.
+
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
 `X-Memory-Actor-Session-Id` (preferred) or `Mcp-Session-Id`. Otherwise
@@ -130,6 +150,8 @@ For built-in installs that use static MCP config, prefer:
   concurrent sessions still need explicit `workspace` + `project` args
   or a session-aware bridge when the MCP client cannot forward the hook
   session id.
+- `per_session` plus Claude Code's `install-mcp --session-aware` bridge when
+  one operator runs concurrent Claude Code sessions in different projects.
 
 ## Pairing with multi-user mode
 
@@ -144,8 +166,8 @@ sessions by the same user are isolated too.
 
 Single-user installs can use `per_session` alone (no `token_pepper`,
 no `users` row) only when the client/bridge forwards the session id on
-MCP calls. With the stock static MCP configs, use explicit
-`workspace` + `project` arguments for concurrent windows.
+MCP calls. Claude Code has the opt-in bridge above; with other stock static MCP
+configs, use explicit `workspace` + `project` arguments for concurrent windows.
 
 ## Memory footprint
 

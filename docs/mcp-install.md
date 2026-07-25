@@ -116,6 +116,52 @@ metadata.
 
 ---
 
+## Claude Code
+
+**Status:** ✅ Native HTTP MCP supported. ✅ Optional session-aware stdio
+bridge supported for concurrent sessions.
+
+The default registration remains a static HTTP entry:
+
+```bash
+ai-memory install-mcp --client claude-code --apply
+```
+
+Static HTTP config cannot attach the current lifecycle-hook session id, so
+`[auto_scope] mode = "per_session"` cannot isolate two concurrent Claude Code
+sessions through that entry. Opt into ai-memory's local stdio bridge instead:
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The generated entry runs `ai-memory mcp-bridge`, connects to the same configured
+local or remote `/mcp` endpoint, preserves bearer authentication, and adds
+`X-Memory-Actor-Session-Id: <CLAUDE_CODE_SESSION_ID>` to every upstream request.
+It supports ai-memory's default stateless HTTP mode and opt-in stateful mode.
+The command fails closed if Claude did not supply a session id rather than
+silently falling back to the shared single slot.
+
+Pair the bridge with this server setting:
+
+```toml
+[auto_scope]
+mode = "per_session"
+```
+
+Claude Code sets `CLAUDE_CODE_SESSION_ID` on stdio MCP subprocesses, but the
+subprocess retains the id it was launched with across `/clear`. Also,
+`--continue` or `--resume` without an explicit id may expose the startup id
+instead of the resumed id. Restart Claude Code after `/clear` when exact
+session-key continuity matters, and prefer `--resume <session-id>` over an
+implicit resume. These are upstream lifecycle limits; the bridge does not guess
+or switch identities behind Claude Code.
+
+`--session-aware` is Claude-Code-only. Other clients keep their documented
+native HTTP or generated bridge paths.
+
+---
+
 ## Cursor
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via

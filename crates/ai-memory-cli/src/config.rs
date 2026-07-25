@@ -198,6 +198,7 @@ pub struct RuntimeEnv {
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
+    claude_code_session_id: Option<String>,
     anthropic_api_key: Option<SecretString>,
     anthropic_oauth_token: Option<SecretString>,
     openai_api_key: Option<SecretString>,
@@ -220,6 +221,7 @@ impl RuntimeEnv {
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
+            claude_code_session_id: env_string("CLAUDE_CODE_SESSION_ID"),
             anthropic_api_key: env_secret("ANTHROPIC_API_KEY"),
             // CLAUDE_CODE_OAUTH_TOKEN is what `claude setup-token` writes;
             // ANTHROPIC_OAUTH_TOKEN is our canonical name — accept both.
@@ -246,6 +248,12 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host_cwd(&self) -> Option<&str> {
         self.host_cwd.as_deref()
+    }
+
+    /// Claude Code lifecycle session id inherited by an stdio MCP subprocess.
+    #[must_use]
+    pub fn claude_code_session_id(&self) -> Option<&str> {
+        self.claude_code_session_id.as_deref()
     }
 
     #[cfg(test)]

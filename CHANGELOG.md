@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `install-mcp --client claude-code --session-aware` now registers an
+  ai-memory-owned stdio bridge that forwards Claude Code's
+  `CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id` on every upstream
+  HTTP MCP request. This makes `[auto_scope] mode = "per_session"` effective
+  for concurrent Claude Code sessions against local or remote servers while
+  leaving the existing static HTTP registration as the default. The bridge
+  preserves bearer auth, stateless/stateful HTTP compatibility, and uninstall
+  ownership; both Docker wrappers forward the Claude session variable into
+  the helper container. (#244)
 - `GET /admin/open-sessions` lists open (not yet ended) sessions for one
   workspace/project/agent, newest first (`all=true` returns every match).
   `ai-memory finalize-session` now uses this endpoint instead of opening

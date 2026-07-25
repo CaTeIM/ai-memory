@@ -32,6 +32,7 @@ pub mod install_mcp;
 pub mod install_skills;
 pub mod lint;
 pub mod llm_test;
+pub mod mcp_bridge;
 pub mod move_project;
 pub mod openclaw_plugin;
 pub mod path_util;

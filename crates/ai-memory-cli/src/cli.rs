@@ -82,6 +82,9 @@ pub enum Command {
     /// Current values are listed under `--client`; see docs/mcp-install.md
     /// for the full guide.
     InstallMcp(InstallMcpArgs),
+    /// Internal stdio-to-HTTP MCP bridge for session-aware Claude Code installs.
+    #[command(hide = true)]
+    McpBridge(McpBridgeArgs),
     /// Stage + commit the wiki tree under git.
     Commit(CommitArgs),
     /// List recent wiki git checkpoints for recovery.
@@ -1475,6 +1478,19 @@ pub struct InstallMcpArgs {
     /// absent (e.g. `~/.claude.json` for Claude Code).
     #[arg(long)]
     pub config_file: Option<PathBuf>,
+    /// For Claude Code, register an ai-memory stdio bridge that forwards the
+    /// current lifecycle session id to the HTTP server. This enables
+    /// `[auto_scope] mode = "per_session"` for concurrent Claude Code sessions.
+    #[arg(long)]
+    pub session_aware: bool,
+}
+
+/// Arguments for the internal Claude Code session-aware MCP bridge.
+#[derive(Debug, Clone, Args)]
+pub struct McpBridgeArgs {
+    /// Remote ai-memory base URL or full `/mcp` endpoint.
+    #[arg(long)]
+    pub server_url: Option<String>,
 }
 
 /// Transport for the MCP server.
@@ -1591,6 +1607,26 @@ pub struct WritePageArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn claude_session_aware_mcp_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "claude-code",
+            "--session-aware",
+            "--apply",
+        ])
+        .unwrap();
+
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp command");
+        };
+        assert!(args.session_aware);
+        assert!(args.apply);
+        assert!(matches!(args.client, McpClient::ClaudeCode));
+    }
 
     #[test]
     fn pi_and_omp_mcp_clients_parse_to_distinct_variants() {

@@ -328,6 +328,15 @@ MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
 cwd parameters use their canonical names.
 
+Claude Code's optional session-aware MCP registration is a transport adapter,
+not a second tool implementation. `ai-memory mcp-bridge` serves the upstream
+tool catalogue over local stdio, delegates tool calls to the configured HTTP
+server through rmcp's client transport, and injects the inherited
+`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`. The server therefore
+keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
+The adapter fails closed without a Claude session id and is installed only by
+the explicit `install-mcp --client claude-code --session-aware` option.
+
 ## CLI subcommand surface
 
 ```
