@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory finalize-session` now uses this endpoint instead of opening
   the local SQLite index directly, so every CLI command is a thin HTTP
   client of the running server; the command now requires a reachable
-  server and no longer works against an offline data directory.
+  server and no longer works against an offline data directory. (#236)
 - Managed workstream support for Grok Build CLI: `ai-memory run grok` (alias
   `grok-build`) creates fresh sessions with a wrapper-generated `--session-id`,
   resumes linked sessions with `--resume`, maps wrapper `--yolo` onto Grok's
