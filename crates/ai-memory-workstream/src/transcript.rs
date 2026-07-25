@@ -6,7 +6,9 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_memory_core::{AgentKind, NewWorkstreamEvent, WorkstreamEventKind};
+use ai_memory_core::{
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+};
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,7 @@ use crate::ManagedHarness;
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
+const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1147,6 +1150,13 @@ fn parse_content_blocks(
             }
             "tool_result" | "toolResult" => {
                 let body = block.get("content").map(value_text).unwrap_or_default();
+                if claude_managed_packet_echo(agent, &body) {
+                    losses.push(
+                        "Claude managed workstream delivery packets were intentionally excluded"
+                            .into(),
+                    );
+                    continue;
+                }
                 push_event(
                     events,
                     agent,
@@ -1169,6 +1179,15 @@ fn parse_content_blocks(
             _ => {}
         }
     }
+}
+
+fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
+    if agent != AgentKind::ClaudeCode {
+        return false;
+    }
+    let body = body.trim_start();
+    body.starts_with(MANAGED_WORKSTREAM_PACKET_MARKER)
+        || body.starts_with(LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX)
 }
 
 fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
@@ -2268,6 +2287,46 @@ mod tests {
         assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
         assert_eq!(events[1].content, "Done");
         assert_eq!(losses.len(), 1);
+    }
+
+    #[test]
+    fn claude_adapter_excludes_read_back_managed_packets_only_at_the_origin() {
+        let value = json!({
+            "type":"user",
+            "uuid":"record",
+            "message":{"role":"user","content":[
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "\n  {MANAGED_WORKSTREAM_PACKET_MARKER}\n> **ai-memory managed workstream: default**\nprivate packet"
+                    )
+                },
+                {
+                    "type":"tool_result",
+                    "content":"  > **ai-memory managed workstream: default**\nlegacy packet"
+                },
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "ordinary file output\nmentions {MANAGED_WORKSTREAM_PACKET_MARKER} later"
+                    )
+                }
+            ]}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&value, "session", "record", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert!(events[0].content.starts_with("ordinary file output"));
+        assert_eq!(
+            losses,
+            [
+                "Claude managed workstream delivery packets were intentionally excluded",
+                "Claude managed workstream delivery packets were intentionally excluded"
+            ]
+        );
     }
 
     #[test]

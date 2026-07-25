@@ -122,6 +122,9 @@ session, and marks lifecycle calls with an invocation-scoped run id.
 SessionStart injects an unseen bounded event range; Crush receives it through a
 temporary supported global-context path because it lacks SessionStart. The host
 imports the native transcript tail and a Git checkpoint when the child exits.
+Every injected packet starts with a versioned origin marker. The Claude
+transcript normalizer excludes a marked packet if Claude persists and reads it
+back, preventing delivered history from recursively re-entering the ledger.
 An explicitly pending handoff is delivered before the managed event range;
 their single-use delivery claims share one writer transaction after the
 complete startup response has been assembled.

@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `access_count` a coarser retention signal. (#239)
 
 ### Fixed
+- Managed workstream packets now carry a versioned origin marker, and Claude
+  Code transcript import excludes a tool result only when its content begins
+  with that marker (or the legacy rendered packet header). This prevents a
+  large SessionStart packet that Claude persists and later reads from
+  `tool-results/` from re-entering the ledger and recursively consuming future
+  packet budgets, while ordinary tool results that merely mention the marker
+  remain visible. (#241)
 - Lifecycle `user-prompt` and `post-compaction` bodies are now truncated
   UTF-8-safely at 16 KiB, while notification and tool excerpts remain capped at
   2 KB. Native hook commands apply the event cap before local spooling or
