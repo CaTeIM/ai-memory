@@ -132,27 +132,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             }
             #[cfg(target_os = "windows")]
             {
-                // Since Anthropic's Feb 2026 move to MSIX packaging, a
-                // packaged Claude Desktop is an AppContainer: it never
-                // sees the real, shared %APPDATA% this unpackaged binary
-                // writes to. Windows silently virtualizes well-known
-                // paths for packaged processes into an isolated
-                // `AppData\Local\Packages\<PackageFamilyName>\LocalCache\...`
-                // tree instead — writing to the plain path produces a
-                // file the running app will never read (issue found
-                // 2026-07-16). Prefer the packaged location when a
-                // `Claude_*` package is present; only unpackaged/legacy
-                // Squirrel installs fall back to the plain path.
-                let home = home()?;
-                let local_packages_dir = home.join("AppData").join("Local").join("Packages");
-                match packaged_claude_desktop_config_path(&local_packages_dir) {
-                    Some(packaged) => packaged,
-                    None => home
-                        .join("AppData")
-                        .join("Roaming")
-                        .join("Claude")
-                        .join("claude_desktop_config.json"),
-                }
+                let local_data_dir = dirs::data_local_dir()
+                    .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
+                let roaming_config_dir = dirs::config_dir()
+                    .context("could not locate %APPDATA% for Claude Desktop config")?;
+                claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -193,21 +177,40 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
     })
 }
 
-/// Windows-only detection for an MSIX/AppX-packaged Claude Desktop.
-/// `local_packages_dir` is normally `%LOCALAPPDATA%\Packages`; a packaged
-/// Claude Desktop registers a `Claude_<PackageFamilyName>`-style directory
-/// there regardless of whether the app has ever been launched (Windows
-/// creates the package directory at install time, but the `LocalCache`
-/// subtree lazily on first run — so this checks for the package directory
-/// itself, not the config file, and lets the caller's atomic-write path
-/// create the remaining subdirectories). Returns `None` when no such
-/// directory exists (unpackaged/legacy Squirrel install, or a non-Windows
-/// test double), so callers fall back to the plain path. Sorted so the
-/// result is deterministic on the (unexpected) chance more than one
-/// `Claude_*` directory exists.
-fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(local_packages_dir)
-        .ok()?
+#[cfg(any(target_os = "windows", test))]
+fn claude_desktop_config_path_in(
+    local_data_dir: &Path,
+    roaming_config_dir: &Path,
+) -> Result<PathBuf> {
+    let local_packages_dir = local_data_dir.join("Packages");
+    Ok(
+        packaged_claude_desktop_config_path(&local_packages_dir)?.unwrap_or_else(|| {
+            roaming_config_dir
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        }),
+    )
+}
+
+/// Detect an MSIX/AppX-packaged Claude Desktop under
+/// `%LOCALAPPDATA%\Packages`. Prefer the package that already contains a
+/// config file; otherwise a single package directory is enough because the
+/// atomic apply path creates its lazy `LocalCache` descendants.
+#[cfg(any(target_os = "windows", test))]
+fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(local_packages_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect Claude Desktop packages under {}",
+                    local_packages_dir.display()
+                )
+            });
+        }
+    };
+    let mut candidates: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| {
@@ -215,17 +218,44 @@ fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Option<Path
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("Claude_"))
+                    .and_then(|name| name.get(.."Claude_".len()))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Claude_"))
         })
         .collect();
     candidates.sort();
-    candidates.into_iter().next().map(|package_dir| {
+
+    let config_path = |package_dir: &Path| {
         package_dir
             .join("LocalCache")
             .join("Roaming")
             .join("Claude")
             .join("claude_desktop_config.json")
-    })
+    };
+    let existing: Vec<PathBuf> = candidates
+        .iter()
+        .map(|package_dir| config_path(package_dir))
+        .filter(|path| path.is_file())
+        .collect();
+
+    match (existing.as_slice(), candidates.as_slice()) {
+        ([path], _) => Ok(Some(path.clone())),
+        ([], []) => Ok(None),
+        ([], [package_dir]) => Ok(Some(config_path(package_dir))),
+        _ => {
+            let package_names = candidates
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "multiple Claude Desktop packages were found under {} ({package_names}); \
+                 pass --config-file with the active package's \
+                 LocalCache\\Roaming\\Claude\\claude_desktop_config.json path",
+                local_packages_dir.display()
+            )
+        }
+    }
 }
 
 /// Claude Code reads MCP-server registrations from `.claude.json`
@@ -1022,7 +1052,9 @@ mod tests {
         let packages = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(packages.path().join("Claude_pzs8sxrjxfjjc")).unwrap();
 
-        let found = packaged_claude_desktop_config_path(packages.path()).unwrap();
+        let found = packaged_claude_desktop_config_path(packages.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             found,
             packages
@@ -1041,18 +1073,72 @@ mod tests {
         fs::create_dir_all(packages.path().join("Microsoft.WindowsTerminal_abc123")).unwrap();
         fs::write(packages.path().join("Claude_notadir"), b"").unwrap();
 
-        assert!(packaged_claude_desktop_config_path(packages.path()).is_none());
+        assert!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn packaged_claude_desktop_path_none_when_packages_dir_absent_or_empty() {
         let missing = tempfile::TempDir::new().unwrap();
         assert!(
-            packaged_claude_desktop_config_path(&missing.path().join("does-not-exist")).is_none()
+            packaged_claude_desktop_config_path(&missing.path().join("does-not-exist"))
+                .unwrap()
+                .is_none()
         );
 
         let empty = tempfile::TempDir::new().unwrap();
-        assert!(packaged_claude_desktop_config_path(empty.path()).is_none());
+        assert!(
+            packaged_claude_desktop_config_path(empty.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_desktop_path_uses_resolved_app_data_roots() {
+        let root = tempfile::TempDir::new().unwrap();
+        let local = root.path().join("redirected-local");
+        let roaming = root.path().join("redirected-roaming");
+
+        assert_eq!(
+            claude_desktop_config_path_in(&local, &roaming).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_prefers_existing_config_among_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_old")).unwrap();
+        let active_config = packages
+            .path()
+            .join("Claude_current")
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json");
+        fs::create_dir_all(active_config.parent().unwrap()).unwrap();
+        fs::write(&active_config, b"{}").unwrap();
+
+        assert_eq!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .unwrap(),
+            active_config
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_rejects_ambiguous_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_first")).unwrap();
+        fs::create_dir_all(packages.path().join("Claude_second")).unwrap();
+
+        let error = packaged_claude_desktop_config_path(packages.path()).unwrap_err();
+        assert!(error.to_string().contains("--config-file"));
     }
 
     #[test]

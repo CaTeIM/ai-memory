@@ -239,11 +239,12 @@ Aliases: `copilot`, `github-copilot`.
 **Config file:**
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json` for an
-  unpackaged/legacy install, or `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
-  for the MSIX-packaged install Anthropic has shipped by default since
-  February 2026 — `install-mcp` detects which one applies automatically
-  by checking for a `Claude_*` directory under
-  `%LOCALAPPDATA%\Packages`.
+  unpackaged install, or
+  `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
+  for a detected MSIX-packaged install. `install-mcp` checks for
+  `Claude_*` package directories automatically and prefers one that
+  already contains a config. If multiple candidates remain ambiguous,
+  it stops and asks for an explicit `--config-file` instead of guessing.
 - Linux: not officially distributed by Anthropic. Use Claude Code
   (terminal) instead.
 
@@ -274,19 +275,20 @@ stdio shim. Requires Node.js installed on the same machine.
   prompt/tool capture and session-boundary handoffs are not possible
   unless Anthropic adds a desktop hook/plugin surface.
 - If the MCP indicator doesn't appear after restart, check the logs:
-  `~/Library/Logs/Claude/mcp*.log` (macOS) or `%APPDATA%\Claude\logs\`
-  (Windows).
+  `~/Library/Logs/Claude/mcp*.log` (macOS). On Windows, check
+  `%APPDATA%\Claude\logs\` for an unpackaged install or the corresponding
+  `LocalCache\Roaming\Claude\logs\` directory under the detected
+  `%LOCALAPPDATA%\Packages\Claude_<id>\` package.
 - **Windows MSIX packaging:** a packaged Claude Desktop is an
-  AppContainer — Windows virtualizes `%APPDATA%` for it into an isolated
+  AppContainer. Windows redirects its `%APPDATA%` writes into an isolated
   `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\` tree that an
-  unpackaged process (like this CLI) never sees at the plain path.
+  unpackaged process such as this CLI must address directly.
   `install-mcp --client claude-desktop --apply` detects this and writes
-  to the packaged location automatically; if you're on an older build of
-  this CLI without that detection, pass `--config-file` pointed at the
-  `LocalCache` path directly (find the exact `Claude_<id>` folder name
-  under `%LOCALAPPDATA%\Packages`).
+  to the packaged location automatically. On an older ai-memory build,
+  pass `--config-file` pointed at the `LocalCache` path directly.
 - Sources: <https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop>,
-  <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>
+  <https://support.claude.com/en/articles/11175166-how-to-connect-remote-mcp-integrations-to-claude>,
+  <https://learn.microsoft.com/en-us/windows/msix/msix-containerization-overview>
 
 ---
 

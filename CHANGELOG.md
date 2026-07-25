@@ -17,14 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `install-mcp --client claude-desktop` now detects an MSIX-packaged
-  Claude Desktop on Windows (the default distribution since February
-  2026) and writes to its virtualized
+  Claude Desktop on Windows and writes to its virtualized
   `AppData\Local\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`
-  instead of the plain `%APPDATA%\Claude\` path, which a packaged,
-  AppContainer-sandboxed Claude Desktop never reads. Previously this
+  instead of the plain `%APPDATA%\Claude\` path. Previously this
   silently wrote a config file the running app ignored, so the MCP
-  server never appeared after restart. Unpackaged/legacy installs are
-  unaffected and keep resolving to the plain path.
+  server never appeared after restart. The detector uses Windows'
+  resolved local and roaming app-data roots, prefers an existing config
+  when multiple package directories exist, and fails with an explicit
+  `--config-file` recovery instruction when the active package is
+  ambiguous. Unpackaged installs keep resolving to the plain path.
+  (#250)
 
 ## [1.18.0] - 2026-07-23
 
