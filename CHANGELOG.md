@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `embed --force` without `--project` still fans out across the workspace and
   no longer needs a derivable project name. `ai-memory serve` is unchanged:
   it has no caller cwd, and its `--workspace` / `--project` remain the baked
-  fallback for hook events without a usable one.
+  fallback for hook events without a usable one. (#259)
 
 ### Fixed
 - `purge-project` no longer deletes a project out from under a running agent.
@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves `state = 'active'` behind until the next `ai-memory run` sweeps it,
   so only a lease that has not yet expired blocks the purge. `move-project`'s
   copy-purge merge surfaces the same conflict as a `409` naming how many
-  pages were already copied, instead of a `500`.
+  pages were already copied, instead of a `500`. (#259)
 
 ## [1.19.0] - 2026-07-25
 
