@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved into `default` — the same repository split across two scopes, with
   `ai-memory run`'s managed workstream stranded on the wrong side. Each field
   still prefers an explicit flag; when the marker decides one, the command
-  announces the resolved scope on stderr. `AI_MEMORY_IGNORE_MARKER=1` restores
-  the previous resolution for one invocation. `ai-memory serve` is unchanged:
+  announces the resolved scope on stderr, naming which half the marker
+  decided. `AI_MEMORY_IGNORE_MARKER=1` restores the previous resolution for
+  one invocation (client commands only — the hooks keep reading the marker).
+  `embed --force` without `--project` still fans out across the workspace and
+  no longer needs a derivable project name. `ai-memory serve` is unchanged:
   it has no caller cwd, and its `--workspace` / `--project` remain the baked
   fallback for hook events without a usable one.
 
@@ -32,7 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `workstreams` and `managed_runs` the cascade removes plus the
   `raw/workstreams/<id>/` directories left orphaned on disk — counters that
   previously showed `0 pages, 0 sessions, …` and made such a scope look safe
-  to delete.
+  to delete. Liveness is the lease, not the row state: a crashed wrapper
+  leaves `state = 'active'` behind until the next `ai-memory run` sweeps it,
+  so only a lease that has not yet expired blocks the purge. `move-project`'s
+  copy-purge merge surfaces the same conflict as a `409` naming how many
+  pages were already copied, instead of a `500`.
 
 ## [1.19.0] - 2026-07-25
 

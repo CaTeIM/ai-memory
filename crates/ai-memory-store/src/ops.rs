@@ -63,9 +63,9 @@ pub struct PurgeSummary {
     /// Number of `managed_runs` rows deleted (cascades through workstreams).
     pub managed_runs_deleted: u64,
     /// Ids of the deleted workstreams. Their `raw/workstreams/<id>/` segment
-    /// directories survive the SQL delete, so the caller removes them the same
-    /// way it removes [`Self::page_paths`]; otherwise they stay orphaned on
-    /// disk with no row pointing at them.
+    /// directories survive the SQL delete and are NOT removed by any caller
+    /// today — they stay on disk with no row pointing at them. Reported so the
+    /// purge can name them instead of leaving them silently orphaned.
     pub workstream_ids: Vec<String>,
 }
 use jiff::Timestamp;
@@ -1509,9 +1509,14 @@ pub fn insert_wiki_migration(
 /// admin handler has the human-readable names; the writer only has IDs) and
 /// forwarded verbatim into [`PurgeSummary::label`] for logging.
 ///
+/// `force` overrides the live-managed-run guard (step 0): `workstreams`
+/// cascades out of `projects`, so purging a scope whose lease is still live
+/// would delete the lease row out from under a running agent.
+///
 /// # Errors
-/// Returns [`StoreError`] if any SQL statement fails. The transaction is
-/// rolled back automatically on error.
+/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
@@ -1536,13 +1541,22 @@ pub fn purge_project(
     // leaves the running agent heartbeating a run id that no longer exists —
     // `409 managed run lease is not active`, every 30s, with its transcript
     // unable to reach any ledger. Refuse unless the operator insists.
+    //
+    // `state = 'active'` alone is NOT liveness: a crashed wrapper leaves that
+    // row untouched, and the only sweep that flips it to `'expired'` runs
+    // inside `workstream::prepare_run`. Without the lease-expiry predicate a
+    // single crashed agent would block every future purge of the project
+    // until someone launched another managed run. The lease is short (90s,
+    // extended by heartbeat), so `lease_expires_at > now` is the real signal.
+    let now = Timestamp::now().as_microsecond();
     let active_runs: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
             "SELECT w.name, mr.agent_kind FROM managed_runs mr \
              JOIN workstreams w ON w.id = mr.workstream_id \
-             WHERE w.project_id = ?1 AND mr.state = 'active'",
+             WHERE w.project_id = ?1 AND mr.state = 'active' \
+               AND mr.lease_expires_at > ?2",
         )?;
-        stmt.query_map(rusqlite::params![&pid[..]], |row| {
+        stmt.query_map(rusqlite::params![&pid[..], now], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1601,18 +1615,18 @@ pub fn purge_project(
     };
 
     // Same idea for the workstream segment directories: the rows go with the
-    // cascade but `raw/workstreams/<id>/` does not.
+    // cascade but `raw/workstreams/<id>/` does not. Decode through the typed
+    // id so the reported string matches the directory name `write_segment`
+    // builds from `WorkstreamId::to_string`; a malformed blob is a corrupt
+    // row, so surface it rather than silently shortening the orphan list.
     let workstream_ids: Vec<String> = {
         let mut stmt = tx.prepare("SELECT id FROM workstreams WHERE project_id = ?1")?;
-        stmt.query_map(rusqlite::params![&pid[..]], |row| row.get::<_, Vec<u8>>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .filter_map(|raw| {
-                <[u8; 16]>::try_from(raw.as_slice())
-                    .ok()
-                    .map(|bytes| uuid::Uuid::from_bytes(bytes).to_string())
-            })
-            .collect()
+        let rows = stmt
+            .query_map(rusqlite::params![&pid[..]], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|raw| ai_memory_core::WorkstreamId::from_slice(&raw).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Cascade handles pages / sessions / observations / handoffs /
@@ -4225,6 +4239,29 @@ mod tests {
             vec![prepared.workstream_id.to_string()],
             "the orphaned raw/workstreams/<id>/ dir is reported for cleanup"
         );
+    }
+
+    /// A crashed wrapper leaves `state = 'active'` behind forever — the only
+    /// sweep that flips it to `'expired'` lives in `prepare_run`. Guarding on
+    /// the state alone would let one dead session block every future purge of
+    /// the project, so the guard must read the lease expiry too.
+    #[test]
+    fn purge_project_ignores_a_managed_run_whose_lease_expired() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        open_managed_run(&mut conn, &ws, &proj);
+        // Simulate the crash: the row still says 'active', but nothing has
+        // heartbeated it, so its lease lapsed.
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = ?1 WHERE state = 'active'",
+            rusqlite::params![Timestamp::now().as_microsecond() - 1],
+        )
+        .unwrap();
+
+        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
+            .expect("a lapsed lease is not a running agent");
+
+        assert_eq!(summary.workstreams_deleted, 1);
+        assert_eq!(summary.managed_runs_deleted, 1);
     }
 
     /// A `rename_project` writes an attributed audit row, committed

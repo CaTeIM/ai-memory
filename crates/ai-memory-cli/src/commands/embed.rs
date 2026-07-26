@@ -32,14 +32,18 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     // Without an explicit `--project`, `--force` / `--reembed` fans out
     // across the whole workspace instead of the CWD-derived project only.
     let all_projects = args.force && args.project.is_none();
-    // Resolve the scope even in the fan-out case: `--force` without
-    // `--project` still targets one workspace, and the marker decides which.
-    let (workspace, resolved_project) =
-        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let project = if all_projects {
-        String::new()
+    // The fan-out still targets one workspace, and the marker decides which —
+    // but only the workspace half is resolved there. Resolving the pair would
+    // make `--force` fail on a cwd whose project name cannot be derived (the
+    // stale-docker-wrapper bail, or a non-repo dir) for a name it then throws
+    // away, and would announce a project the request never carries.
+    let (workspace, project) = if all_projects {
+        (
+            super::resolve_workspace(config, args.workspace.as_deref()),
+            String::new(),
+        )
     } else {
-        resolved_project
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?
     };
     let report: serde_json::Value = post_json(
         &endpoint,

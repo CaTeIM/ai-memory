@@ -81,25 +81,31 @@ pub(crate) fn resolve_scope(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
-    let marker =
-        scope_cwd(config).and_then(|cwd| crate::marker::read_scope(&cwd).map(|scope| (scope, cwd)));
+    let explicit_ws = explicit_ws.filter(|s| !s.is_empty());
+    let explicit_proj = explicit_proj.filter(|s| !s.is_empty());
+    // Both halves pinned on the command line: the marker cannot change the
+    // answer, so skip the walk and the file reads entirely.
+    if let (Some(workspace), Some(project)) = (explicit_ws, explicit_proj) {
+        return Ok((workspace.to_string(), project.to_string()));
+    }
+    let marker = marker_scope(config);
 
-    let mut from_marker = false;
-    let workspace = match explicit_ws.filter(|s| !s.is_empty()) {
+    let mut decided: Vec<&str> = Vec::with_capacity(2);
+    let workspace = match explicit_ws {
         Some(explicit) => explicit.to_string(),
         None => match marker
             .as_ref()
             .and_then(|(scope, _)| scope.workspace.clone())
         {
             Some(declared) => {
-                from_marker = true;
+                decided.push("workspace");
                 declared
             }
             None => crate::config::DEFAULT_WORKSPACE.to_string(),
         },
     };
 
-    let project = match explicit_proj.filter(|s| !s.is_empty()) {
+    let project = match explicit_proj {
         Some(explicit) => explicit.to_string(),
         None => {
             // A marker's explicit `project` pins the name for its whole tree;
@@ -118,7 +124,7 @@ pub(crate) fn resolve_scope(
             });
             match declared {
                 Some(name) => {
-                    from_marker = true;
+                    decided.push("project");
                     name
                 }
                 None => resolve_project_name(config, None)?,
@@ -126,13 +132,46 @@ pub(crate) fn resolve_scope(
         }
     };
 
-    if from_marker && let Some((scope, _)) = marker.as_ref() {
+    if let Some((scope, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
+        // Name only the halves the marker actually decided: an explicit flag
+        // that was honoured must not read as if the file overrode it.
         eprintln!(
-            "ai-memory: scope {workspace}/{project} declared by {}",
+            "ai-memory: scope {workspace}/{project} ({} from {})",
+            decided.join(" + "),
             scope.path.display()
         );
     }
     Ok((workspace, project))
+}
+
+/// Resolve only the workspace half, for the one command whose project half is
+/// deliberately absent (`embed --force` fans out across every project in the
+/// workspace). Resolving the pair there would make the command fail on the
+/// cwd-derived project name it is about to throw away.
+pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> String {
+    if let Some(explicit) = explicit_ws.filter(|s| !s.is_empty()) {
+        return explicit.to_string();
+    }
+    match marker_scope(config) {
+        Some((scope, _)) => match scope.workspace {
+            Some(declared) => {
+                eprintln!(
+                    "ai-memory: workspace {declared} (workspace from {})",
+                    scope.path.display()
+                );
+                declared
+            }
+            None => crate::config::DEFAULT_WORKSPACE.to_string(),
+        },
+        None => crate::config::DEFAULT_WORKSPACE.to_string(),
+    }
+}
+
+/// The nearest scope-declaring marker plus the cwd the walk started from.
+fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String)> {
+    let cwd = scope_cwd(config)?;
+    let scope = crate::marker::read_scope(&cwd, &config.runtime_env)?;
+    Some((scope, cwd))
 }
 
 /// The directory marker discovery walks up from.

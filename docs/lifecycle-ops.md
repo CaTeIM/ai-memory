@@ -8,7 +8,7 @@ on a homelab box where mistakes are harder to undo.
 
 | Command | Safe with server **running**? | Wipes data? | Reversible? | Notes |
 |---|---|---|---|---|
-| `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. |
+| `purge-project --confirm` | ✅ yes | the one project's data | no | Atomic `rm -rf <project_root>` on the namespaced disk path; sibling projects untouched. Refuses with `409` while a managed workstream under the project holds a live run lease — `--force` overrides. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory, reports filesystem partial failures, and dispatches mirror notification after durable work. |
@@ -77,20 +77,40 @@ What happens, in order:
 
 1. Server looks up `(workspace_id, project_id)` by name. Returns 404
    if either is missing.
-2. Counts rows that will cascade (`pages`, `sessions`,
-   `observations`, `handoffs`, `page_embeddings`).
-3. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
+2. Refuses with 409 when a managed workstream under the project still
+   holds a **live** run lease (`managed_runs.state = 'active'` AND
+   `lease_expires_at` in the future). `workstreams` cascades out of
+   `projects` and `managed_runs` cascades out of `workstreams`, so
+   purging would delete a running agent's lease row: its heartbeat
+   would then fail with `409 managed run lease is not active` for the
+   rest of the session and the transcript would never reach the ledger.
+   A lapsed lease (crashed wrapper) does **not** block the purge.
+   `--force` purges anyway.
+3. Counts rows that will cascade (`pages`, `sessions`,
+   `observations`, `handoffs`, `page_embeddings`, plus `workstreams`
+   and `managed_runs`).
+4. Single `DELETE FROM projects WHERE id = ?` - the V01 + V05
    `ON DELETE CASCADE` foreign keys propagate to every dependent
    table in one transaction.
-4. `std::fs::remove_dir_all(<wiki_root>/<workspace_id>/<project_id>)`
+5. `std::fs::remove_dir_all(<wiki_root>/<workspace_id>/<project_id>)`
    wipes the on-disk project root.
-5. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
+6. Returns a summary: `{label, pages_deleted, sessions_deleted, …,
+   workstreams_deleted, managed_runs_deleted, workstream_ids,
    files_deleted: [<project_root>], files_failed: [...]}`.
+
+`workstream_ids` is reported, not deleted: the managed-run segment
+directories live under `<data_dir>/raw/workstreams/<workstream_id>/`,
+outside the wiki root the purge removes, so they survive as orphans
+with no row pointing at them. Remove them by hand on the **server's**
+data dir if you want the raw event ledger gone too.
 
 Failure modes:
 
 - **Workspace or project name not found** → 404, no mutation.
 - **Confirmation flag omitted** → 400, no mutation.
+- **Live managed run, no `--force`** → 409 naming the workstreams, no
+   mutation. Finish or cancel the session, or re-run with `--force`
+   (the running agent then stops being able to save its history).
 - **`remove_dir_all` partial failure** (e.g. permissions) → DB
    rows are already gone but `files_failed` is populated. Re-run
    the command with the same args is idempotent; the second call
@@ -252,7 +272,10 @@ are carried over verbatim, and only then is the source purged
 Copy-before-purge means any copy failure aborts **before** the purge,
 leaving the source intact. An unreadable source file is skipped and also
 blocks the purge (`source_purged: false`) so a fixed re-run is safe
-(re-running is idempotent — copied pages just supersede).
+(re-running is idempotent — copied pages just supersede). A **live managed
+run** under the source blocks the purge leg the same way: the move returns
+409 saying how many pages were already copied, and the source stays intact
+until the session ends and the move is re-run.
 
 **Same-path conflicts (`on_conflict`).** When a source page's path already
 exists in the destination with a different body, frontmatter, title, tier, or

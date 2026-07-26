@@ -9,12 +9,20 @@
 //! server. That is deliberate: resolution happens first, so the stderr notice
 //! is emitted regardless, and the test never needs a live engine.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ai-memory")
+}
+
+/// The tempdir's real path. `TempDir` hands back `/var/folders/…` on macOS
+/// while the child's `getcwd()` reports the resolved `/private/var/folders/…`
+/// — without canonicalising, `$HOME` never equals any directory the walk
+/// visits and the marker search escapes all the way to `/`.
+fn real_path(dir: &TempDir) -> PathBuf {
+    dir.path().canonicalize().expect("canonicalising tempdir")
 }
 
 /// Run `search` from `cwd` with a deliberately dead server and return stderr.
@@ -33,6 +41,9 @@ fn search_stderr(cwd: &Path, data_dir: &Path, extra_env: &[(&str, &str)], args: 
         // Port 1 is reserved and never listening: the command resolves its
         // scope, prints the notice, then fails on connect.
         .env("AI_MEMORY_SERVER_URL", "http://127.0.0.1:1")
+        // `AI_MEMORY_HOME` outranks `$HOME` in `path_util::home_dir`, so an
+        // exported one on the developer's machine would unpin the walk.
+        .env_remove("AI_MEMORY_HOME")
         .env_remove("AI_MEMORY_HOST_CWD")
         .env_remove("AI_MEMORY_IGNORE_MARKER")
         .env_remove("AI_MEMORY_PROJECT_STRATEGY");
@@ -54,7 +65,7 @@ fn marker_tree(body: &str) -> (TempDir, TempDir) {
 fn marker_workspace_is_used_and_announced() {
     let (cwd, data) = marker_tree("workspace = \"acme\"\n");
 
-    let stderr = search_stderr(cwd.path(), data.path(), &[], &[]);
+    let stderr = search_stderr(&real_path(&cwd), &real_path(&data), &[], &[]);
 
     assert!(
         stderr.contains("scope acme/"),
@@ -64,6 +75,10 @@ fn marker_workspace_is_used_and_announced() {
         stderr.contains(".ai-memory.toml"),
         "the notice names the marker that decided it: {stderr}"
     );
+    assert!(
+        stderr.contains("workspace from"),
+        "the notice names which half the marker decided: {stderr}"
+    );
 }
 
 #[test]
@@ -71,8 +86,8 @@ fn ignore_marker_env_restores_the_default_workspace() {
     let (cwd, data) = marker_tree("workspace = \"acme\"\n");
 
     let stderr = search_stderr(
-        cwd.path(),
-        data.path(),
+        &real_path(&cwd),
+        &real_path(&data),
         &[("AI_MEMORY_IGNORE_MARKER", "1")],
         &[],
     );
@@ -87,7 +102,12 @@ fn ignore_marker_env_restores_the_default_workspace() {
 fn explicit_workspace_flag_beats_the_marker() {
     let (cwd, data) = marker_tree("workspace = \"acme\"\n");
 
-    let stderr = search_stderr(cwd.path(), data.path(), &[], &["--workspace", "default"]);
+    let stderr = search_stderr(
+        &real_path(&cwd),
+        &real_path(&data),
+        &[],
+        &["--workspace", "default"],
+    );
 
     assert!(
         !stderr.contains("scope acme/"),
@@ -100,10 +120,10 @@ fn a_tree_without_a_marker_is_unchanged() {
     let cwd = TempDir::new().expect("tempdir for cwd");
     let data = TempDir::new().expect("tempdir for data dir");
 
-    let stderr = search_stderr(cwd.path(), data.path(), &[], &[]);
+    let stderr = search_stderr(&real_path(&cwd), &real_path(&data), &[], &[]);
 
     assert!(
-        !stderr.contains("declared by"),
+        !stderr.contains("ai-memory: scope "),
         "no marker means no scope notice and no behaviour change: {stderr}"
     );
 }

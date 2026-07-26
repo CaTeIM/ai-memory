@@ -4190,6 +4190,25 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
+        // A live managed run under the source blocks the second leg exactly
+        // as it blocks a standalone purge. The pages are already copied at
+        // this point, so say so: re-running after the session finishes is
+        // idempotent (copied pages just supersede) and leaves the source
+        // intact meanwhile. `409` matches `handle_purge_project`; a `500`
+        // here would read as a server fault for an operator-fixable state.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{pages_copied} page(s) were copied to {}/{}, but the source \
+                         {label} could not be purged: {e}. The source is intact — \
+                         re-run the move once the session ends.",
+                        req.to_workspace, req.project,
+                    )
+                })),
+            ));
+        }
         Err(e) => return Err(internal_err(e.to_string())),
     };
 

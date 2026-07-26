@@ -636,8 +636,9 @@ pub struct BootstrapArgs {
     /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
-    /// Workspace name. Defaults to `default` (the single workspace
-    /// all hook-captured sessions land in today).
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default` — the same resolution the lifecycle hooks
+    /// use, so bootstrap pages land where the session captures do.
     #[arg(long)]
     pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
@@ -820,9 +821,10 @@ pub struct DeletePageArgs {
     /// Exact wiki path to delete (e.g. `notes/foo.md`).
     #[arg(long)]
     pub path: String,
-    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
-    /// a cross-workspace project-name collision can never silently route
-    /// the delete to the wrong slot.
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Resolution is announced on stderr so a
+    /// cross-workspace project-name collision can never silently route the
+    /// delete to the wrong slot.
     #[arg(long)]
     pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project

@@ -21,16 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::commands::path_util::home_dir;
-
-/// Set when the operator wants a marker ignored for one invocation — an
-/// escape hatch for running a command against the fallback scope without
-/// editing (or moving out of) the marker's tree.
-const IGNORE_MARKER_ENV: &str = "AI_MEMORY_IGNORE_MARKER";
-
-/// Install-wide project strategy, matching what `install-hooks
-/// --project-strategy` bakes into the generated hook commands. Consulted
-/// only when the marker itself does not pin one.
-const PROJECT_STRATEGY_ENV: &str = "AI_MEMORY_PROJECT_STRATEGY";
+use crate::config::RuntimeEnv;
 
 /// The scope fields a marker declares, plus where it was found.
 ///
@@ -69,37 +60,37 @@ impl MarkerScope {
 /// Read the nearest marker's scope declaration, honouring
 /// `AI_MEMORY_IGNORE_MARKER`.
 ///
+/// Both env knobs arrive through [`RuntimeEnv`] rather than being read here:
+/// `Config::load()` is the one config-read path, and routing them through it
+/// is also what makes the caller's unit tests hermetic against a developer's
+/// exported `AI_MEMORY_IGNORE_MARKER`.
+///
 /// Returns `None` when no marker is found, when the operator disabled marker
 /// resolution, or when the marker declares nothing scope-related — callers
 /// then keep their existing fallbacks untouched.
-pub(crate) fn read_scope(cwd: &str) -> Option<MarkerScope> {
-    if marker_ignored() {
+pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
+    if env.ignore_marker() {
         return None;
     }
     let path = find_marker(cwd)?;
+    // One read, three keys: the marker is re-read per key nowhere else on a
+    // hot path, but this one runs on every client command.
+    let text = std::fs::read_to_string(&path).ok()?;
     let mut scope = MarkerScope {
-        workspace: parse_toml_key(&path, "workspace"),
-        project: parse_toml_key(&path, "project"),
-        project_strategy: parse_toml_key(&path, "project_strategy"),
+        workspace: parse_key_in(&text, "workspace"),
+        project: parse_key_in(&text, "project"),
+        project_strategy: parse_key_in(&text, "project_strategy"),
         path,
     };
     if scope.project_strategy.is_none() {
-        scope.project_strategy = install_default_strategy();
+        // The install-wide `--project-strategy` default, if one was baked into
+        // the environment. Empty values are treated as unset.
+        scope.project_strategy = env
+            .project_strategy()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
     }
     scope.declares_scope().then_some(scope)
-}
-
-/// Whether `AI_MEMORY_IGNORE_MARKER` is set to a truthy value.
-pub(crate) fn marker_ignored() -> bool {
-    std::env::var(IGNORE_MARKER_ENV).is_ok_and(|value| is_truthy(&value))
-}
-
-/// The install-wide `--project-strategy` default, if one was baked into the
-/// environment. Empty values are treated as unset.
-fn install_default_strategy() -> Option<String> {
-    std::env::var(PROJECT_STRATEGY_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 /// Derive a project name from the **main** repository root, so linked
@@ -138,7 +129,12 @@ pub(crate) fn find_marker(cwd: &str) -> Option<PathBuf> {
 /// tables), mirroring `ai_memory_parse_toml_key`. Returns the first
 /// match. Avoids pulling in a TOML parser dependency.
 pub(crate) fn parse_toml_key(file: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(file).ok()?;
+    parse_key_in(&std::fs::read_to_string(file).ok()?, key)
+}
+
+/// [`parse_toml_key`] over already-read marker text, so a caller that needs
+/// several keys pays for one read.
+fn parse_key_in(text: &str, key: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         let Some(after_key) = trimmed.strip_prefix(key) else {
