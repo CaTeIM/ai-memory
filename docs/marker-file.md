@@ -325,6 +325,46 @@ runtime override (which was deliberately rejected in #16). The flag accepts
 Precedence is unchanged: a marker's explicit `project_strategy` or `project`
 still wins over the install default.
 
+## Who reads the marker
+
+Both entry points, as of v1.20:
+
+- **Lifecycle hooks** forward the marker's fields to the server on every
+  event, so session captures land in the declared scope.
+- **Client CLI commands** resolve `(workspace, project)` locally before
+  calling the server — `run`, `bootstrap`, `search`, `read-page`,
+  `write-page`, `lint`, `curator`, `embed`, `pending-writes`,
+  `forget-sweep`, `auto-improve`, `purge-project`, `rename-project`,
+  `move-project` (source side), and friends.
+
+Before v1.20 only the hooks read it. A checkout declaring
+`workspace = "acme"` therefore had its captures land in `acme` while every
+CLI command resolved into `default` — the same repository split across two
+scopes, with `ai-memory run`'s managed workstream on the wrong side of the
+split.
+
+Each field is resolved independently:
+
+1. The explicit flag (`--workspace` / `--project`).
+2. The nearest marker: `workspace`, and `project` — or the main repo root's
+   basename when only `project_strategy = "repo-root"` is set.
+3. The previous fallbacks: `default`, and the cwd-derived project name.
+
+When rung 2 decides a field, the command prints one line to stderr naming
+the marker and the resolved scope:
+
+```console
+$ ai-memory search "scope resolver"
+ai-memory: scope acme/api declared by /Users/dev/projects/acme/.ai-memory.toml
+```
+
+`AI_MEMORY_IGNORE_MARKER=1` skips rung 2 for one invocation, restoring the
+pre-v1.20 resolution without editing or leaving the marker's tree.
+
+`ai-memory serve` is deliberately excluded: the server has no caller cwd to
+walk up from, and its `--workspace` / `--project` are the baked fallback for
+hook events that arrive without a usable one.
+
 ## What the marker file does NOT do
 
 - ❌ No glob patterns. Walk-up by literal ancestry only.
@@ -338,6 +378,8 @@ still wins over the install default.
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)
+- ❌ No reach outside `$HOME`. The walk stops there, so a checkout that
+  lives outside the account's home directory needs its own marker.
 
 ## Troubleshooting
 

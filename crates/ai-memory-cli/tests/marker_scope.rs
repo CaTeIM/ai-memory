@@ -1,0 +1,109 @@
+//! Subprocess tests for `.ai-memory.toml` scope resolution in client commands.
+//!
+//! The unit tests in `commands::tests` cover the precedence table directly.
+//! What needs a real process is the env-var wiring — `AI_MEMORY_IGNORE_MARKER`
+//! is read from the process environment, and `$HOME` bounds the marker walk,
+//! so both have to be set before the binary starts.
+//!
+//! Each test runs a command that resolves its scope and then fails to reach a
+//! server. That is deliberate: resolution happens first, so the stderr notice
+//! is emitted regardless, and the test never needs a live engine.
+
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_ai-memory")
+}
+
+/// Run `search` from `cwd` with a deliberately dead server and return stderr.
+///
+/// `$HOME` is pinned to `cwd` so the marker walk cannot reach the developer's
+/// real `~/.ai-memory.toml`, and the data dir is redirected for the same
+/// reason — neither test should read or write the machine's actual install.
+fn search_stderr(cwd: &Path, data_dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> String {
+    let mut cmd = Command::new(bin());
+    cmd.arg("search")
+        .arg("anything")
+        .args(args)
+        .current_dir(cwd)
+        .env("HOME", cwd)
+        .env("AI_MEMORY_DATA_DIR", data_dir)
+        // Port 1 is reserved and never listening: the command resolves its
+        // scope, prints the notice, then fails on connect.
+        .env("AI_MEMORY_SERVER_URL", "http://127.0.0.1:1")
+        .env_remove("AI_MEMORY_HOST_CWD")
+        .env_remove("AI_MEMORY_IGNORE_MARKER")
+        .env_remove("AI_MEMORY_PROJECT_STRATEGY");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().expect("running ai-memory search");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn marker_tree(body: &str) -> (TempDir, TempDir) {
+    let cwd = TempDir::new().expect("tempdir for cwd");
+    let data = TempDir::new().expect("tempdir for data dir");
+    std::fs::write(cwd.path().join(".ai-memory.toml"), body).expect("writing marker");
+    (cwd, data)
+}
+
+#[test]
+fn marker_workspace_is_used_and_announced() {
+    let (cwd, data) = marker_tree("workspace = \"acme\"\n");
+
+    let stderr = search_stderr(cwd.path(), data.path(), &[], &[]);
+
+    assert!(
+        stderr.contains("scope acme/"),
+        "the resolved scope must come from the marker and be announced: {stderr}"
+    );
+    assert!(
+        stderr.contains(".ai-memory.toml"),
+        "the notice names the marker that decided it: {stderr}"
+    );
+}
+
+#[test]
+fn ignore_marker_env_restores_the_default_workspace() {
+    let (cwd, data) = marker_tree("workspace = \"acme\"\n");
+
+    let stderr = search_stderr(
+        cwd.path(),
+        data.path(),
+        &[("AI_MEMORY_IGNORE_MARKER", "1")],
+        &[],
+    );
+
+    assert!(
+        !stderr.contains("scope acme/"),
+        "AI_MEMORY_IGNORE_MARKER=1 must skip the marker entirely: {stderr}"
+    );
+}
+
+#[test]
+fn explicit_workspace_flag_beats_the_marker() {
+    let (cwd, data) = marker_tree("workspace = \"acme\"\n");
+
+    let stderr = search_stderr(cwd.path(), data.path(), &[], &["--workspace", "default"]);
+
+    assert!(
+        !stderr.contains("scope acme/"),
+        "an explicit --workspace wins, so no marker notice: {stderr}"
+    );
+}
+
+#[test]
+fn a_tree_without_a_marker_is_unchanged() {
+    let cwd = TempDir::new().expect("tempdir for cwd");
+    let data = TempDir::new().expect("tempdir for data dir");
+
+    let stderr = search_stderr(cwd.path(), data.path(), &[], &[]);
+
+    assert!(
+        !stderr.contains("declared by"),
+        "no marker means no scope notice and no behaviour change: {stderr}"
+    );
+}

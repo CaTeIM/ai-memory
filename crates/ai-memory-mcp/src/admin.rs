@@ -2861,6 +2861,11 @@ struct PurgeProjectRequest {
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Off by default: the cascade would delete that lease row
+    /// out from under a running agent, which then cannot save its history.
+    #[serde(default)]
+    force: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -2878,6 +2883,13 @@ pub struct PurgeProjectReport {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted.
     pub embeddings_deleted: u64,
+    /// Number of managed `workstreams` rows deleted via cascade.
+    pub workstreams_deleted: u64,
+    /// Number of `managed_runs` rows deleted via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams, whose `raw/workstreams/<id>/` segment
+    /// directories the operator may still want to remove.
+    pub workstream_ids: Vec<String>,
     /// Paths removed from disk (the project's UUID-namespaced directory).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
@@ -2948,10 +2960,19 @@ async fn handle_purge_project(
 
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id)
+        .purge_project(ws_id, proj_id, &label, author_id, req.force)
         .await
     {
         Ok(s) => s,
+        // A live managed run is a conflict, not a server fault: the operator
+        // can finish the session or retry with `force`. Same status the
+        // heartbeat itself returns when a lease is gone, so the two agree.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         Err(e) => return internal_err(e.to_string()),
     };
 
@@ -3000,6 +3021,9 @@ async fn handle_purge_project(
         observations_deleted: summary.observations_deleted,
         handoffs_deleted: summary.handoffs_deleted,
         embeddings_deleted: summary.embeddings_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -4162,7 +4186,7 @@ async fn copy_purge_merge(
     // `purge_project` here, so the audit author is left NULL.
     let summary = match state
         .writer
-        .purge_project(src_ws, src_proj, &label, None)
+        .purge_project(src_ws, src_proj, &label, None, false)
         .await
     {
         Ok(s) => s,

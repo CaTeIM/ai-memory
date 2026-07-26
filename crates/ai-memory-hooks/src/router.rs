@@ -4768,7 +4768,7 @@ mod tests {
         //    points at it (exactly the purge-on-live-server scenario).
         state
             .writer
-            .purge_project(ws, proj, "default/heal-project", None)
+            .purge_project(ws, proj, "default/heal-project", None, false)
             .await
             .unwrap();
         assert!(
@@ -4951,7 +4951,7 @@ mod tests {
 
         state
             .writer
-            .purge_project(ws, proj, "default/repo-root-project", None)
+            .purge_project(ws, proj, "default/repo-root-project", None, false)
             .await
             .unwrap();
 

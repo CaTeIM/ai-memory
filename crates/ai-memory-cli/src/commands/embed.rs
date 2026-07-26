@@ -32,16 +32,20 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     // Without an explicit `--project`, `--force` / `--reembed` fans out
     // across the whole workspace instead of the CWD-derived project only.
     let all_projects = args.force && args.project.is_none();
+    // Resolve the scope even in the fan-out case: `--force` without
+    // `--project` still targets one workspace, and the marker decides which.
+    let (workspace, resolved_project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let project = if all_projects {
         String::new()
     } else {
-        super::resolve_project_name(config, args.project.as_deref())?
+        resolved_project
     };
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/embed",
         &EmbedRequest {
-            workspace: args.workspace,
+            workspace,
             project,
             // The CLI flag was historically named `force`; the server
             // field is `reembed` — map them here.
