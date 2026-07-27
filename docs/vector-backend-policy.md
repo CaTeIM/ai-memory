@@ -11,9 +11,10 @@ pages per project. At that size, brute-force cosine is simple,
 inspectable, and fast enough, especially because vector retrieval is only
 one signal in the query path. `memory_query` already combines FTS5,
 graph-neighbor expansion, optional vector RRF, and raw observation
-fallback. A bounded page-authority adjustment runs after those candidate
-streams, so semantic similarity cannot by itself declare a session page more
-canonical than a maintained decision.
+fallback. Each stream contributes through the same bounded candidate window,
+then a page-authority adjustment runs after fusion, so semantic similarity
+cannot by itself declare a session page more canonical than a maintained
+decision.
 
 Adding `sqlite-vec` would add operational surface before it has proven
 value:
