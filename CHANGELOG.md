@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Hybrid search now gives its FTS, vector, and graph streams the same bounded
+  candidate window used by authority-aware FTS search. Small result limits no
+  longer exclude a canonical page before post-fusion authority ranking can
+  promote it, and candidate-limit arithmetic is saturating throughout. (#276)
 - Forced workspace deletion now removes the immutable managed-workstream
   segment directories whose database rows are removed by the workspace
   cascade. Its admin report includes workstream/run counts and IDs, and raw

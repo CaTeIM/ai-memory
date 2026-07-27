@@ -2139,14 +2139,15 @@ impl ReaderPool {
         dim: u32,
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
+        // Authority is applied after RRF, so every stream needs the same
+        // bounded candidate window used by FTS-only search. A `limit * 2`
+        // window was too narrow at small limits for a canonical page to enter
+        // the fused pool and receive its bounded promotion.
+        let candidate_limit = authority_candidate_limit(limit);
+
         // Fetch FTS5 hits first.
         let fts_candidates = self
-            .search_page_candidates_for_project(
-                workspace_id,
-                project_id,
-                query,
-                limit.saturating_mul(2),
-            )
+            .search_page_candidates_for_project(workspace_id, project_id, query, candidate_limit)
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
@@ -2166,7 +2167,7 @@ impl ReaderPool {
                     provider,
                     model,
                     dim,
-                    limit * 2,
+                    candidate_limit,
                 )
                 .await?;
         }
@@ -2183,7 +2184,7 @@ impl ReaderPool {
             }
         }
         let graph_hits = self
-            .graph_neighbors_for_project(workspace_id, project_id, seed_ids, limit * 2)
+            .graph_neighbors_for_project(workspace_id, project_id, seed_ids, candidate_limit)
             .await?;
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
@@ -5435,6 +5436,17 @@ mod tests {
     use ai_memory_core::{
         AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, ProjectId, SessionId, WorkspaceId,
     };
+
+    #[test]
+    fn authority_candidate_window_is_bounded_and_saturating() {
+        use super::authority_candidate_limit;
+
+        assert_eq!(authority_candidate_limit(0), 0);
+        assert_eq!(authority_candidate_limit(1), 20);
+        assert_eq!(authority_candidate_limit(10), 40);
+        assert_eq!(authority_candidate_limit(1_000), 1_300);
+        assert_eq!(authority_candidate_limit(usize::MAX), usize::MAX);
+    }
 
     /// Build an open handoff for the pure-selection tests. `manual` toggles
     /// the manual (`from_session_id == None`) vs auto distinction; `t` is the

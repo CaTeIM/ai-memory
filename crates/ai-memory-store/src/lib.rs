@@ -2214,7 +2214,7 @@ mod tests {
                 String::new(),
                 String::new(),
                 0,
-                10,
+                1,
             )
             .await
             .unwrap();
