@@ -1849,6 +1849,8 @@ pub struct MoveSummary {
     pub auto_improve_runs_moved: u64,
     /// `auto_improve_proposals` rows re-stamped.
     pub auto_improve_proposals_moved: u64,
+    /// `auto_improve_rejections` rows re-stamped.
+    pub auto_improve_rejections_moved: u64,
     /// `auto_improve_scheduler_state` rows re-stamped.
     pub auto_improve_scheduler_state_moved: u64,
     /// `auto_improve_scheduler_claims` rows re-stamped.
@@ -1919,6 +1921,10 @@ pub fn move_project_workspace(
         "UPDATE auto_improve_proposals SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    let auto_improve_rejections_moved = tx.execute(
+        "UPDATE auto_improve_rejections SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
     let auto_improve_scheduler_state_moved = tx.execute(
         "UPDATE auto_improve_scheduler_state SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -1955,6 +1961,7 @@ pub fn move_project_workspace(
         audit_log_moved,
         auto_improve_runs_moved,
         auto_improve_proposals_moved,
+        auto_improve_rejections_moved,
         auto_improve_scheduler_state_moved,
         auto_improve_scheduler_claims_moved,
         session_consolidation_jobs_moved,
@@ -3222,6 +3229,17 @@ mod tests {
         .unwrap();
         end_session(&mut conn, &sid, None).unwrap();
         crate::session_consolidation::enqueue(&mut conn, src_ws, proj, sid).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_rejections \
+             (id, workspace_id, project_id, reason, normalized_fingerprint, summary, created_at) \
+             VALUES (?1, ?2, ?3, 'rejected', 'fingerprint', 'summary', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
         let managed = crate::workstream::prepare_run(
             &mut conn,
             &crate::PrepareWorkstreamRun {
@@ -3243,6 +3261,7 @@ mod tests {
         assert_eq!(summary.pages_moved, 1);
         assert_eq!(summary.sessions_moved, 1);
         assert_eq!(summary.observations_moved, 1);
+        assert_eq!(summary.auto_improve_rejections_moved, 1);
         assert_eq!(summary.session_consolidation_jobs_moved, 1);
         assert_eq!(summary.workstreams_moved, 1);
 
@@ -3266,6 +3285,7 @@ mod tests {
             "pages",
             "sessions",
             "observations",
+            "auto_improve_rejections",
             "session_consolidation_jobs",
             "workstreams",
         ] {
