@@ -52,6 +52,7 @@ pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
     use rusqlite::{Connection, params};
 
     /// A store migrated by a newer build (an applied version above anything
@@ -234,5 +235,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_table, 1);
+    }
+
+    #[test]
+    fn v33_to_v34_preserves_sessions_and_activates_durable_queue() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 33).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            },
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "continue".into(),
+                importance: 8,
+            },
+        )
+        .unwrap();
+        crate::ops::end_session(&mut conn, &session_id, None).unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        assert_eq!(schema_object_count(&conn, "table", "sessions"), 1);
+        assert_eq!(
+            schema_object_count(&conn, "table", "session_consolidation_jobs"),
+            1
+        );
+        assert_eq!(
+            schema_object_count(
+                &conn,
+                "trigger",
+                "session_consolidation_jobs_session_pairing_ai"
+            ),
+            1
+        );
+        assert!(
+            crate::session_consolidation::enqueue(&mut conn, workspace_id, project_id, session_id,)
+                .unwrap()
+        );
     }
 }

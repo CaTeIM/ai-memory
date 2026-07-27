@@ -274,7 +274,7 @@ mod tests {
 
         assert_eq!(
             find_marker_with_home(nested.to_str().unwrap(), Some(&home)),
-            Some(repo_marker)
+            Some(repo_marker.canonicalize().unwrap())
         );
         fs::remove_file(repo.join(".ai-memory.toml")).unwrap();
         assert_eq!(
@@ -302,7 +302,7 @@ mod tests {
         let local = write_marker(&cwd, "workspace = \"right\"\n");
         assert_eq!(
             find_marker_with_home(cwd.to_str().unwrap(), Some(&home)),
-            Some(local)
+            Some(local.canonicalize().unwrap())
         );
     }
 

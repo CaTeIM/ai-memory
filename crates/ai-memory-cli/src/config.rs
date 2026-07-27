@@ -91,9 +91,10 @@ pub struct Config {
     pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
-    /// configured. Off by default — SessionEnd stays cheap and
-    /// fire-and-forget; the LLM checkpoint otherwise happens on PreCompact
-    /// and via manual `memory_consolidate`. Set with
+    /// configured. Off by default. Provider work is durably queued after the
+    /// deterministic session page and handoff, then handled outside the hook
+    /// response by one bounded retrying worker. The LLM checkpoint otherwise
+    /// happens on PreCompact and via manual `memory_consolidate`. Set with
     /// `AI_MEMORY_CONSOLIDATE_ON_SESSION_END=true`.
     pub consolidate_on_session_end: bool,
     /// Server-side opt-in for assistant/Stop capture (#196). When true, the
