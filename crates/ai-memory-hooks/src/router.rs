@@ -5377,7 +5377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_end_queues_llm_work_without_waiting_for_provider() {
+    async fn session_end_queues_llm_work_without_calling_provider() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         let llm = Arc::new(RecordingLlm(Mutex::new(None)));
@@ -5405,13 +5405,7 @@ mod tests {
         process(&state, fire("user-prompt-submit"), None)
             .await
             .unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            process(&state, fire("session-end"), None),
-        )
-        .await
-        .expect("SessionEnd must not wait for provider I/O")
-        .unwrap();
+        process(&state, fire("session-end"), None).await.unwrap();
 
         assert!(
             llm.0.lock().unwrap().is_none(),
