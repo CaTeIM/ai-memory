@@ -56,6 +56,7 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
 }
 
 const AUTHORITY_CANDIDATE_MULTIPLIER: usize = 4;
+const AUTHORITY_MIN_CANDIDATES: usize = 20;
 const AUTHORITY_MAX_EXTRA_CANDIDATES: usize = 300;
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +81,7 @@ impl PageAuthority {
             "rule" | "decision" => 0.15,
             "procedure" | "gotcha" => 0.12,
             "concept" | "slot" => 0.07,
-            "session" => -0.12,
+            "session" => -0.15,
             _ => 0.0,
         };
         factor += match tier {
@@ -154,8 +155,12 @@ fn normalize_authority_tag(tag: &str) -> String {
 }
 
 fn authority_candidate_limit(limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
     limit
         .saturating_mul(AUTHORITY_CANDIDATE_MULTIPLIER)
+        .max(AUTHORITY_MIN_CANDIDATES)
         .min(limit.saturating_add(AUTHORITY_MAX_EXTRA_CANDIDATES))
 }
 

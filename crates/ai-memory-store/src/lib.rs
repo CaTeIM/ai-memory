@@ -2149,6 +2149,18 @@ mod tests {
         session.tier = Tier::Episodic;
         store.writer.upsert_page(session).await.unwrap();
 
+        for idx in 0..5 {
+            let mut noisy_session = sample_page(
+                ws,
+                proj,
+                &format!("sessions/noisy-{idx}.md"),
+                "What is the current decision about LLM embeddings? This session repeats the question as historical evidence.",
+            );
+            noisy_session.title = "What is the current decision about LLM embeddings?".into();
+            noisy_session.tier = Tier::Episodic;
+            store.writer.upsert_page(noisy_session).await.unwrap();
+        }
+
         let mut rejected = sample_page(
             ws,
             proj,
@@ -2177,6 +2189,13 @@ mod tests {
             Some("sessions/rejected-fixture.md")
         );
         assert!(scoped.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
+
+        let top_one = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(top_one[0].path.as_str(), "decisions/embedding-policy.md");
 
         let global = store
             .reader
