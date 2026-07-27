@@ -11,7 +11,9 @@ pages per project. At that size, brute-force cosine is simple,
 inspectable, and fast enough, especially because vector retrieval is only
 one signal in the query path. `memory_query` already combines FTS5,
 graph-neighbor expansion, optional vector RRF, and raw observation
-fallback.
+fallback. A bounded page-authority adjustment runs after those candidate
+streams, so semantic similarity cannot by itself declare a session page more
+canonical than a maintained decision.
 
 Adding `sqlite-vec` would add operational surface before it has proven
 value:
@@ -68,3 +70,4 @@ the MCP tool surface. The migration path should be additive:
 4. Add a safe rebuild command/path for the derived vec table.
 5. Switch vector candidate generation from brute-force scan to
    `sqlite-vec`, while preserving FTS5 + graph + vector RRF semantics.
+   The existing post-fusion authority adjustment remains unchanged.

@@ -102,7 +102,12 @@ from hook paths.
    rejected candidates/rejection-buffer entries rather than wiki writes.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
-   the same RRF. If compiled wiki pages miss entirely in default,
+   the same RRF. Before final truncation, a bounded authority multiplier
+   adjusts the relevance score using the canonical page kind, tier,
+   `pinned`, and explicit positive/negative frontmatter tags. It favors
+   maintained rules, decisions, procedures, and gotchas in close contests
+   while keeping episodic, historical, lint, and test evidence searchable.
+   No query-intent regex or hard exclusion participates. If compiled wiki pages miss entirely in default,
    explicit project, or explicit `scopes` mode, bounded raw observation
    FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
    pages across projects only. Page hits bump `access_count` +
@@ -289,7 +294,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
