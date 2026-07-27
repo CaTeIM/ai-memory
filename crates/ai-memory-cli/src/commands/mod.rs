@@ -62,8 +62,8 @@ pub mod write_page;
 ///
 /// 1. The explicit flag (`--workspace` / `--project`) when non-empty.
 /// 2. The nearest `.ai-memory.toml` marker: `workspace`, and `project` —
-///    or, when the marker only pins `project_strategy = "repo-root"`, the
-///    main repository root's basename.
+///    or the hook-compatible derived project when the marker leaves it
+///    unpinned (`basename(cwd)` by default, main repo root for `repo-root`).
 /// 3. Today's fallbacks: [`crate::config::DEFAULT_WORKSPACE`] and
 ///    [`resolve_project_name`]'s cwd chain.
 ///
@@ -95,7 +95,7 @@ pub(crate) fn resolve_scope(
         Some(explicit) => explicit.to_string(),
         None => match marker
             .as_ref()
-            .and_then(|(scope, _)| scope.workspace.clone())
+            .and_then(|(scope, _, _)| scope.workspace.clone())
         {
             Some(declared) => {
                 decided.push("workspace");
@@ -108,20 +108,24 @@ pub(crate) fn resolve_scope(
     let project = match explicit_proj {
         Some(explicit) => explicit.to_string(),
         None => {
-            // A marker's explicit `project` pins the name for its whole tree;
-            // `project_strategy = "repo-root"` instead asks for the main repo
-            // root, collapsing linked worktrees and subdirectories onto one
-            // project. Rung 3 already resolves by main repo root, so the
-            // strategy only matters when it disagrees with an inherited
-            // `AI_MEMORY_HOST_CWD` basename.
-            let declared = marker.as_ref().and_then(|(scope, cwd)| {
-                scope.project.clone().or_else(|| {
-                    scope
-                        .is_repo_root()
-                        .then(|| crate::marker::repo_root_project(cwd))
-                        .flatten()
-                })
-            });
+            // A marker's explicit `project` pins the name for its whole tree.
+            // Otherwise derive exactly as the hook does: basename(cwd) by
+            // default, or the main repository root for `repo-root`.
+            let declared = marker
+                .as_ref()
+                .and_then(|(scope, identity_cwd, lookup_cwd)| {
+                    scope.project.clone().or_else(|| {
+                        if scope.is_repo_root() {
+                            crate::marker::repo_root_project(lookup_cwd)
+                        } else {
+                            ai_memory_consolidate::derive_project_name(
+                                std::path::Path::new(identity_cwd),
+                                ai_memory_consolidate::ProjectNameStrategy::Basename,
+                            )
+                            .map(|(name, _)| name)
+                        }
+                    })
+                });
             match declared {
                 Some(name) => {
                     decided.push("project");
@@ -132,7 +136,7 @@ pub(crate) fn resolve_scope(
         }
     };
 
-    if let Some((scope, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
+    if let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
         // Name only the halves the marker actually decided: an explicit flag
         // that was honoured must not read as if the file overrode it.
         eprintln!(
@@ -153,7 +157,7 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> S
         return explicit.to_string();
     }
     match marker_scope(config) {
-        Some((scope, _)) => match scope.workspace {
+        Some((scope, _, _)) => match scope.workspace {
             Some(declared) => {
                 eprintln!(
                     "ai-memory: workspace {declared} (workspace from {})",
@@ -168,10 +172,23 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> S
 }
 
 /// The nearest scope-declaring marker plus the cwd the walk started from.
-fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String)> {
-    let cwd = scope_cwd(config)?;
-    let scope = crate::marker::read_scope(&cwd, &config.runtime_env)?;
-    Some((scope, cwd))
+fn marker_scope(config: &Config) -> Option<(crate::marker::MarkerScope, String, String)> {
+    let identity_cwd = scope_cwd(config)?;
+    // The Docker wrapper preserves the host cwd for identity but binds the
+    // checkout at /work. Check the host path when its bounded root is mounted;
+    // otherwise use the physical cwd so a marker in the /work bind is still
+    // visible. Project derivation keeps using the host identity either way.
+    let lookup_cwd = if let Some(scope_cwd) = config.runtime_env.scope_cwd() {
+        scope_cwd.to_string()
+    } else if std::path::Path::new(&identity_cwd).exists() {
+        identity_cwd.clone()
+    } else {
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.to_string_lossy().into_owned())?
+    };
+    let scope = crate::marker::read_scope(&lookup_cwd, &config.runtime_env)?;
+    Some((scope, identity_cwd, lookup_cwd))
 }
 
 /// The directory marker discovery walks up from.
@@ -325,6 +342,51 @@ mod tests {
             project,
             tmp.path().file_name().unwrap().to_str().unwrap(),
             "an unpinned project still comes from the cwd chain"
+        );
+    }
+
+    #[test]
+    fn workspace_only_marker_uses_hook_basename_from_a_subdirectory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
+        let subdir = tmp.path().join("crates").join("cli");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(subdir.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "cli".to_string())
+        );
+        assert_eq!(
+            resolve_scope(&config, Some("flagged"), None).unwrap(),
+            ("flagged".to_string(), "cli".to_string()),
+            "an explicit workspace must not restore the main-repo fallback"
+        );
+    }
+
+    #[test]
+    fn workspace_only_marker_uses_linked_worktree_directory_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let worktree = tmp.path().join("feature-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.join(".ai-memory.toml"), "workspace = \"acme\"\n").unwrap();
+        let config = Config {
+            runtime_env: RuntimeEnv::with_host_cwd_for_tests(worktree.to_str().unwrap()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_scope(&config, None, None).unwrap(),
+            ("acme".to_string(), "feature-worktree".to_string()),
+            "workspace-only markers preserve the hook's basename worktree identity"
         );
     }
 

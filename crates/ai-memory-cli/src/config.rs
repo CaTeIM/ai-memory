@@ -198,6 +198,7 @@ pub struct RuntimeEnv {
     server_url: Option<String>,
     auth_token: Option<String>,
     host_cwd: Option<String>,
+    scope_cwd: Option<String>,
     ignore_marker: bool,
     project_strategy: Option<String>,
     claude_code_session_id: Option<String>,
@@ -223,6 +224,7 @@ impl RuntimeEnv {
             server_url: env_string("AI_MEMORY_SERVER_URL"),
             auth_token: env_string("AI_MEMORY_AUTH_TOKEN"),
             host_cwd: env_string("AI_MEMORY_HOST_CWD"),
+            scope_cwd: env_string("AI_MEMORY_SCOPE_CWD"),
             // One-invocation escape hatch: run a command against the fallback
             // scope without editing (or leaving) the marker's tree.
             ignore_marker: env_string("AI_MEMORY_IGNORE_MARKER")
@@ -258,6 +260,18 @@ impl RuntimeEnv {
     #[must_use]
     pub fn host_cwd(&self) -> Option<&str> {
         self.host_cwd.as_deref()
+    }
+
+    /// Container-visible cwd used only for marker discovery.
+    #[must_use]
+    pub fn scope_cwd(&self) -> Option<&str> {
+        self.scope_cwd.as_deref()
+    }
+
+    /// Operator home captured by the single config-read path.
+    #[must_use]
+    pub fn home_dir(&self) -> Option<&str> {
+        self.home_dir.as_deref()
     }
 
     /// Whether `AI_MEMORY_IGNORE_MARKER` asked this invocation to resolve its

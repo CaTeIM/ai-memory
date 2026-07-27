@@ -72,7 +72,7 @@ pub(crate) fn read_scope(cwd: &str, env: &RuntimeEnv) -> Option<MarkerScope> {
     if env.ignore_marker() {
         return None;
     }
-    let path = find_marker(cwd)?;
+    let path = find_marker_with_home(cwd, env.home_dir().map(Path::new))?;
     // One read, three keys: the marker is re-read per key nowhere else on a
     // hot path, but this one runs on every client command.
     let text = std::fs::read_to_string(&path).ok()?;
@@ -103,20 +103,57 @@ pub(crate) fn repo_root_project(cwd: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Walk up from `cwd` toward `$HOME` (or the filesystem root) looking
-/// for `.ai-memory.toml`. Stops at `$HOME` to avoid leaking a parent
-/// user's declaration on shared machines (parity with
-/// `ai_memory_find_marker`).
+/// Walk up from `cwd` toward `$HOME` looking for `.ai-memory.toml`.
+/// Checkouts outside `$HOME` stop at their nearest `.git` root; a non-git
+/// directory outside `$HOME` checks only `cwd`. When home is unavailable the
+/// historical filesystem-root walk remains the fallback.
 pub(crate) fn find_marker(cwd: &str) -> Option<PathBuf> {
     let home = home_dir();
-    let mut dir = Path::new(cwd);
+    find_marker_with_home(cwd, home.as_deref())
+}
+
+fn find_marker_with_home(cwd: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let start = absolute_normalized(Path::new(cwd));
+    let home = home.map(absolute_normalized);
+    let boundary = match home.as_deref() {
+        Some(home) if start.starts_with(home) => Some(home.to_path_buf()),
+        Some(_) => Some(checkout_root(&start).unwrap_or_else(|| start.clone())),
+        None => None,
+    };
+
+    let mut dir = start.as_path();
     loop {
         let candidate = dir.join(".ai-memory.toml");
         if candidate.is_file() {
             return Some(candidate);
         }
-        if home.as_deref() == Some(dir) {
+        if boundary.as_deref() == Some(dir) {
             return None;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent,
+            _ => return None,
+        }
+    }
+}
+
+fn absolute_normalized(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+fn checkout_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
         }
         match dir.parent() {
             Some(parent) if parent != dir => dir = parent,
@@ -210,7 +247,7 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
-            find_marker(nested.to_str().unwrap()),
+            find_marker_with_home(nested.to_str().unwrap(), Some(&root)),
             Some(marker),
             "a marker in any ancestor wins"
         );
@@ -220,6 +257,53 @@ mod tests {
     fn find_marker_returns_none_without_one() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(find_marker(tmp.path().to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn marker_walk_outside_home_stops_at_checkout_root() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let outer = tmp.path().join("outside");
+        let repo = outer.join("repo");
+        let nested = repo.join("src");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let outer_marker = write_marker(&outer, "workspace = \"wrong\"\n");
+        let repo_marker = write_marker(&repo, "workspace = \"right\"\n");
+
+        assert_eq!(
+            find_marker_with_home(nested.to_str().unwrap(), Some(&home)),
+            Some(repo_marker)
+        );
+        fs::remove_file(repo.join(".ai-memory.toml")).unwrap();
+        assert_eq!(
+            find_marker_with_home(nested.to_str().unwrap(), Some(&home)),
+            None,
+            "a marker above the checkout boundary must not leak in"
+        );
+        assert!(outer_marker.exists());
+    }
+
+    #[test]
+    fn marker_walk_outside_home_checks_only_cwd_without_a_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let outer = tmp.path().join("outside");
+        let cwd = outer.join("plain");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        write_marker(&outer, "workspace = \"wrong\"\n");
+
+        assert_eq!(
+            find_marker_with_home(cwd.to_str().unwrap(), Some(&home)),
+            None
+        );
+        let local = write_marker(&cwd, "workspace = \"right\"\n");
+        assert_eq!(
+            find_marker_with_home(cwd.to_str().unwrap(), Some(&home)),
+            Some(local)
+        );
     }
 
     /// Happy-path TOML parser: extracts each declared root-level

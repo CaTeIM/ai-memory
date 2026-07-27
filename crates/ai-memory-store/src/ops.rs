@@ -62,10 +62,9 @@ pub struct PurgeSummary {
     pub workstreams_deleted: u64,
     /// Number of `managed_runs` rows deleted (cascades through workstreams).
     pub managed_runs_deleted: u64,
-    /// Ids of the deleted workstreams. Their `raw/workstreams/<id>/` segment
-    /// directories survive the SQL delete and are NOT removed by any caller
-    /// today — they stay on disk with no row pointing at them. Reported so the
-    /// purge can name them instead of leaving them silently orphaned.
+    /// Ids of the deleted workstreams. The admin layer uses these typed,
+    /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
+    /// transaction commits and to report any filesystem partial failure.
     pub workstream_ids: Vec<String>,
 }
 use jiff::Timestamp;
@@ -1615,10 +1614,11 @@ pub fn purge_project(
     };
 
     // Same idea for the workstream segment directories: the rows go with the
-    // cascade but `raw/workstreams/<id>/` does not. Decode through the typed
-    // id so the reported string matches the directory name `write_segment`
-    // builds from `WorkstreamId::to_string`; a malformed blob is a corrupt
-    // row, so surface it rather than silently shortening the orphan list.
+    // cascade but `raw/workstreams/<id>/` needs post-commit filesystem
+    // cleanup. Decode through the typed id so the reported string matches the
+    // directory name `write_segment` builds from `WorkstreamId::to_string`; a
+    // malformed blob is a corrupt row, so surface it rather than silently
+    // shortening the cleanup list.
     let workstream_ids: Vec<String> = {
         let mut stmt = tx.prepare("SELECT id FROM workstreams WHERE project_id = ?1")?;
         let rows = stmt
@@ -4237,7 +4237,7 @@ mod tests {
         assert_eq!(
             summary.workstream_ids,
             vec![prepared.workstream_id.to_string()],
-            "the orphaned raw/workstreams/<id>/ dir is reported for cleanup"
+            "the raw/workstreams/<id>/ dir is reported for post-commit cleanup"
         );
     }
 

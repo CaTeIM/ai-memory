@@ -822,13 +822,13 @@ drop_subagent_captures = "true"
     #[test]
     fn marker_query_suffix_repo_root_non_git_keeps_project_implicit() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let child = tmp.path().join("plain-dir");
+        std::fs::create_dir_all(&child).unwrap();
         std::fs::write(
-            tmp.path().join(".ai-memory.toml"),
+            child.join(".ai-memory.toml"),
             "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
         )
         .unwrap();
-        let child = tmp.path().join("plain-dir");
-        std::fs::create_dir_all(&child).unwrap();
         let qs = marker_query_suffix(child.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");
         assert!(!qs.contains("&project="), "{qs}");
@@ -877,11 +877,6 @@ drop_subagent_captures = "true"
 
         let worktrees = tmp.path().join("worktrees");
         std::fs::create_dir_all(&worktrees).unwrap();
-        std::fs::write(
-            worktrees.join(".ai-memory.toml"),
-            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
-        )
-        .unwrap();
         let wt = worktrees.join("acme-api/wt-feature");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         if !std::process::Command::new("git")
@@ -895,6 +890,11 @@ drop_subagent_captures = "true"
         {
             return;
         }
+        std::fs::write(
+            wt.join(".ai-memory.toml"),
+            "workspace = \"oss\"\nproject_strategy = \"repo-root\"\n",
+        )
+        .unwrap();
 
         let qs = marker_query_suffix(wt.to_str().unwrap(), None);
         assert!(qs.contains("&workspace=oss"), "{qs}");

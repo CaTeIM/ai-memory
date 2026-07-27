@@ -527,10 +527,9 @@ pub struct MoveProjectArgs {
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]
     pub confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409) to
-    /// move the project a hook session is actively writing to; `--force`
-    /// proceeds anyway (still safe — the move keeps the active pointer correct
-    /// and the schema rejects any stale write).
+    /// Override the active-project guard. In a copy-purge merge this never
+    /// overrides a live managed-workstream lease, because deleting that lease
+    /// would strand the running agent's transcript.
     #[arg(long)]
     pub force: bool,
     /// Merge conflict policy (copy-purge path only): what to do when a source

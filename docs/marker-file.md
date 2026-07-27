@@ -23,10 +23,12 @@ ai-memory or running CLI commands per directory.
 
 ## Where to put it
 
-`.ai-memory.toml` in **any ancestor** of your `cwd`. Lifecycle hooks
-walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and
-use the **first** marker found. Closer markers override outer ones. When
-a marker is found, hook scripts also forward the current `cwd` so
+`.ai-memory.toml` in **any allowed ancestor** of your `cwd`. Lifecycle hooks
+walk up from `cwd` toward `$HOME` (or `/` if `$HOME` is unset) and use the
+**first** marker found. When cwd is outside `$HOME`, the walk stops at the
+nearest checkout root (`.git` file or directory); outside a checkout, only cwd
+itself is checked. Closer markers override outer ones. When a marker is found,
+hook scripts also forward the current `cwd` so
 workspace-only markers can still resolve `project = basename(cwd)` for
 handoff lookups.
 
@@ -383,8 +385,10 @@ hook events that arrive without a usable one.
   *default* can still be baked into an install without a marker via
   `install-hooks --project-strategy repo-root`, but that is install-time
   config, not a runtime override the user sets in their shell.)
-- ❌ No reach outside `$HOME`. The walk stops there, so a checkout that
-  lives outside the account's home directory needs its own marker.
+- ❌ No reach outside the trust boundary. The walk stops at `$HOME`; a
+  checkout outside it stops at that checkout's root and needs a marker inside
+  the checkout. A non-git directory outside `$HOME` needs a marker in its
+  exact cwd.
 
 ## Troubleshooting
 

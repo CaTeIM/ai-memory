@@ -2887,8 +2887,8 @@ pub struct PurgeProjectReport {
     pub workstreams_deleted: u64,
     /// Number of `managed_runs` rows deleted via cascade.
     pub managed_runs_deleted: u64,
-    /// Ids of the deleted workstreams, whose `raw/workstreams/<id>/` segment
-    /// directories the operator may still want to remove.
+    /// Ids of the deleted workstreams whose `raw/workstreams/<id>/` segment
+    /// directories were included in the post-commit cleanup.
     pub workstream_ids: Vec<String>,
     /// Paths removed from disk (the project's UUID-namespaced directory).
     pub files_deleted: Vec<String>,
@@ -2900,6 +2900,60 @@ pub struct PurgeProjectReport {
     /// Post-purge checkpoint, if the purge changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+}
+
+async fn remove_purged_project_storage(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let project_root = state.wiki.project_root(workspace_id, project_id);
+    let project_root_display = project_root.display().to_string();
+    let mut deleted = Vec::with_capacity(workstream_ids.len() + 1);
+    let mut failed = Vec::new();
+
+    match state
+        .wiki
+        .remove_project_dir(workspace_id, project_id)
+        .await
+    {
+        Ok(()) => deleted.push(project_root_display.clone()),
+        Err(error) => {
+            warn!(
+                operation,
+                path = %project_root_display,
+                error = %error,
+                "project purge failed to remove wiki directory"
+            );
+            failed.push(project_root_display);
+        }
+    }
+
+    for workstream_id in workstream_ids {
+        let path = state
+            .data_dir
+            .join("raw")
+            .join("workstreams")
+            .join(workstream_id);
+        let path_display = path.display().to_string();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => deleted.push(path_display),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    operation,
+                    path = %path_display,
+                    error = %error,
+                    "project purge failed to remove workstream segment directory"
+                );
+                failed.push(path_display);
+            }
+        }
+    }
+
+    (deleted, failed)
 }
 
 async fn handle_purge_project(
@@ -2976,25 +3030,17 @@ async fn handle_purge_project(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows. Directory removal remains best-effort
-    // and is reported separately, matching the pre-admission purge contract.
-    let proj_root_str = state
-        .wiki
-        .project_root(ws_id, proj_id)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(ws_id, proj_id).await {
-        Ok(()) => {
-            files_deleted.push(proj_root_str);
-        }
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // DB cascade already deleted all rows. Remove both the wiki project root
+    // and every raw managed-workstream segment directory best-effort, reporting
+    // partial failures without disguising the committed database purge.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        &state,
+        ws_id,
+        proj_id,
+        &summary.workstream_ids,
+        "purge-project",
+    )
+    .await;
     // Mirrors that track filesystem reality (a git-push mirror) want to
     // know the on-disk dir is still present even though the DB rows are
     // gone, so they can refuse to drop their own copy in violation of
@@ -3392,12 +3438,13 @@ struct MoveProjectRequest {
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
     confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409)
+    /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
     /// live session's next observation would carry a stale workspace id.
     /// `force: true` proceeds anyway (still safe: the move republishes the
     /// active pointer and the (workspace_id, project_id) trigger makes any
-    /// stale write fail cleanly rather than corrupt).
+    /// stale write fail cleanly rather than corrupt). It never overrides a
+    /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
@@ -4190,20 +4237,21 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
-        // A live managed run under the source blocks the second leg exactly
-        // as it blocks a standalone purge. The pages are already copied at
-        // this point, so say so: re-running after the session finishes is
-        // idempotent (copied pages just supersede) and leaves the source
-        // intact meanwhile. `409` matches `handle_purge_project`; a `500`
-        // here would read as a server fault for an operator-fixable state.
+        // A live managed run under the source always blocks the destructive
+        // second leg. `force` only overrides the active-project guard; unlike
+        // a true move, copy-purge would delete the lease and strand the raw
+        // transcript. The pages are already copied, so a later retry is
+        // idempotent and leaves the source intact meanwhile.
         Err(e @ StoreError::ManagedRunActive { .. }) => {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": format!(
                         "{pages_copied} page(s) were copied to {}/{}, but the source \
-                         {label} could not be purged: {e}. The source is intact — \
-                         re-run the move once the session ends.",
+                         {label} could not be purged: {e}. The source is intact. \
+                         move-project --force cannot delete a live managed \
+                         workstream during a copy-purge merge; finish or cancel \
+                         the managed run, then retry.",
                         req.to_workspace, req.project,
                     )
                 })),
@@ -4212,24 +4260,17 @@ async fn copy_purge_merge(
         Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    // Remove the source's on-disk dir, then dispatch the non-blocking
-    // purge webhook. Pass the workspace/project NAMES we cached in
-    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
-    // name-resolution lookup at dispatch time would find nothing.
-    let proj_root_str = state
-        .wiki
-        .project_root(src_ws, src_proj)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(src_ws, src_proj).await {
-        Ok(()) => files_deleted.push(proj_root_str),
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // Remove the source's wiki and raw-workstream directories, then dispatch
+    // the non-blocking purge webhook. Pass the workspace/project names cached
+    // in `resolved_purge_ctx`; the DB rows no longer exist for lookup.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        state,
+        src_ws,
+        src_proj,
+        &summary.workstream_ids,
+        "move-project",
+    )
+    .await;
     // See `handle_purge_project` for the rationale on `partial_failure`.
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()

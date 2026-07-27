@@ -45,6 +45,7 @@ fn search_stderr(cwd: &Path, data_dir: &Path, extra_env: &[(&str, &str)], args: 
         // exported one on the developer's machine would unpin the walk.
         .env_remove("AI_MEMORY_HOME")
         .env_remove("AI_MEMORY_HOST_CWD")
+        .env_remove("AI_MEMORY_SCOPE_CWD")
         .env_remove("AI_MEMORY_IGNORE_MARKER")
         .env_remove("AI_MEMORY_PROJECT_STRATEGY");
     for (key, value) in extra_env {
@@ -76,8 +77,8 @@ fn marker_workspace_is_used_and_announced() {
         "the notice names the marker that decided it: {stderr}"
     );
     assert!(
-        stderr.contains("workspace from"),
-        "the notice names which half the marker decided: {stderr}"
+        stderr.contains("workspace + project from"),
+        "a workspace-only marker also selects hook-compatible basename(cwd): {stderr}"
     );
 }
 
@@ -125,5 +126,36 @@ fn a_tree_without_a_marker_is_unchanged() {
     assert!(
         !stderr.contains("ai-memory: scope "),
         "no marker means no scope notice and no behaviour change: {stderr}"
+    );
+}
+
+#[test]
+fn mounted_scope_cwd_reads_marker_while_host_cwd_keeps_project_identity() {
+    let root = TempDir::new().expect("scope root");
+    let data = TempDir::new().expect("data dir");
+    std::fs::write(
+        root.path().join(".ai-memory.toml"),
+        "workspace = \"acme\"\n",
+    )
+    .unwrap();
+    let mounted_cwd = root.path().join("crates/cli");
+    std::fs::create_dir_all(&mounted_cwd).unwrap();
+    let mounted_cwd = mounted_cwd.canonicalize().unwrap();
+    let root = real_path(&root);
+    let data = real_path(&data);
+    let stderr = search_stderr(
+        &mounted_cwd,
+        &data,
+        &[
+            ("AI_MEMORY_HOST_CWD", "/host/repo/crates/cli"),
+            ("AI_MEMORY_SCOPE_CWD", mounted_cwd.to_str().unwrap()),
+            ("HOME", root.to_str().unwrap()),
+        ],
+        &[],
+    );
+
+    assert!(
+        stderr.contains("scope acme/cli"),
+        "lookup must use the mounted path and naming must use host cwd: {stderr}"
     );
 }

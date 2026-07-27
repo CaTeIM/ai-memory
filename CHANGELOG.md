@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer needs a derivable project name. `ai-memory serve` is unchanged:
   it has no caller cwd, and its `--workspace` / `--project` remain the baked
   fallback for hook events without a usable one. (#259)
+- Marker discovery now stays inside its trust boundary when the caller's cwd
+  is outside `$HOME`: it walks no higher than the nearest checkout root, or
+  checks only cwd for a non-git directory. Workspace-only markers also keep
+  the hooks' documented `project = basename(cwd)` behavior for CLI commands,
+  including subdirectories and linked worktrees. (#259)
 
 ### Fixed
 - `purge-project` no longer deletes a project out from under a running agent.
@@ -32,14 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `409 managed run lease is not active` and the session's transcript never
   reached the ledger. The purge now refuses with a `409` naming the offending
   workstreams unless `--force` is passed, and its report counts the
-  `workstreams` and `managed_runs` the cascade removes plus the
-  `raw/workstreams/<id>/` directories left orphaned on disk — counters that
-  previously showed `0 pages, 0 sessions, …` and made such a scope look safe
-  to delete. Liveness is the lease, not the row state: a crashed wrapper
-  leaves `state = 'active'` behind until the next `ai-memory run` sweeps it,
-  so only a lease that has not yet expired blocks the purge. `move-project`'s
+  `workstreams` and `managed_runs` the cascade removes; their
+  `raw/workstreams/<id>/` directories are now removed server-side and included
+  in the same filesystem success/failure report instead of being orphaned.
+  Those counters previously showed `0 pages, 0 sessions, …` and made such a
+  scope look safe to delete. Liveness is the lease, not the row state: a
+  crashed wrapper leaves `state = 'active'` behind until the next
+  `ai-memory run` sweeps it, so only a lease that has not yet expired blocks
+  the purge. `move-project`'s
   copy-purge merge surfaces the same conflict as a `409` naming how many
-  pages were already copied, instead of a `500`. (#259)
+  pages were already copied, instead of a `500`; its `--force` flag only
+  overrides the active-project guard and never destroys a live managed-run
+  lease. (#259)
 
 ## [1.19.0] - 2026-07-25
 
