@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `superseded`, `historical`, `test-fixture`, or `do-not-answer-from` are
   downgraded but remain searchable. Exact session-only queries still retrieve
   their evidence, and the returned `rank` includes the bounded adjustment so
-  multi-scope merging preserves the same order. (#262)
+  multi-scope merging preserves the same order. (#269)
 - Client CLI commands now resolve their `(workspace, project)` from the
   nearest `.ai-memory.toml` marker, not just the lifecycle hooks. Previously
   only the hook path read the marker, so a checkout declaring
