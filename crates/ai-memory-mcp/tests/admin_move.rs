@@ -13,9 +13,9 @@
 //! both versions survive), then purge the source — there the episodic rows
 //! (sessions/observations/handoffs) are dropped by the purge.
 
-use ai_memory_core::{PagePath, Sanitized, Sanitizer, Tier};
+use ai_memory_core::{AgentKind, PagePath, Sanitized, Sanitizer, Tier};
 use ai_memory_mcp::{AdminState, admin_router};
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::{DecayParams, PrepareWorkstreamRun, Store, WorkstreamSelection};
 use ai_memory_wiki::{
     AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig, Wiki, WritePageRequest,
 };
@@ -910,6 +910,80 @@ async fn move_active_project_with_force_succeeds_and_republishes() {
         active.get(),
         Some((dst_ws, src_proj)),
         "active republished to dst"
+    );
+}
+
+#[tokio::test]
+async fn copy_purge_force_never_deletes_a_live_managed_workstream() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&store, &state.wiki, "src", "proj", "notes/a.md", "source").await;
+    seed_page(
+        &store,
+        &state.wiki,
+        "dst",
+        "proj",
+        "notes/keep.md",
+        "destination",
+    )
+    .await;
+    let (src_ws, src_proj) = ids(&store, "src", "proj").await;
+    state.active_project.set(src_ws, src_proj);
+    let prepared = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id: src_ws,
+            project_id: src_proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/move-project",
+        json!({
+            "from_workspace": "src",
+            "project": "proj",
+            "to_workspace": "dst",
+            "confirm": true,
+            "force": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--force cannot delete a live managed workstream"),
+        "the force boundary must be explicit: {body}"
+    );
+    assert_eq!(
+        store
+            .reader
+            .find_project(src_ws, "proj".into())
+            .await
+            .unwrap(),
+        Some(src_proj),
+        "the source must remain intact"
+    );
+    assert!(
+        store
+            .reader
+            .managed_run_status(prepared.run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the managed lease row must survive"
     );
 }
 

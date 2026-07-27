@@ -1352,8 +1352,10 @@ remote or uses a custom host/port.
 
 ```
 --repo-path <PATH>         (default: git rev-parse --show-toplevel)
---workspace <NAME>         (default: "default")
---project <NAME>           (default: derived from cwd — main repo root's
+--workspace <NAME>         (default: the nearest `.ai-memory.toml` marker's
+                            `workspace`, else "default")
+--project <NAME>           (default: the marker's `project` when pinned,
+                            else derived from cwd — main repo root's
                             basename via `git rev-parse --show-toplevel`,
                             or basename(cwd) when no repo is found.
                             "scratch" only as a defensive fallback for

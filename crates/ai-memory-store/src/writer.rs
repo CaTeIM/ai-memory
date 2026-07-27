@@ -183,6 +183,8 @@ pub(crate) enum WriteCmd {
         /// Authenticated operator recorded in the `audit_log` row (NULL when
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
+        /// Purge even when a managed workstream still holds a live run lease.
+        force: bool,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
@@ -751,6 +753,7 @@ impl WriterHandle {
         project_id: ProjectId,
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
+        force: bool,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -758,6 +761,7 @@ impl WriterHandle {
             project_id,
             label: label.into(),
             author_id,
+            force,
             reply: tx,
         })
         .await?;
@@ -1461,10 +1465,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 project_id,
                 label,
                 author_id,
+                force,
                 reply,
             } => {
-                let result =
-                    ops::purge_project(&mut conn, &workspace_id, &project_id, &label, author_id);
+                let result = ops::purge_project(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &label,
+                    author_id,
+                    force,
+                );
                 send_or_warn(reply, result, "purge_project");
             }
             WriteCmd::DeleteWorkspace {
