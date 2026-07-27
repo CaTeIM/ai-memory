@@ -491,7 +491,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Mark a session ended, optionally linking its summary page.
+    /// Mark a session ended, optionally linking its summary page, and persist
+    /// the observation generation covered by this end.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.

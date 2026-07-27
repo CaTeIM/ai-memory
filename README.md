@@ -657,7 +657,10 @@ Session end always writes a rule-based summary page + handoff either way.
 When the session-end opt-in is enabled, provider work is durably queued after
 those deterministic writes and handled by one bounded server worker, so hook
 drain latency does not cancel it. Failed jobs retry with backoff and survive a
-server restart.
+server restart. A resumed native session is ended again only after its
+observation generation advances; the persisted generation watermark makes
+duplicate SessionEnd delivery and system clock skew converge without repeated
+provider work.
 
 Recommended defaults:
 

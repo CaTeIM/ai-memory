@@ -830,8 +830,8 @@ pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult
     Ok(())
 }
 
-/// Stamp a session as ended, optionally linking the synthesised summary
-/// page.
+/// Stamp a session as ended, optionally linking the synthesised summary page,
+/// and record the observation generation covered by this end.
 pub fn end_session(
     conn: &mut Connection,
     session_id: &SessionId,
@@ -840,7 +840,12 @@ pub fn end_session(
     let now = Timestamp::now().as_microsecond();
     let page_blob: Option<&[u8]> = summary_page_id.map(|p| &p.as_bytes()[..]);
     conn.execute(
-        "UPDATE sessions SET ended_at = ?1, summary_page_id = ?2 WHERE id = ?3",
+        "UPDATE sessions \
+         SET ended_at = ?1, summary_page_id = ?2, \
+             ended_observation_count = (\
+                 SELECT COUNT(*) FROM observations WHERE session_id = ?3\
+             ) \
+         WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
     )?;
     Ok(())

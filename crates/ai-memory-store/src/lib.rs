@@ -2578,6 +2578,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_end_disposition_uses_observation_generation_not_wall_clock() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let first_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "first".into(),
+                    body: "initial work".into(),
+                    importance: 8,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = ?1 WHERE id = ?2",
+            params![ended_at + 1_000_000, first_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropStale,
+            "a covered observation must stay covered even if its timestamp is in the future"
+        );
+
+        let resumed_observation = store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::PostToolUse,
+                    extension: None,
+                    source_event: None,
+                    title: "resumed".into(),
+                    body: "new work".into(),
+                    importance: 7,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE observations SET created_at = 1 WHERE id = ?1",
+            params![resumed_observation.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::ReEndWithNewWork,
+            "a new observation must trigger re-end even if its timestamp predates ended_at"
+        );
+
+        store.writer.end_session(session_id, None).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropStale,
+            "stamping the new generation must make the re-end converge"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_improve_scheduler_candidates_respect_watermark_age_and_runs() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -3049,7 +3163,11 @@ mod tests {
                 },
             )
             .unwrap();
-            super::ops::end_session(&mut conn, &session_id, Some(&page_id)).unwrap();
+            conn.execute(
+                "UPDATE sessions SET ended_at = 1, summary_page_id = ?1 WHERE id = ?2",
+                params![page_id.as_bytes(), session_id.as_bytes()],
+            )
+            .unwrap();
         }
 
         let store = Store::open(tmp.path()).unwrap();

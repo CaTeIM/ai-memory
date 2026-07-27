@@ -95,12 +95,13 @@ pub enum SessionEndDisposition {
     /// The session is open in the resolved scope/agent: run the normal end
     /// path.
     Open,
-    /// Missing, cross-scope, cross-agent, or already ended with no
-    /// observations after `ended_at`: a duplicate or stale end — drop it.
+    /// Missing, cross-scope, cross-agent, or already ended with no observations
+    /// beyond the persisted end generation: a duplicate or stale end — drop it.
     DropStale,
-    /// Already ended, but observations arrived after `ended_at`: the agent
-    /// resumed the session under the same id — run the full end path again
-    /// so the resumed work reaches the compiled page (issue #152).
+    /// Already ended, but the observation count exceeds the persisted end
+    /// generation: the agent resumed the session under the same id — run the
+    /// full end path again so the resumed work reaches the compiled page
+    /// (issue #152).
     ReEndWithNewWork,
 }
 
@@ -1249,11 +1250,13 @@ impl ReaderPool {
     /// How a `SessionEnd` should treat its target session (issue #152).
     ///
     /// The old boolean ("is the session open?") conflated two very different
-    /// ended states: a *duplicate/stale* end (nothing happened since
-    /// `ended_at` — drop it, the reason the guard exists) and a *re-end* of a
+    /// ended states: a *duplicate/stale* end (the observation generation did
+    /// not advance — drop it, the reason the guard exists) and a *re-end* of a
     /// resumed session (the agent reused the id and kept working after the
     /// first end — the end path must run again or the resumed work never
-    /// reaches the compiled session page).
+    /// reaches the compiled session page). A persisted count is deliberately
+    /// used instead of comparing wall clocks, which does not converge after
+    /// clock skew (issue #261).
     pub async fn session_end_disposition(
         &self,
         session_id: SessionId,
@@ -1263,9 +1266,9 @@ impl ReaderPool {
     ) -> StoreResult<SessionEndDisposition> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
-            let ended_at: Option<Option<i64>> = conn
+            let end_state: Option<(Option<i64>, u64)> = conn
                 .query_row(
-                    "SELECT ended_at FROM sessions \
+                    "SELECT ended_at, ended_observation_count FROM sessions \
                      WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
                        AND agent_kind = ?4",
                     params![
@@ -1274,23 +1277,22 @@ impl ReaderPool {
                         project_id.as_bytes(),
                         agent,
                     ],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(ended_at) = ended_at else {
+            let Some((ended_at, ended_observation_count)) = end_state else {
                 // Missing, cross-scope, or cross-agent: never end it.
                 return Ok(SessionEndDisposition::DropStale);
             };
-            let Some(ended_at) = ended_at else {
+            if ended_at.is_none() {
                 return Ok(SessionEndDisposition::Open);
-            };
-            let newer: u64 = conn.query_row(
-                "SELECT COUNT(*) FROM observations \
-                 WHERE session_id = ?1 AND created_at > ?2",
-                params![session_id.as_bytes(), ended_at],
+            }
+            let current_observation_count: u64 = conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session_id.as_bytes()],
                 |row| row.get(0),
             )?;
-            if newer > 0 {
+            if current_observation_count > ended_observation_count {
                 Ok(SessionEndDisposition::ReEndWithNewWork)
             } else {
                 Ok(SessionEndDisposition::DropStale)

@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- SessionEnd re-consolidation now converges by comparing the current
+  observation count with a persisted count stamped by the latest completed
+  end, instead of comparing independently generated wall-clock timestamps.
+  Clock skew could otherwise leave an old observation permanently "new" and
+  repeatedly rewrite the same session page, handoff, and opt-in LLM job with no
+  agent activity. Existing ended sessions are baselined during migration so an
+  upgrade does not enqueue historical catch-up work. (#268)
 - Capture exclusions now canonicalize an existing hook working directory
   before matching paths, so filesystem aliases such as macOS `/var` versus
   `/private/var` cannot turn an excluded file event into a spooled event.

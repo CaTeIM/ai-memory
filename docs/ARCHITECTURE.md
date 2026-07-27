@@ -72,7 +72,12 @@ from hook paths.
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
-   `Handoff` row for the next agent. Auto-commits the wiki. Clients
+   `Handoff` row for the next agent. The same transaction that stamps the
+   session ended records the covered observation count. A later SessionEnd
+   re-runs the path only when that generation advances, so resumed sessions
+   are captured while duplicate delivery and clock skew converge. Existing
+   ended sessions are baselined at migration instead of becoming historical
+   catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
    Codex provides `ai-memory finalize-session`, while Antigravity CLI should
    call `memory_handoff_begin` before quitting when a handoff is needed.
@@ -205,7 +210,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
-| `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. They are an operational audit trail, not a complete native transcript. |
+| `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for opt-in SessionEnd LLM consolidation. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
