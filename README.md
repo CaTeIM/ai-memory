@@ -654,6 +654,10 @@ when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Session end always writes a rule-based summary page + handoff either way.
+When the session-end opt-in is enabled, provider work is durably queued after
+those deterministic writes and handled by one bounded server worker, so hook
+drain latency does not cancel it. Failed jobs retry with backoff and survive a
+server restart.
 
 Recommended defaults:
 

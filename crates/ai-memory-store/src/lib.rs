@@ -21,6 +21,7 @@ mod migrations;
 mod ops;
 mod reader;
 mod scope;
+mod session_consolidation;
 pub mod users;
 mod workstream;
 mod writer;
@@ -55,6 +56,7 @@ pub use scope::{
     create_explicit_scope, create_global_scope, lookup_existing_scope, lookup_existing_workspace,
     lookup_global_scope, resolve_many_existing_scopes,
 };
+pub use session_consolidation::{SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob};
 pub use users::{TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, generate_token, hash_token};
 pub use workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, ManagedRunContext, PrepareWorkstreamRun,
