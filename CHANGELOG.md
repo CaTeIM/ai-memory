@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Scheduled hollow-project cleanup now treats managed workstreams as project
+  data. Older projects whose only history is a managed workstream, including
+  those with a live run, are no longer cascade-deleted out from under the
+  workstream heartbeat or left with orphaned transcript segments. (#279)
 - Hybrid search now gives its FTS, vector, and graph streams the same bounded
   candidate window used by authority-aware FTS search. Small result limits no
   longer exclude a canonical page before post-fusion authority ranking can
