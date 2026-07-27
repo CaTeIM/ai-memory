@@ -162,10 +162,13 @@ strategy into the hooks:
 ai-memory install-hooks --apply --agent claude-code --project-strategy repo-root
 ```
 
-`--project-strategy` accepts `basename` (the default; bakes nothing, so existing
-installs are unchanged) or `repo-root`. It works for every agent and delivery
-path. A per-repo `.ai-memory.toml` marker's own `project_strategy` / `project`
-still take precedence — see
+`--project-strategy` accepts `basename` (the new-install default; bakes nothing)
+or `repo-root`. Omitting it during a later `--apply` preserves the strategy
+already baked into that agent's ai-memory hooks, including during the wrapper's
+automatic post-upgrade refresh. Pass `basename` explicitly to remove an
+existing `repo-root` default. This works for every agent and delivery path. A
+per-repo `.ai-memory.toml` marker's own `project_strategy` / `project` still
+take precedence — see
 [the marker-file reference](marker-file.md#install-wide-default-no-marker).
 
 ---

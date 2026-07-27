@@ -392,7 +392,9 @@ does not leave an older default-path ai-memory installation behind.
 If your agent often starts inside repository subdirectories or linked
 worktrees, add `--project-strategy repo-root` to `install-hooks` so captures
 collapse to the main git repo name; see [`docs/install.md`](docs/install.md)
-and [`docs/marker-file.md`](docs/marker-file.md) for details.
+and [`docs/marker-file.md`](docs/marker-file.md) for details. Later bare
+`--apply` refreshes, including `ai-memory upgrade`, preserve that choice;
+pass `--project-strategy basename` explicitly to remove it.
 
 The Docker wrapper also bridges thin-client commands such as
 `ai-memory status` and `ai-memory bootstrap` back to the host's

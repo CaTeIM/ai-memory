@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Bare `install-hooks --apply` re-runs, including the Docker wrapper's
+  post-upgrade refresh, now preserve an install's baked `repo-root` project
+  strategy for every supported hook integration. An explicit
+  `--project-strategy basename` still removes the install-wide default. (#267)
 - Installer `--apply` modes now write through symlinked agent configuration
   files instead of atomically replacing the symlink itself. Symlink chains and
   dangling final targets are preserved, while backups remain next to the
