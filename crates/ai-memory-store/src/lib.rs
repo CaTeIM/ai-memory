@@ -2112,6 +2112,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn search_ranks_page_authority_without_hiding_session_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        let mut decision = sample_page(
+            ws,
+            proj,
+            "decisions/embedding-policy.md",
+            "The current decision keeps LLM embeddings optional and uses them only for reranking.",
+        );
+        decision.title = "LLM embedding policy".into();
+        decision.pinned = true;
+        decision.frontmatter_json =
+            serde_json::json!({"tags": ["decision", "canonical", "active"]});
+        store.writer.upsert_page(decision).await.unwrap();
+
+        let mut session = sample_page(
+            ws,
+            proj,
+            "sessions/2026-07-27.md",
+            "What is the current decision about LLM embeddings? This session preserves historical evidence and chronicleonlytoken.",
+        );
+        session.title = "What is the current decision about LLM embeddings?".into();
+        session.tier = Tier::Episodic;
+        store.writer.upsert_page(session).await.unwrap();
+
+        for idx in 0..5 {
+            let mut noisy_session = sample_page(
+                ws,
+                proj,
+                &format!("sessions/noisy-{idx}.md"),
+                "What is the current decision about LLM embeddings? This session repeats the question as historical evidence.",
+            );
+            noisy_session.title = "What is the current decision about LLM embeddings?".into();
+            noisy_session.tier = Tier::Episodic;
+            store.writer.upsert_page(noisy_session).await.unwrap();
+        }
+
+        let mut rejected = sample_page(
+            ws,
+            proj,
+            "sessions/rejected-fixture.md",
+            "What is the current decision about LLM embeddings? This obsolete answer repeats LLM embeddings current decision.",
+        );
+        rejected.title = "Current decision about LLM embeddings".into();
+        rejected.tier = Tier::Episodic;
+        rejected.frontmatter_json =
+            serde_json::json!({"tags": ["superseded", "do_not_answer_from"]});
+        store.writer.upsert_page(rejected).await.unwrap();
+
+        let query = "what is the current decision about LLM embeddings";
+        let scoped = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 10)
+            .await
+            .unwrap();
+        let scoped_paths: Vec<&str> = scoped.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(
+            scoped_paths[0], "decisions/embedding-policy.md",
+            "authority-ranked hits: {scoped:?}"
+        );
+        assert_eq!(
+            scoped_paths.last().copied(),
+            Some("sessions/rejected-fixture.md")
+        );
+        assert!(scoped.windows(2).all(|pair| pair[0].rank <= pair[1].rank));
+
+        let top_one = store
+            .reader
+            .search_pages_for_project(ws, proj, query.into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(top_one[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let global = store
+            .reader
+            .search_pages_with_meta(query.into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(global[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let hybrid = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                query.into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hybrid[0].path.as_str(), "decisions/embedding-policy.md");
+
+        let session_evidence = store
+            .reader
+            .search_pages_for_project(ws, proj, "chronicleonlytoken".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(session_evidence.len(), 1);
+        assert_eq!(session_evidence[0].path.as_str(), "sessions/2026-07-27.md");
+    }
+
     /// Regression: bare `word:` in agent queries is FTS5 column syntax, not
     /// a literal token (`no such column: pick` / `memory`).
     #[tokio::test]

@@ -141,6 +141,16 @@ Adopt agentmemory's tier model **but** keep the surface narrow:
 
 **Implementation note:** the four tiers map to one `pages` table with a `tier` enum column + an `observations` table for bounded working/episodic projections, not four separate tables. Keeps schema migrations sane.
 
+**Retrieval authority:** tier is also one bounded signal after relevance
+candidate generation. The canonical page-kind classifier, `pinned`, and a
+small built-in tag vocabulary (`canonical`, `active`, `source-of-truth`,
+`superseded`, `historical`, `test-fixture`, `do-not-answer-from`) join it in a
+post-fusion multiplier. This is deliberately not an independent retriever or
+an absolute override: it resolves close contests between durable knowledge and
+episodic evidence without hiding targeted session/history matches. `pinned`
+continues to control retention and automated mutation first; its retrieval
+effect alone is small.
+
 ## 8. Consolidation (the Karpathy bit)
 
 Three scheduled MCP operations:

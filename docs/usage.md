@@ -56,7 +56,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 
 | You say | Agent calls | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, with bounded raw-observation fallback. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + graph/vector RRF over compiled wiki pages, followed by bounded source-authority ranking and raw-observation fallback on a page miss. |
 | Before proposing architecture | `memory_query` | Checks prior decisions and gotchas before suggesting designs. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest whose verbosity scales with time since last activity. |
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
@@ -74,6 +74,15 @@ matching `_rules/`, `gotchas/`, `procedures/`, or `decisions/` pages, read the
 full page before acting: rules are constraints, gotchas are preflight warnings,
 procedures are checklists, and decisions are settled architecture unless the
 user explicitly asks to revisit them.
+
+Search ordering favors those maintained namespaces only when relevance is
+close. `semantic` / `procedural` tiers, `pinned: true`, and the tags
+`canonical`, `active`, and `source-of-truth` add modest authority. `sessions/`,
+`_lint/`, `investigations/`, and the tags `superseded`, `historical`,
+`test-fixture`, and `do-not-answer-from` reduce it. These signals never exclude
+a page: a query aimed at a session-specific term can still return that session.
+`pinned` remains primarily a retention and automation-mutation control, not an
+unconditional search override.
 
 ## Install the routing snippet and Agent Skills
 

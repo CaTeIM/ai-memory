@@ -105,6 +105,14 @@ priors are at the [bottom](#influences-and-prior-art).
   `global_scope_hits`, so preferences travel with you into new projects
   without naming a magic project or paying the all-projects
   `global=true` fan-out. Event capture never writes there.
+- **Authority-aware recall.** FTS5, graph-neighbor RRF, and optional vector RRF
+  still generate candidates by relevance. Before truncation, a bounded
+  adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
+  `gotchas/` pages over closely matching episodic session evidence. Tier,
+  `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
+  `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
+  contribute without becoming absolute filters, so targeted history searches
+  still find session pages.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
   at session-end (or PreCompact; Codex can use `ai-memory finalize-session`
   for a manual final close), not retrieved over raw logs.
@@ -713,6 +721,9 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
 you want vector reranking in addition to FTS5 + graph-neighbor retrieval.
+Both the FTS-only and hybrid paths apply the same bounded page-authority
+adjustment after candidate generation; embeddings improve relevance recall but
+do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
@@ -735,7 +746,8 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
 pages, and serves retrieval through FTS5, graph-neighbor RRF, optional
-vector RRF, and bounded raw-observation fallback for non-global searches.
+vector RRF, bounded source-authority adjustment, and bounded raw-observation
+fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.
