@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Forced workspace deletion now removes the immutable managed-workstream
+  segment directories whose database rows are removed by the workspace
+  cascade. Its admin report includes workstream/run counts and IDs, and raw
+  segment cleanup participates in the existing filesystem partial-failure
+  reporting instead of leaving transcript data orphaned. (#274)
 - Lossless `move-project` true moves now re-stamp managed workstreams into the
   destination workspace in the same transaction as the project and its other
   denormalized child rows. Previously the project moved while its managed

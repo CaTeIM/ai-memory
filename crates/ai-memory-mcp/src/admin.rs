@@ -2902,6 +2902,39 @@ pub struct PurgeProjectReport {
     pub checkpoint: Option<String>,
 }
 
+async fn remove_workstream_segment_storage(
+    state: &AdminState,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let mut deleted = Vec::with_capacity(workstream_ids.len());
+    let mut failed = Vec::new();
+
+    for workstream_id in workstream_ids {
+        let path = state
+            .data_dir
+            .join("raw")
+            .join("workstreams")
+            .join(workstream_id);
+        let path_display = path.display().to_string();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => deleted.push(path_display),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    operation,
+                    path = %path_display,
+                    error = %error,
+                    "scope purge failed to remove workstream segment directory"
+                );
+                failed.push(path_display);
+            }
+        }
+    }
+
+    (deleted, failed)
+}
+
 async fn remove_purged_project_storage(
     state: &AdminState,
     workspace_id: WorkspaceId,
@@ -2931,27 +2964,10 @@ async fn remove_purged_project_storage(
         }
     }
 
-    for workstream_id in workstream_ids {
-        let path = state
-            .data_dir
-            .join("raw")
-            .join("workstreams")
-            .join(workstream_id);
-        let path_display = path.display().to_string();
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => deleted.push(path_display),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    operation,
-                    path = %path_display,
-                    error = %error,
-                    "project purge failed to remove workstream segment directory"
-                );
-                failed.push(path_display);
-            }
-        }
-    }
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, workstream_ids, operation).await;
+    deleted.extend(raw_deleted);
+    failed.extend(raw_failed);
 
     (deleted, failed)
 }
@@ -3178,7 +3194,14 @@ pub struct DeleteWorkspaceResult {
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
-    /// Paths removed from disk (the workspace's UUID-namespaced directory).
+    /// Managed `workstreams` rows removed via cascade.
+    pub workstreams_deleted: u64,
+    /// `managed_runs` rows removed via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose raw segment directories were
+    /// included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
+    /// Paths removed from disk (the workspace directory and raw segments).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
@@ -3279,7 +3302,7 @@ async fn delete_workspace_core(
         .join(ws_id.to_string())
         .display()
         .to_string();
-    let mut files_deleted = Vec::new();
+    let mut files_deleted = Vec::with_capacity(summary.workstream_ids.len() + 1);
     let mut files_failed = Vec::new();
     match state.wiki.remove_workspace_dir(ws_id).await {
         Ok(()) => files_deleted.push(ws_root_str.clone()),
@@ -3288,6 +3311,10 @@ async fn delete_workspace_core(
             files_failed.push(ws_root_str);
         }
     }
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, &summary.workstream_ids, "delete-workspace").await;
+    files_deleted.extend(raw_deleted);
+    files_failed.extend(raw_failed);
 
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -3304,6 +3331,9 @@ async fn delete_workspace_core(
         workspace: workspace.to_string(),
         projects_deleted: summary.projects_deleted,
         pages_deleted: summary.pages_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
