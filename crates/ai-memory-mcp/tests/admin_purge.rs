@@ -18,6 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::post as route_post;
 use serde_json::json;
+use std::path::Path;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -363,12 +364,16 @@ async fn purge_project_removes_raw_workstream_segments() {
         body["workstream_ids"],
         json!([prepared.workstream_id.to_string()])
     );
+    let raw_suffix = Path::new("raw")
+        .join("workstreams")
+        .join(prepared.workstream_id.to_string());
     assert!(
         body["files_deleted"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path.as_str() == Some(raw_dir.to_string_lossy().as_ref())),
+            .filter_map(|path| path.as_str())
+            .any(|path| Path::new(path).ends_with(&raw_suffix)),
         "raw cleanup must be visible in the report: {body}"
     );
 }
