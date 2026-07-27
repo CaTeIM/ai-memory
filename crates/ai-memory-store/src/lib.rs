@@ -2695,6 +2695,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_end_and_automatic_handoff_commit_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        let handoff = |project_id| NewHandoff {
+            workspace_id: ws,
+            project_id,
+            from_session_id: Some(session_id),
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: None,
+            summary: "continue".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+        };
+
+        assert!(
+            store
+                .writer
+                .end_session_with_handoff(session_id, None, handoff(other))
+                .await
+                .is_err(),
+            "a mismatched handoff must reject the whole end transition"
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "failed handoff insertion must leave the session open"
+        );
+
+        store
+            .writer
+            .end_session_with_handoff(session_id, None, handoff(proj))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended: Option<i64> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let handoffs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE from_session_id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(ended.is_some());
+        assert_eq!(handoffs, 1);
+    }
+
+    #[tokio::test]
     async fn session_end_disposition_uses_observation_generation_not_wall_clock() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -2709,6 +2795,15 @@ mod tests {
             .await
             .unwrap();
         let session_id = SessionId::new();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid,
+            "a missing session must not enter already-ended recovery"
+        );
         store
             .writer
             .begin_session(NewSession {
@@ -2720,6 +2815,27 @@ mod tests {
             })
             .await
             .unwrap();
+        let other_proj = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, other_proj, AgentKind::ClaudeCode)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::DropInvalid
+        );
         let first_observation = store
             .writer
             .insert_observation(Sanitized::new(
@@ -2759,7 +2875,7 @@ mod tests {
                 .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
                 .await
                 .unwrap(),
-            SessionEndDisposition::DropStale,
+            SessionEndDisposition::AlreadyEnded,
             "a covered observation must stay covered even if its timestamp is in the future"
         );
 
@@ -2803,7 +2919,7 @@ mod tests {
                 .session_end_disposition(session_id, ws, proj, AgentKind::ClaudeCode)
                 .await
                 .unwrap(),
-            SessionEndDisposition::DropStale,
+            SessionEndDisposition::AlreadyEnded,
             "stamping the new generation must make the re-end converge"
         );
     }

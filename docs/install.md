@@ -477,7 +477,10 @@ boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 Each spooled entry keeps one idempotency key across retries. A server that
 processed an event but lost the batch response will not duplicate its
 observation or completed session-end effects; if processing stopped after the
-observation commit, the retry re-runs downstream wiki/handoff work. Those
+observation commit, the retry re-runs downstream work. SessionEnd atomically
+commits its end watermark with its automatic handoff; a retry that finds that
+transaction complete finishes any interrupted wiki commit, durable provider
+enqueue, and ingest-key completion without adding a second handoff. Those
 incomplete effects remain at-least-once until the server marks the event
 complete.
 On Unix, the helper uses a trusted `setsid` launcher when available and falls

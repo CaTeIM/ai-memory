@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- SessionEnd recovery now commits the ended generation and automatic handoff in
+  one SQLite transaction, then lets an already-ended native replay converge the
+  remaining wiki commit, durable consolidation enqueue, and ingest-key
+  completion. An interruption after `ended_at` can no longer strand a missing
+  handoff or permanently pending spool key, and missing or scope/agent-
+  mismatched SessionEnd events no longer attempt consolidation recovery against
+  an unrelated session. (#270)
 - Bare `install-hooks --apply` re-runs, including the Docker wrapper's
   post-upgrade refresh, now preserve an install's baked `repo-root` project
   strategy for every supported hook integration. An explicit
