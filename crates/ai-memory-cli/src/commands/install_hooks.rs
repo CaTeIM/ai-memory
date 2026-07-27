@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::cli::{AgentChoice, InstallHooksArgs, McpClient};
+use crate::cli::{AgentChoice, InstallHooksArgs, McpClient, ProjectStrategyArg};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
@@ -181,7 +181,7 @@ fn kimi_code_config_path_in(
 ///
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
-pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
+pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     let inferred = if args.server_url.is_none() {
         infer_installed_mcp_config(args.agent)?
     } else {
@@ -232,6 +232,15 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
         );
     }
     if args.apply {
+        // Preserve a project-strategy an earlier `--apply` baked when this run
+        // did not pass `--project-strategy`. Without this, a bare re-apply —
+        // notably the auto-refresh in `ai-memory upgrade` — re-renders the hook
+        // commands with no strategy and silently reverts a `repo-root` install
+        // to `basename`. An explicit `--project-strategy` (including `basename`)
+        // is honored as-is, so an intentional downgrade still works. Resolving
+        // into `args` here means every downstream renderer picks it up with no
+        // per-agent plumbing.
+        args.project_strategy = install_project_strategy(&args);
         return match args.agent {
             AgentChoice::OpenCode => apply_to_opencode_plugin(&server_url, auth, &args),
             AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args),
@@ -284,7 +293,7 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
             }
         };
     }
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     match args.agent {
         AgentChoice::OpenCode => render_opencode_plugin(&server_url, auth, strategy),
         AgentChoice::Pi => render_pi_extension(&server_url, auth, strategy),
@@ -373,6 +382,58 @@ pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
 struct InferredMcpConfig {
     hook_server_url: Option<String>,
     auth_token: Option<String>,
+}
+
+/// The project-strategy to install for `args`: the explicit `--project-strategy`
+/// when one was given, otherwise the strategy an earlier `--apply` baked into
+/// the agent's existing config (so a bare re-apply preserves it instead of
+/// reverting to basename). `None` means "bake nothing", unchanged from before.
+fn install_project_strategy(args: &InstallHooksArgs) -> Option<ProjectStrategyArg> {
+    if args.project_strategy.is_some() {
+        return args.project_strategy;
+    }
+    existing_agent_config(args)
+        .as_deref()
+        .and_then(baked_project_strategy)
+}
+
+/// Read the config file `--apply` would write for `args`'s agent, when its path
+/// is resolvable up front. Returns the current contents, or `None` when the path
+/// isn't known here — in which case the agent keeps its prior behavior. Claude
+/// Code (the common case) and any agent pointed at `--config-file` are covered;
+/// other agents can be wired in as their paths get threaded through.
+fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
+    let path = match &args.config_file {
+        Some(p) => p.clone(),
+        None if args.agent == AgentChoice::ClaudeCode => claude_settings_path().ok()?,
+        None => return None,
+    };
+    std::fs::read_to_string(path).ok()
+}
+
+/// Recover the `ProjectStrategyArg` an earlier `--apply` baked into `existing`,
+/// so a re-apply without `--project-strategy` can keep it. Only `repo-root` is
+/// ever baked (`basename` bakes nothing), so it's the sole value we look for;
+/// the scan matches the shell env prefix, the PowerShell form, and the native
+/// flag spellings.
+fn baked_project_strategy(existing: &str) -> Option<ProjectStrategyArg> {
+    for marker in [
+        "AI_MEMORY_PROJECT_STRATEGY=",
+        "--project-strategy=",
+        "--project-strategy ",
+    ] {
+        let Some(rest) = existing.split(marker).nth(1) else {
+            continue;
+        };
+        let token: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if token == "repo-root" || token == "repo_root" {
+            return Some(ProjectStrategyArg::RepoRoot);
+        }
+    }
+    None
 }
 
 /// Reject `--as-user X` without a usable `--auth-token`. P1.8
@@ -838,7 +899,7 @@ fn apply_to_claude_code_settings_in(
         server_url,
         auth_token,
         Some(data_dir),
-        args.project_strategy.baked(),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
         args.capture_assistant,
     );
     apply_to_claude_code_settings_with_payload(payload, args)
@@ -857,7 +918,7 @@ fn apply_to_claude_code_settings_with_staged(
         server_url,
         auth_token,
         Some(data_dir),
-        args.project_strategy.baked(),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
         args.capture_assistant,
     );
     apply_to_claude_code_settings_with_payload(payload, args)
@@ -927,7 +988,7 @@ fn apply_to_grok_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "grok")?;
     let command_dir = staged_command_dir(&staged, "grok");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = build_grok_payload_with_data_dir(
         &command_dir,
         server_url,
@@ -1006,7 +1067,7 @@ fn apply_to_devin_settings_with_staged(
         None => devin_hooks_path()?,
     };
     let command_dir = staged_command_dir(staged, "devin");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = build_devin_payload_with_data_dir(
         &command_dir,
         server_url,
@@ -1108,7 +1169,7 @@ fn apply_to_codex_settings_in(
         auth_token,
         "codex",
         Some(data_dir),
-        args.project_strategy.baked(),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -1128,7 +1189,7 @@ fn apply_to_codex_settings_with_staged(
         auth_token,
         "codex",
         Some(data_dir),
-        args.project_strategy.baked(),
+        args.project_strategy.and_then(ProjectStrategyArg::baked),
     );
     apply_to_codex_settings_with_payload(payload, args)
 }
@@ -1249,7 +1310,7 @@ fn apply_to_cursor_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "cursor")?;
     let command_dir = staged_command_dir(&staged, "cursor");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_cursor_hooks(
         &command_dir,
         server_url,
@@ -1341,7 +1402,7 @@ fn apply_to_gemini_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "gemini-cli")?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_gemini_hooks(
         &command_dir,
         server_url,
@@ -1425,7 +1486,7 @@ fn apply_to_antigravity_settings(
     };
     let staged = stage_hook_scripts(hooks_dir, "antigravity-cli")?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_antigravity_hooks(
         &command_dir,
         server_url,
@@ -1508,7 +1569,7 @@ fn apply_to_kimi_code_config(
     };
     let staged = stage_hook_scripts(hooks_dir, "kimi-code")?;
     let command_dir = staged_command_dir(&staged, "kimi-code");
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_kimi_code_hooks(
         &command_dir,
         server_url,
@@ -1615,7 +1676,7 @@ fn apply_to_opencode_plugin(
         Some(p) => p.clone(),
         None => opencode_plugin_path()?,
     };
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_opencode_plugin(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -2130,7 +2191,7 @@ fn apply_to_omp_extension(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = resolve_omp_extension_path(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_omp_extension(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -2184,7 +2245,7 @@ fn apply_to_pi_extension(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let path = resolve_pi_extension_path(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let body = build_pi_extension(server_url, auth_token, strategy);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
@@ -3136,7 +3197,7 @@ fn apply_to_zero_hooks(
         Some(p) => p.clone(),
         None => zero_hooks_path()?,
     };
-    let strategy = args.project_strategy.baked();
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = super::render_shared::build_zero_hooks_config(
         server_url,
         auth_token,
@@ -3511,8 +3572,94 @@ mod tests {
             as_user: None,
             apply: true,
             config_file: None,
-            project_strategy: ProjectStrategyArg::Basename,
+            project_strategy: Some(ProjectStrategyArg::Basename),
         }
+    }
+
+    // ── #issue project-strategy preservation on re-apply ─────────────
+
+    #[test]
+    fn baked_project_strategy_reads_every_form() {
+        // Shell env prefix (Claude Code / POSIX script hooks).
+        assert_eq!(
+            baked_project_strategy(
+                "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/s.sh"
+            ),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        // PowerShell form.
+        assert_eq!(
+            baked_project_strategy("$env:AI_MEMORY_PROJECT_STRATEGY=repo-root; & /x/s.ps1"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        // Native flag, both spellings.
+        assert_eq!(
+            baked_project_strategy("ai-memory hook --project-strategy repo-root run"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+        assert_eq!(
+            baked_project_strategy("ai-memory hook --project-strategy=repo_root"),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+    }
+
+    #[test]
+    fn baked_project_strategy_none_for_basename_or_absent() {
+        // basename bakes nothing, so there is no marker to find.
+        assert_eq!(baked_project_strategy(r#"{"hooks":{}}"#), None);
+        assert_eq!(baked_project_strategy(""), None);
+    }
+
+    #[test]
+    fn install_project_strategy_preserves_baked_when_flag_absent() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            "AI_MEMORY_PROJECT_STRATEGY=repo-root /x/session-start.sh",
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(cfg),
+            project_strategy: None,
+            ..default_hook_args()
+        };
+        // A bare re-apply (e.g. `ai-memory upgrade`) must keep repo-root.
+        assert_eq!(
+            install_project_strategy(&args),
+            Some(ProjectStrategyArg::RepoRoot)
+        );
+    }
+
+    #[test]
+    fn install_project_strategy_explicit_basename_overrides_existing() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("settings.json");
+        std::fs::write(&cfg, "AI_MEMORY_PROJECT_STRATEGY=repo-root /x/s.sh").unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(cfg),
+            project_strategy: Some(ProjectStrategyArg::Basename),
+            ..default_hook_args()
+        };
+        // Explicit basename is honored, not overridden by the baked repo-root.
+        assert_eq!(
+            install_project_strategy(&args),
+            Some(ProjectStrategyArg::Basename)
+        );
+    }
+
+    #[test]
+    fn install_project_strategy_none_when_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            config_file: Some(tmp.path().join("nope.json")),
+            project_strategy: None,
+            ..default_hook_args()
+        };
+        assert_eq!(install_project_strategy(&args), None);
     }
 
     // ── P1.8 validate_as_user ────────────────────────────────────────
@@ -4651,7 +4798,7 @@ model = "gpt-5"
             as_user: None,
             apply: true,
             config_file: Some(tmp.path().join("extensions").join("ai-memory.ts")),
-            project_strategy: ProjectStrategyArg::Basename,
+            project_strategy: Some(ProjectStrategyArg::Basename),
         };
 
         let path = resolve_omp_extension_path(&args).unwrap();
@@ -4680,7 +4827,7 @@ model = "gpt-5"
             as_user: None,
             apply: true,
             config_file: Some(path.clone()),
-            project_strategy: ProjectStrategyArg::Basename,
+            project_strategy: Some(ProjectStrategyArg::Basename),
         };
 
         let resolved = resolve_pi_extension_path(&args).unwrap();
@@ -5040,7 +5187,7 @@ model = "gpt-5"
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
-                project_strategy: ProjectStrategyArg::Basename,
+                project_strategy: Some(ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
             },
@@ -5495,7 +5642,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
-                project_strategy: ProjectStrategyArg::Basename,
+                project_strategy: Some(ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
             },
@@ -5584,7 +5731,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
-                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
             },
@@ -5647,7 +5794,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
-                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
             },
@@ -5699,7 +5846,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
             config_file: Some(hooks_v1_path.clone()),
-            project_strategy: crate::cli::ProjectStrategyArg::Basename,
+            project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
             as_user: None,
             apply: false,
         };
@@ -5744,7 +5891,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             server_url: Some("http://127.0.0.1:49374".to_string()),
             auth_token: None,
             config_file: Some(config_path.clone()),
-            project_strategy: crate::cli::ProjectStrategyArg::Basename,
+            project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
             as_user: None,
             apply: false,
         };
@@ -5814,7 +5961,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 server_url: Some("http://127.0.0.1:49374".to_string()),
                 auth_token: None,
                 config_file: Some(config_path.clone()),
-                project_strategy: crate::cli::ProjectStrategyArg::Basename,
+                project_strategy: Some(crate::cli::ProjectStrategyArg::Basename),
                 as_user: None,
                 apply: false,
             },
