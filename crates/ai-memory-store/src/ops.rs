@@ -1849,12 +1849,17 @@ pub struct MoveSummary {
     pub auto_improve_runs_moved: u64,
     /// `auto_improve_proposals` rows re-stamped.
     pub auto_improve_proposals_moved: u64,
+    /// `auto_improve_rejections` rows re-stamped.
+    pub auto_improve_rejections_moved: u64,
     /// `auto_improve_scheduler_state` rows re-stamped.
     pub auto_improve_scheduler_state_moved: u64,
     /// `auto_improve_scheduler_claims` rows re-stamped.
     pub auto_improve_scheduler_claims_moved: u64,
     /// Durable SessionEnd consolidation jobs re-stamped.
     pub session_consolidation_jobs_moved: u64,
+    /// Managed workstreams re-stamped. Native sessions, runs, and events stay
+    /// attached through `workstream_id` and need no direct update.
+    pub workstreams_moved: u64,
 }
 
 /// Re-stamp a project's `workspace_id` across every domain table in ONE
@@ -1916,6 +1921,10 @@ pub fn move_project_workspace(
         "UPDATE auto_improve_proposals SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    let auto_improve_rejections_moved = tx.execute(
+        "UPDATE auto_improve_rejections SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
     let auto_improve_scheduler_state_moved = tx.execute(
         "UPDATE auto_improve_scheduler_state SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
@@ -1926,6 +1935,10 @@ pub fn move_project_workspace(
     )? as u64;
     let session_consolidation_jobs_moved = tx.execute(
         "UPDATE session_consolidation_jobs SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
+    let workstreams_moved = tx.execute(
+        "UPDATE workstreams SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
 
@@ -1948,9 +1961,11 @@ pub fn move_project_workspace(
         audit_log_moved,
         auto_improve_runs_moved,
         auto_improve_proposals_moved,
+        auto_improve_rejections_moved,
         auto_improve_scheduler_state_moved,
         auto_improve_scheduler_claims_moved,
         session_consolidation_jobs_moved,
+        workstreams_moved,
     })
 }
 
@@ -3214,12 +3229,41 @@ mod tests {
         .unwrap();
         end_session(&mut conn, &sid, None).unwrap();
         crate::session_consolidation::enqueue(&mut conn, src_ws, proj, sid).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_rejections \
+             (id, workspace_id, project_id, reason, normalized_fingerprint, summary, created_at) \
+             VALUES (?1, ?2, ?3, 'rejected', 'fingerprint', 'summary', 1)",
+            params![
+                uuid::Uuid::new_v4().as_bytes(),
+                src_ws.as_bytes(),
+                proj.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let managed = crate::workstream::prepare_run(
+            &mut conn,
+            &crate::PrepareWorkstreamRun {
+                workspace_id: src_ws,
+                project_id: proj,
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: vec![AgentKind::Codex],
+                selection: crate::WorkstreamSelection::Current,
+                lease_owner: "test".into(),
+            },
+        )
+        .unwrap();
 
         let summary = move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
         assert_eq!(summary.pages_moved, 1);
         assert_eq!(summary.sessions_moved, 1);
         assert_eq!(summary.observations_moved, 1);
+        assert_eq!(summary.auto_improve_rejections_moved, 1);
         assert_eq!(summary.session_consolidation_jobs_moved, 1);
+        assert_eq!(summary.workstreams_moved, 1);
 
         // The project_id is unchanged; every row now points at dst_ws.
         // `projects` keys the project by `id`; child tables by `project_id`.
@@ -3241,11 +3285,27 @@ mod tests {
             "pages",
             "sessions",
             "observations",
+            "auto_improve_rejections",
             "session_consolidation_jobs",
+            "workstreams",
         ] {
             assert_eq!(count_in(table, &dst_ws), 1, "{table} must move to dst ws");
             assert_eq!(count_in(table, &src_ws), 0, "{table} must leave src ws");
         }
+        let managed_run_still_attached: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_runs mr \
+                 JOIN workstreams w ON w.id = mr.workstream_id \
+                 WHERE mr.id = ?1 AND w.workspace_id = ?2 AND w.project_id = ?3",
+                params![
+                    managed.run_id.as_bytes(),
+                    dst_ws.as_bytes(),
+                    proj.as_bytes(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed_run_still_attached, 1);
         // The page keeps its id (embeddings/links follow via page_id).
         let still_there: i64 = conn
             .query_row(

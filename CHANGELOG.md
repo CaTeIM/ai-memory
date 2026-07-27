@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Lossless `move-project` true moves now re-stamp managed workstreams into the
+  destination workspace in the same transaction as the project and its other
+  denormalized child rows. Previously the project moved while its managed
+  workstreams retained the source `workspace_id`, hiding portable history from
+  destination-scope lookup and violating the project/workspace pairing
+  invariant. The admin response now reports `workstreams_moved`. (#272)
 - SessionEnd recovery now commits the ended generation and automatic handoff in
   one SQLite transaction, then lets an already-ended native replay converge the
   remaining wiki commit, durable consolidation enqueue, and ingest-key
