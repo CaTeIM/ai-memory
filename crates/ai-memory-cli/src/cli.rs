@@ -1332,7 +1332,7 @@ pub struct LlmTestArgs {
 /// resolves its project from the main git repo root (collapsing
 /// subdirectories and worktrees) without a per-repo `.ai-memory.toml`
 /// marker. A marker's own `project_strategy` still wins.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProjectStrategyArg {
     /// `project = basename(cwd)` — the default; bakes nothing.
     Basename,
@@ -1448,10 +1448,13 @@ pub struct InstallHooksArgs {
     /// `repo-root` makes every session resolve its project from the main
     /// git repo root (collapsing subdirectories and worktrees) without a
     /// per-repo `.ai-memory.toml` marker. A marker's own `project_strategy`
-    /// still wins. Defaults to `basename`, which bakes nothing and is
-    /// identical to prior behavior.
-    #[arg(long, value_enum, default_value_t = ProjectStrategyArg::Basename)]
-    pub project_strategy: ProjectStrategyArg,
+    /// still wins. `basename` bakes nothing and is identical to prior
+    /// behavior. Omitting the flag leaves it unset: an `--apply` re-run then
+    /// preserves whatever strategy an earlier `--apply` baked, so a bare
+    /// re-apply (e.g. the auto-refresh in `ai-memory upgrade`) does not
+    /// silently revert `repo-root` back to `basename`.
+    #[arg(long, value_enum)]
+    pub project_strategy: Option<ProjectStrategyArg>,
     /// Bake `--capture-assistant` onto the installed native `stop` command so a
     /// Claude Code `stop` event carries a sanitized excerpt of the assistant's
     /// final turn (#196). Only valid for `--agent claude-code` on a native
@@ -2016,23 +2019,53 @@ mod tests {
         };
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::RepoRoot
+            Some(ProjectStrategyArg::RepoRoot)
         ));
-        assert_eq!(args.project_strategy.baked(), Some("repo-root"));
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            Some("repo-root")
+        );
     }
 
     #[test]
-    fn install_hooks_project_strategy_defaults_to_basename() {
+    fn install_hooks_project_strategy_defaults_to_unset() {
         let cli = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", "claude-code"])
             .expect("install-hooks parses without --project-strategy");
         let Command::InstallHooks(args) = cli.command else {
             panic!("expected install-hooks command");
         };
+        // No flag → None, so a re-apply preserves whatever is already baked.
+        assert!(args.project_strategy.is_none());
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
+    }
+
+    #[test]
+    fn install_hooks_explicit_basename_still_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--project-strategy",
+            "basename",
+        ])
+        .expect("install-hooks parses --project-strategy basename");
+        let Command::InstallHooks(args) = cli.command else {
+            panic!("expected install-hooks command");
+        };
+        // Explicit basename is distinct from "unset": it forces basename and
+        // overrides an already-baked repo-root on re-apply.
         assert!(matches!(
             args.project_strategy,
-            ProjectStrategyArg::Basename
+            Some(ProjectStrategyArg::Basename)
         ));
-        assert_eq!(args.project_strategy.baked(), None);
+        assert_eq!(
+            args.project_strategy.and_then(ProjectStrategyArg::baked),
+            None
+        );
     }
 
     #[test]

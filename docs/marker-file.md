@@ -322,7 +322,9 @@ This is **install-time config**, written into the agent's hook command (and
 the generated OpenCode / OMP / Pi / OpenClaw plugins) — the same status as the
 `AI_MEMORY_AUTH_TOKEN` / `AI_MEMORY_HOOK_URL` it sits beside, *not* a user-set
 runtime override (which was deliberately rejected in #16). The flag accepts
-`basename` (the default — bakes nothing, behavior unchanged) or `repo-root`.
+`basename` (the new-install default — bakes nothing) or `repo-root`. A later
+`install-hooks --apply` without the flag preserves the value already baked into
+ai-memory's hooks; pass `--project-strategy basename` explicitly to remove it.
 
 Precedence is unchanged: a marker's explicit `project_strategy` or `project`
 still wins over the install default.

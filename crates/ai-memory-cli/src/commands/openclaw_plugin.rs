@@ -24,7 +24,9 @@ pub(crate) fn apply(
     args: &InstallHooksArgs,
 ) -> Result<()> {
     let plugin_dir = resolve_plugin_dir(args)?;
-    let strategy = args.project_strategy.baked();
+    let strategy = args
+        .project_strategy
+        .and_then(crate::cli::ProjectStrategyArg::baked);
     let outcomes = write_package(&plugin_dir, server_url, auth_token, strategy)?;
     for (path, outcome) in &outcomes {
         println!(
