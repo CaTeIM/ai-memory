@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Installer `--apply` modes now write through symlinked agent configuration
+  files instead of atomically replacing the symlink itself. Symlink chains and
+  dangling final targets are preserved, while backups remain next to the
+  user-facing configuration path. (#264)
 - SessionEnd re-consolidation now converges by comparing the current
   observation count with a persisted count stamped by the latest completed
   end, instead of comparing independently generated wall-clock timestamps.

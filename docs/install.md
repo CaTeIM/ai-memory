@@ -141,6 +141,11 @@ without env vars or flags, hooks reuse the existing ai-memory MCP entry for
 that agent when possible. This keeps remote MCP config and lifecycle capture
 pointed at the same server instead of falling back to loopback.
 
+All installer `--apply` modes preserve symlinked configuration files: the
+atomic update is written to the symlink target, including a missing final
+target, while the timestamped backup stays next to the user-facing config
+path. This keeps stow, chezmoi, and similar dotfile-managed installs linked.
+
 `init`, `serve`, and `generate-auth-token` do not need these env vars because
 they either create local files or start the server itself.
 
