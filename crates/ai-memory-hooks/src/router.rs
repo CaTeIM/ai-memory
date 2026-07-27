@@ -5546,7 +5546,7 @@ mod tests {
         assert_eq!(
             disposition,
             ai_memory_store::SessionEndDisposition::ReEndWithNewWork,
-            "observations after ended_at must mark the session re-endable"
+            "a newer observation generation must mark the session re-endable"
         );
 
         process(&state, fire("session-end", None), None)
@@ -5576,8 +5576,9 @@ mod tests {
                 .is_some(),
             "the re-end must refresh the auto-handoff"
         );
-        // ended_at advanced past the resumed work: the next duplicate end is
-        // dropped again (pins the de1cef2 dedupe behaviour post-re-end).
+        // The persisted end generation now covers the resumed work, so the
+        // next duplicate end is dropped again (pins the de1cef2 dedupe
+        // behaviour post-re-end).
         let disposition = state
             .reader
             .session_end_disposition(
@@ -5591,7 +5592,7 @@ mod tests {
         assert_eq!(
             disposition,
             ai_memory_store::SessionEndDisposition::DropStale,
-            "after the re-end, ended_at must cover the resumed work again"
+            "after the re-end, the generation watermark must cover resumed work"
         );
     }
 

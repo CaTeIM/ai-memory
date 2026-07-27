@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn v33_to_v34_preserves_sessions_and_activates_durable_queue() {
+    fn v33_to_v35_preserves_queue_and_backfills_end_generation() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 33).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
@@ -272,7 +272,11 @@ mod tests {
             },
         )
         .unwrap();
-        crate::ops::end_session(&mut conn, &session_id, None).unwrap();
+        conn.execute(
+            "UPDATE sessions SET ended_at = 1 WHERE id = ?1",
+            params![session_id.as_bytes()],
+        )
+        .unwrap();
 
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         run(&mut conn).unwrap();
@@ -289,6 +293,17 @@ mod tests {
                 "session_consolidation_jobs_session_pairing_ai"
             ),
             1
+        );
+        let ended_observation_count: u64 = conn
+            .query_row(
+                "SELECT ended_observation_count FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ended_observation_count, 1,
+            "V35 must baseline existing ended sessions without catch-up work"
         );
         assert!(
             crate::session_consolidation::enqueue(&mut conn, workspace_id, project_id, session_id,)
