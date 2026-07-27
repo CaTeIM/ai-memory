@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempts with backoff. A stale SessionEnd redelivery also repairs the
   enqueue when the original request was cancelled just after `ended_at`, so
   the default hook drain timeout can no longer silently strand the heuristic
-  page as the final result. (#260)
+  page as the final result. (#265)
 - `purge-project` no longer deletes a project out from under a running agent.
   `workstreams` cascades from `projects` and `managed_runs` cascades from
   `workstreams`, so purging a scope that still held a live managed run tore
