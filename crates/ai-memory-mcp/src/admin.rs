@@ -3493,6 +3493,9 @@ pub struct MoveProjectReport {
     /// Number of latest pages copied into the destination (copy-purge) or
     /// re-stamped in place (true-move).
     pub pages_copied: u64,
+    /// Managed workstreams re-stamped in place by a lossless true move.
+    /// Copy-purge reports zero because it does not transfer managed history.
+    pub workstreams_moved: u64,
     /// Source paths whose on-disk file could not be read (copy skipped).
     /// When non-empty the source is NOT purged so a fixed re-run is safe.
     pub pages_skipped: Vec<String>,
@@ -3645,6 +3648,7 @@ async fn true_move_project(
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
+        workstreams_moved: summary.workstreams_moved,
         pages_skipped: Vec::new(),
         // Nothing is purged in a true move — the source rows ARE the
         // destination rows, just re-stamped.
@@ -4189,6 +4193,7 @@ async fn copy_purge_merge(
             merged_into_existing: true,
             moved_via: "copy-purge",
             pages_copied,
+            workstreams_moved: 0,
             pages_skipped,
             source_purged: false,
             source_pages_deleted: 0,
@@ -4306,6 +4311,7 @@ async fn copy_purge_merge(
         merged_into_existing: true,
         moved_via: "copy-purge",
         pages_copied,
+        workstreams_moved: 0,
         pages_skipped: Vec::new(),
         source_purged: true,
         source_pages_deleted: summary.pages_deleted,

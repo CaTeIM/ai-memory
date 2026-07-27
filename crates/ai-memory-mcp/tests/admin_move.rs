@@ -210,6 +210,22 @@ async fn move_project_true_move_into_fresh_dest() {
         .await
         .unwrap()
         .expect("src project exists");
+    let managed = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            workspace_id: src_ws,
+            project_id: src_proj,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: vec![AgentKind::Codex],
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test".into(),
+        })
+        .await
+        .unwrap();
     let src_dir = state.wiki.project_root(src_ws, src_proj);
     assert!(src_dir.exists(), "source dir must exist before move");
 
@@ -223,6 +239,7 @@ async fn move_project_true_move_into_fresh_dest() {
 
     let body = body_json(resp).await;
     assert_eq!(body["pages_copied"].as_u64().unwrap_or(0), 2, "{body}");
+    assert_eq!(body["workstreams_moved"].as_u64().unwrap_or(0), 1, "{body}");
     assert_eq!(body["moved_via"], "true-move", "{body}");
     // Nothing is purged in a true move — the rows are re-stamped, not copied.
     assert_eq!(body["source_purged"], false, "{body}");
@@ -244,6 +261,15 @@ async fn move_project_true_move_into_fresh_dest() {
     assert_eq!(
         dst_proj_check, src_proj,
         "true move keeps the same project_id"
+    );
+    assert!(
+        store
+            .reader
+            .managed_run_status(managed.run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the existing managed run must remain attached after the move"
     );
 
     // Both pages now belong to dst/proj (latest), content preserved.
