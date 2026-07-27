@@ -809,12 +809,13 @@ async fn start_maintenance_scheduler(
         }));
     }
 
-    // Hollow-project sweep: deletes project rows with zero data of any
-    // kind (pages, sessions, observations, handoffs) once they are older
-    // than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by construction — nothing
-    // exists to lose — which is why it runs unconditionally under the
-    // maintenance flag with no extra config. Runs once shortly after
-    // startup (so upgrades clean up immediately) and then daily.
+    // Hollow-project sweep: deletes project rows with no pages, sessions,
+    // observations, handoffs, managed workstreams, or auto-improvement data
+    // once they are older than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by
+    // construction — nothing exists to lose — which is why it runs
+    // unconditionally under the maintenance flag with no extra config. Runs
+    // once shortly after startup (so upgrades clean up immediately) and then
+    // daily.
     if maintenance_enabled {
         /// A week of grace before a hollow row is considered noise, so a
         /// project created moments before its first real event is never

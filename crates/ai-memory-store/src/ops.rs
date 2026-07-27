@@ -210,16 +210,15 @@ pub fn get_or_create_project(
 }
 
 /// Delete "hollow" project rows: zero pages (any version), zero sessions,
-/// zero observations, zero handoffs, zero auto-improve runs/proposals/
-/// rejections, and older than `min_age_days`. (The per-project
-/// scheduler-state row is bookkeeping created for every project and does
-/// not count as data.) These
-/// are pure bookkeeping noise left behind by probes, renames, and failed
-/// first events — nothing exists to lose, which is what makes this safe to
-/// run on a schedule (the operator-driven `purge-project` covers everything
-/// that actually holds data). Reserved projects (`scratch`, the cwd-less
-/// fallback; `_global`, the preferences scope) are exempt even when empty.
-/// Returns the deleted names for logging.
+/// zero observations, zero handoffs, zero managed workstreams, zero
+/// auto-improve runs/proposals/rejections, and older than `min_age_days`.
+/// (The per-project scheduler-state row is bookkeeping created for every
+/// project and does not count as data.) These are pure bookkeeping noise left
+/// behind by probes, renames, and failed first events — nothing exists to lose,
+/// which is what makes this safe to run on a schedule (the operator-driven
+/// `purge-project` covers everything that actually holds data). Reserved
+/// projects (`scratch`, the cwd-less fallback; `_global`, the preferences
+/// scope) are exempt even when empty. Returns the deleted names for logging.
 ///
 /// # Errors
 /// Propagates SQLite failures.
@@ -236,6 +235,7 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -255,6 +255,7 @@ pub fn sweep_hollow_projects(conn: &mut Connection, min_age_days: u32) -> StoreR
                AND NOT EXISTS (SELECT 1 FROM sessions     WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM observations WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM handoffs     WHERE project_id = projects.id)
+               AND NOT EXISTS (SELECT 1 FROM workstreams  WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_runs      WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_proposals WHERE project_id = projects.id)
                AND NOT EXISTS (SELECT 1 FROM auto_improve_rejections WHERE project_id = projects.id)",
@@ -3546,13 +3547,15 @@ mod tests {
         let fresh = get_or_create_project(&mut conn, &ws, "new-probe", None).unwrap();
         // Old but has a session: keep (not hollow).
         let with_data = get_or_create_project(&mut conn, &ws, "one-off", None).unwrap();
+        // Old but has a managed workstream: keep (not hollow).
+        let with_workstream = get_or_create_project(&mut conn, &ws, "managed-only", None).unwrap();
         // Reserved + hollow + old: keep.
         let global =
             get_or_create_project(&mut conn, &ws, ai_memory_core::GLOBAL_SCOPE_PROJECT, None)
                 .unwrap();
 
         let eight_days_us: i64 = 8 * 24 * 60 * 60 * 1_000_000;
-        for id in [&hollow, &with_data, &global] {
+        for id in [&hollow, &with_data, &with_workstream, &global] {
             conn.execute(
                 "UPDATE projects SET created_at = created_at - ?1 WHERE id = ?2",
                 params![eight_days_us, &id.as_bytes()[..]],
@@ -3570,6 +3573,7 @@ mod tests {
             },
         )
         .unwrap();
+        let managed = open_managed_run(&mut conn, &ws, &with_workstream);
 
         let deleted = sweep_hollow_projects(&mut conn, 7).unwrap();
         assert_eq!(deleted, vec!["zt".to_string()]);
@@ -3585,7 +3589,28 @@ mod tests {
         assert_eq!(exists(&hollow), 0, "old hollow row deleted");
         assert_eq!(exists(&fresh), 1, "fresh hollow row kept (grace window)");
         assert_eq!(exists(&with_data), 1, "data-bearing row kept");
+        assert_eq!(
+            exists(&with_workstream),
+            1,
+            "managed-workstream-bearing row kept"
+        );
         assert_eq!(exists(&global), 1, "reserved _global kept even when hollow");
+        let workstream_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workstreams WHERE id = ?1",
+                params![&managed.workstream_id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workstream_rows, 1, "managed workstream kept");
+        let run_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_runs WHERE id = ?1",
+                params![&managed.run_id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_rows, 1, "managed run kept");
 
         // Idempotent: a second pass deletes nothing.
         assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
