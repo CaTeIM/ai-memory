@@ -1743,14 +1743,20 @@ pub struct DeleteWorkspaceSummary {
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
+    /// Managed `workstreams` rows removed via cascade.
+    pub workstreams_deleted: u64,
+    /// `managed_runs` rows removed via cascade.
+    pub managed_runs_deleted: u64,
+    /// Pre-delete identifiers for post-commit raw-segment cleanup.
+    pub workstream_ids: Vec<String>,
 }
 
 /// Delete a workspace row. Refuses a workspace that still holds projects
 /// unless `force` is set (the guard exists so a stray typo can't wipe a live
 /// workspace). The `workspace_id` FKs are `ON DELETE CASCADE`, so a single
 /// `DELETE FROM workspaces` also removes its projects / pages / sessions /
-/// observations / handoffs. The caller removes the on-disk workspace dir
-/// afterwards.
+/// observations / handoffs / managed workstreams. The caller removes the
+/// on-disk workspace and raw workstream directories afterwards.
 ///
 /// # Errors
 /// [`StoreError::WorkspaceNotEmpty`] when it still holds projects and `force`
@@ -1774,6 +1780,21 @@ pub fn delete_workspace(
         return Err(StoreError::WorkspaceNotEmpty(projects_deleted));
     }
     let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE workspace_id = ?1")?;
+    let workstreams_deleted = count("SELECT COUNT(*) FROM workstreams WHERE workspace_id = ?1")?;
+    let managed_runs_deleted = count(
+        "SELECT COUNT(*) FROM managed_runs mr \
+         JOIN workstreams w ON w.id = mr.workstream_id \
+         WHERE w.workspace_id = ?1",
+    )?;
+    let workstream_ids: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM workstreams WHERE workspace_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![&wid[..]], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|raw| ai_memory_core::WorkstreamId::from_slice(&raw).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
@@ -1786,6 +1807,9 @@ pub fn delete_workspace(
     Ok(DeleteWorkspaceSummary {
         projects_deleted,
         pages_deleted,
+        workstreams_deleted,
+        managed_runs_deleted,
+        workstream_ids,
     })
 }
 
@@ -2233,6 +2257,7 @@ mod tests {
     fn delete_workspace_refuses_non_empty_then_cascades_with_force() {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         upsert_page(&mut conn, &page(ws, proj, "notes/a.md", "body")).unwrap();
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
 
         // Non-empty (holds the "scratch" project + a page) → refused w/o force.
         let err = delete_workspace(&mut conn, &ws, false).unwrap_err();
@@ -2254,6 +2279,12 @@ mod tests {
         assert!(
             summary.projects_deleted >= 1 && summary.pages_deleted >= 1,
             "{summary:?}"
+        );
+        assert_eq!(summary.workstreams_deleted, 1);
+        assert_eq!(summary.managed_runs_deleted, 1);
+        assert_eq!(
+            summary.workstream_ids,
+            vec![prepared.workstream_id.to_string()]
         );
         let proj_left: i64 = conn
             .query_row(
@@ -2278,6 +2309,9 @@ mod tests {
         let summary = delete_workspace(&mut conn, &empty, false).unwrap();
         assert_eq!(summary.projects_deleted, 0);
         assert_eq!(summary.pages_deleted, 0);
+        assert_eq!(summary.workstreams_deleted, 0);
+        assert_eq!(summary.managed_runs_deleted, 0);
+        assert!(summary.workstream_ids.is_empty());
     }
 
     #[test]
