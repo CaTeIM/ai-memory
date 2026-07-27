@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Wiki search now applies a bounded source-authority adjustment after FTS5,
+  graph, and optional vector candidate generation. Canonical rules, decisions,
+  procedures, gotchas, semantic/procedural tiers, `pinned` pages, and
+  `canonical` / `active` / `source-of-truth` tags win close relevance contests;
+  episodic sessions, `_lint/` output, investigations, and pages tagged
+  `superseded`, `historical`, `test-fixture`, or `do-not-answer-from` are
+  downgraded but remain searchable. Exact session-only queries still retrieve
+  their evidence, and the returned `rank` includes the bounded adjustment so
+  multi-scope merging preserves the same order. (#269)
+- Client CLI commands now resolve their `(workspace, project)` from the
+  nearest `.ai-memory.toml` marker, not just the lifecycle hooks. Previously
+  only the hook path read the marker, so a checkout declaring
+  `workspace = "acme"` had its captures land in `acme` while `run`,
+  `bootstrap`, `search`, `write-page` and every other scope-taking command
+  resolved into `default` — the same repository split across two scopes, with
+  `ai-memory run`'s managed workstream stranded on the wrong side. Each field
+  still prefers an explicit flag; when the marker decides one, the command
+  announces the resolved scope on stderr, naming which half the marker
+  decided. `AI_MEMORY_IGNORE_MARKER=1` restores the previous resolution for
+  one invocation (client commands only — the hooks keep reading the marker).
+  `embed --force` without `--project` still fans out across the workspace and
+  no longer needs a derivable project name. `ai-memory serve` is unchanged:
+  it has no caller cwd, and its `--workspace` / `--project` remain the baked
+  fallback for hook events without a usable one. (#259)
+- Marker discovery now stays inside its trust boundary when the caller's cwd
+  is outside `$HOME`: it walks no higher than the nearest checkout root, or
+  checks only cwd for a non-git directory. Workspace-only markers also keep
+  the hooks' documented `project = basename(cwd)` behavior for CLI commands,
+  including subdirectories and linked worktrees. (#259)
+
+### Fixed
+- Installer `--apply` modes now write through symlinked agent configuration
+  files instead of atomically replacing the symlink itself. Symlink chains and
+  dangling final targets are preserved, while backups remain next to the
+  user-facing configuration path. (#264)
+- SessionEnd re-consolidation now converges by comparing the current
+  observation count with a persisted count stamped by the latest completed
+  end, instead of comparing independently generated wall-clock timestamps.
+  Clock skew could otherwise leave an old observation permanently "new" and
+  repeatedly rewrite the same session page, handoff, and opt-in LLM job with no
+  agent activity. Existing ended sessions are baselined during migration so an
+  upgrade does not enqueue historical catch-up work. (#268)
+- Capture exclusions now canonicalize an existing hook working directory
+  before matching paths, so filesystem aliases such as macOS `/var` versus
+  `/private/var` cannot turn an excluded file event into a spooled event.
+  Marker discovery tests likewise accept the canonical path they request.
+  (#265)
+- Opt-in SessionEnd LLM consolidation now runs from a durable, generation-
+  idempotent queue instead of inside the hook batch request. The hook commits
+  its deterministic session page and handoff, persists the provider job, and
+  returns without waiting for LLM latency; a single bounded worker recovers
+  queued or expired-lease work after restart and makes at most five provider
+  attempts with backoff. A stale SessionEnd redelivery also repairs the
+  enqueue when the original request was cancelled just after `ended_at`, so
+  the default hook drain timeout can no longer silently strand the heuristic
+  page as the final result. (#265)
+- `purge-project` no longer deletes a project out from under a running agent.
+  `workstreams` cascades from `projects` and `managed_runs` cascades from
+  `workstreams`, so purging a scope that still held a live managed run tore
+  out its lease row: the wrapper then failed every heartbeat with
+  `409 managed run lease is not active` and the session's transcript never
+  reached the ledger. The purge now refuses with a `409` naming the offending
+  workstreams unless `--force` is passed, and its report counts the
+  `workstreams` and `managed_runs` the cascade removes; their
+  `raw/workstreams/<id>/` directories are now removed server-side and included
+  in the same filesystem success/failure report instead of being orphaned.
+  Those counters previously showed `0 pages, 0 sessions, …` and made such a
+  scope look safe to delete. Liveness is the lease, not the row state: a
+  crashed wrapper leaves `state = 'active'` behind until the next
+  `ai-memory run` sweeps it, so only a lease that has not yet expired blocks
+  the purge. `move-project`'s
+  copy-purge merge surfaces the same conflict as a `409` naming how many
+  pages were already copied, instead of a `500`; its `--force` flag only
+  overrides the active-project guard and never destroys a live managed-run
+  lease. (#259)
+
 ## [1.19.0] - 2026-07-25
 
 ### Fixed

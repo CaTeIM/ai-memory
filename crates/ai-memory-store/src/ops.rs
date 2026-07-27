@@ -55,6 +55,17 @@ pub struct PurgeSummary {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted (cascades through pages).
     pub embeddings_deleted: u64,
+    /// Number of `workstreams` rows deleted. These cascade from `projects`,
+    /// so a project that looks empty by page/session/observation count can
+    /// still take a managed workstream — and its portable event ledger — down
+    /// with it. Counted so the caller can say so out loud.
+    pub workstreams_deleted: u64,
+    /// Number of `managed_runs` rows deleted (cascades through workstreams).
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams. The admin layer uses these typed,
+    /// pre-delete identifiers to remove `raw/workstreams/<id>/` after the SQL
+    /// transaction commits and to report any filesystem partial failure.
+    pub workstream_ids: Vec<String>,
 }
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -819,8 +830,8 @@ pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult
     Ok(())
 }
 
-/// Stamp a session as ended, optionally linking the synthesised summary
-/// page.
+/// Stamp a session as ended, optionally linking the synthesised summary page,
+/// and record the observation generation covered by this end.
 pub fn end_session(
     conn: &mut Connection,
     session_id: &SessionId,
@@ -829,7 +840,12 @@ pub fn end_session(
     let now = Timestamp::now().as_microsecond();
     let page_blob: Option<&[u8]> = summary_page_id.map(|p| &p.as_bytes()[..]);
     conn.execute(
-        "UPDATE sessions SET ended_at = ?1, summary_page_id = ?2 WHERE id = ?3",
+        "UPDATE sessions \
+         SET ended_at = ?1, summary_page_id = ?2, \
+             ended_observation_count = (\
+                 SELECT COUNT(*) FROM observations WHERE session_id = ?3\
+             ) \
+         WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
     )?;
     Ok(())
@@ -1497,15 +1513,21 @@ pub fn insert_wiki_migration(
 /// admin handler has the human-readable names; the writer only has IDs) and
 /// forwarded verbatim into [`PurgeSummary::label`] for logging.
 ///
+/// `force` overrides the live-managed-run guard (step 0): `workstreams`
+/// cascades out of `projects`, so purging a scope whose lease is still live
+/// would delete the lease row out from under a running agent.
+///
 /// # Errors
-/// Returns [`StoreError`] if any SQL statement fails. The transaction is
-/// rolled back automatically on error.
+/// Returns [`StoreError::ManagedRunActive`] when a managed run's lease is
+/// still live and `force` is false, or [`StoreError`] if any SQL statement
+/// fails. The transaction is rolled back automatically on error.
 pub fn purge_project(
     conn: &mut Connection,
     workspace_id: &WorkspaceId,
     project_id: &ProjectId,
     workspace_project_label: &str,
     author_id: Option<ai_memory_core::UserId>,
+    force: bool,
 ) -> StoreResult<PurgeSummary> {
     let tx = conn.transaction()?;
 
@@ -1517,6 +1539,44 @@ pub fn purge_project(
     };
 
     let pid = project_id.as_bytes();
+
+    // Managed workstreams cascade out of `projects`, and `managed_runs`
+    // cascades out of them. A live run's lease row would go with them, which
+    // leaves the running agent heartbeating a run id that no longer exists —
+    // `409 managed run lease is not active`, every 30s, with its transcript
+    // unable to reach any ledger. Refuse unless the operator insists.
+    //
+    // `state = 'active'` alone is NOT liveness: a crashed wrapper leaves that
+    // row untouched, and the only sweep that flips it to `'expired'` runs
+    // inside `workstream::prepare_run`. Without the lease-expiry predicate a
+    // single crashed agent would block every future purge of the project
+    // until someone launched another managed run. The lease is short (90s,
+    // extended by heartbeat), so `lease_expires_at > now` is the real signal.
+    let now = Timestamp::now().as_microsecond();
+    let active_runs: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT w.name, mr.agent_kind FROM managed_runs mr \
+             JOIN workstreams w ON w.id = mr.workstream_id \
+             WHERE w.project_id = ?1 AND mr.state = 'active' \
+               AND mr.lease_expires_at > ?2",
+        )?;
+        stmt.query_map(rusqlite::params![&pid[..], now], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !active_runs.is_empty() && !force {
+        let mut names: Vec<String> = active_runs
+            .iter()
+            .map(|(workstream, agent)| format!("'{workstream}' ({agent})"))
+            .collect();
+        names.sort();
+        names.dedup();
+        return Err(StoreError::ManagedRunActive {
+            count: active_runs.len() as u64,
+            workstreams: names.join(", "),
+        });
+    }
     let pages_deleted = count("SELECT COUNT(*) FROM pages WHERE project_id = ?1", &pid[..])?;
     let sessions_deleted = count(
         "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
@@ -1537,6 +1597,16 @@ pub fn purge_project(
         &pid[..],
     )?;
 
+    let workstreams_deleted = count(
+        "SELECT COUNT(*) FROM workstreams WHERE project_id = ?1",
+        &pid[..],
+    )?;
+    let managed_runs_deleted = count(
+        "SELECT COUNT(*) FROM managed_runs WHERE workstream_id IN \
+         (SELECT id FROM workstreams WHERE project_id = ?1)",
+        &pid[..],
+    )?;
+
     // Collect all distinct on-disk paths for the caller to clean up.
     // We use DISTINCT because multiple versions of the same logical page
     // share a path; the file only exists once. The statement must be
@@ -1546,6 +1616,22 @@ pub fn purge_project(
         path_stmt
             .query_map(rusqlite::params![&pid[..]], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?
+    };
+
+    // Same idea for the workstream segment directories: the rows go with the
+    // cascade but `raw/workstreams/<id>/` needs post-commit filesystem
+    // cleanup. Decode through the typed id so the reported string matches the
+    // directory name `write_segment` builds from `WorkstreamId::to_string`; a
+    // malformed blob is a corrupt row, so surface it rather than silently
+    // shortening the cleanup list.
+    let workstream_ids: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT id FROM workstreams WHERE project_id = ?1")?;
+        let rows = stmt
+            .query_map(rusqlite::params![&pid[..]], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|raw| ai_memory_core::WorkstreamId::from_slice(&raw).map(|id| id.to_string()))
+            .collect::<Result<Vec<_>, _>>()?
     };
 
     // Cascade handles pages / sessions / observations / handoffs /
@@ -1578,6 +1664,9 @@ pub fn purge_project(
         observations_deleted,
         handoffs_deleted,
         embeddings_deleted,
+        workstreams_deleted,
+        managed_runs_deleted,
+        workstream_ids,
     })
 }
 
@@ -1698,6 +1787,8 @@ pub struct MoveSummary {
     pub auto_improve_scheduler_state_moved: u64,
     /// `auto_improve_scheduler_claims` rows re-stamped.
     pub auto_improve_scheduler_claims_moved: u64,
+    /// Durable SessionEnd consolidation jobs re-stamped.
+    pub session_consolidation_jobs_moved: u64,
 }
 
 /// Re-stamp a project's `workspace_id` across every domain table in ONE
@@ -1767,6 +1858,10 @@ pub fn move_project_workspace(
         "UPDATE auto_improve_scheduler_claims SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
+    let session_consolidation_jobs_moved = tx.execute(
+        "UPDATE session_consolidation_jobs SET workspace_id = ?1 WHERE project_id = ?2 AND workspace_id = ?3",
+        params![&to[..], &pid[..], &from[..]],
+    )? as u64;
 
     let projects_updated = tx.execute(
         "UPDATE projects SET workspace_id = ?1 WHERE id = ?2 AND workspace_id = ?3",
@@ -1789,6 +1884,7 @@ pub fn move_project_workspace(
         auto_improve_proposals_moved,
         auto_improve_scheduler_state_moved,
         auto_improve_scheduler_claims_moved,
+        session_consolidation_jobs_moved,
     })
 }
 
@@ -3050,11 +3146,14 @@ mod tests {
             },
         )
         .unwrap();
+        end_session(&mut conn, &sid, None).unwrap();
+        crate::session_consolidation::enqueue(&mut conn, src_ws, proj, sid).unwrap();
 
         let summary = move_project_workspace(&mut conn, &proj, &src_ws, &dst_ws).unwrap();
         assert_eq!(summary.pages_moved, 1);
         assert_eq!(summary.sessions_moved, 1);
         assert_eq!(summary.observations_moved, 1);
+        assert_eq!(summary.session_consolidation_jobs_moved, 1);
 
         // The project_id is unchanged; every row now points at dst_ws.
         // `projects` keys the project by `id`; child tables by `project_id`.
@@ -3071,7 +3170,13 @@ mod tests {
             )
             .unwrap()
         };
-        for table in ["projects", "pages", "sessions", "observations"] {
+        for table in [
+            "projects",
+            "pages",
+            "sessions",
+            "observations",
+            "session_consolidation_jobs",
+        ] {
             assert_eq!(count_in(table, &dst_ws), 1, "{table} must move to dst ws");
             assert_eq!(count_in(table, &src_ws), 0, "{table} must leave src ws");
         }
@@ -4003,7 +4108,7 @@ mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         // Simulate the post-purge state: project row gone.
         // `purge_project` drives the cascading deletes we want here.
-        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None)
+        let _ = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
             .expect("purge of fresh project should succeed");
         // Now try to rename the project that no longer exists. The
         // pre-fix code returned `Ok(())` because `UPDATE` affected
@@ -4058,8 +4163,15 @@ mod tests {
         let (_tmp, mut conn, ws, proj) = fresh_db();
         let author = seed_user(&conn, "alice");
 
-        purge_project(&mut conn, &ws, &proj, "default/scratch", Some(author))
-            .expect("purge should succeed");
+        purge_project(
+            &mut conn,
+            &ws,
+            &proj,
+            "default/scratch",
+            Some(author),
+            false,
+        )
+        .expect("purge should succeed");
 
         let (count, op_author) = audit_row_for(&conn, "purge_project");
         assert_eq!(count, 1, "exactly one purge_project audit row");
@@ -4068,6 +4180,109 @@ mod tests {
             Some(&author.as_bytes()[..]),
             "audit row must carry the purging operator"
         );
+    }
+
+    /// Open one managed run on `proj` so the purge guard has something to
+    /// refuse. Mirrors what `ai-memory run` does on launch.
+    fn open_managed_run(
+        conn: &mut Connection,
+        ws: &ai_memory_core::WorkspaceId,
+        proj: &ai_memory_core::ProjectId,
+    ) -> crate::workstream::PreparedWorkstreamRun {
+        crate::workstream::prepare_run(
+            conn,
+            &crate::workstream::PrepareWorkstreamRun {
+                workspace_id: *ws,
+                project_id: *proj,
+                repo_fingerprint: "repo-fp".to_string(),
+                worktree_fingerprint: "worktree-fp".to_string(),
+                cwd: "/tmp/checkout".to_string(),
+                agent: ai_memory_core::AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: crate::workstream::WorkstreamSelection::Current,
+                lease_owner: "test".to_string(),
+            },
+        )
+        .expect("opening a managed run should succeed")
+    }
+
+    /// `workstreams` cascades out of `projects` and `managed_runs` cascades
+    /// out of `workstreams`, so purging a project silently tore the lease row
+    /// out from under a live agent: its heartbeat then failed with
+    /// `409 managed run lease is not active` every 30s and its transcript
+    /// never reached the ledger. The purge must refuse instead.
+    #[test]
+    fn purge_project_refuses_while_a_managed_run_is_active() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        open_managed_run(&mut conn, &ws, &proj);
+
+        let err = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
+            .expect_err("an active managed run must block the purge");
+
+        match err {
+            StoreError::ManagedRunActive { count, workstreams } => {
+                assert_eq!(count, 1, "one active run");
+                assert!(
+                    workstreams.contains("default"),
+                    "the error names the workstream so the operator can find the session: {workstreams}"
+                );
+            }
+            other => panic!("expected ManagedRunActive, got {other:?}"),
+        }
+
+        let survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                rusqlite::params![&proj.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1, "a refused purge must not delete anything");
+    }
+
+    /// `force` is the deliberate override, and the summary must account for
+    /// what the cascade took with it — the counters the pre-fix report showed
+    /// (`0 pages, 0 sessions, …`) made a scope carrying a live workstream look
+    /// safe to delete.
+    #[test]
+    fn forced_purge_reports_the_workstreams_it_cascaded() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let prepared = open_managed_run(&mut conn, &ws, &proj);
+
+        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, true)
+            .expect("force purges regardless of the live lease");
+
+        assert_eq!(summary.workstreams_deleted, 1);
+        assert_eq!(summary.managed_runs_deleted, 1);
+        assert_eq!(
+            summary.workstream_ids,
+            vec![prepared.workstream_id.to_string()],
+            "the raw/workstreams/<id>/ dir is reported for post-commit cleanup"
+        );
+    }
+
+    /// A crashed wrapper leaves `state = 'active'` behind forever — the only
+    /// sweep that flips it to `'expired'` lives in `prepare_run`. Guarding on
+    /// the state alone would let one dead session block every future purge of
+    /// the project, so the guard must read the lease expiry too.
+    #[test]
+    fn purge_project_ignores_a_managed_run_whose_lease_expired() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        open_managed_run(&mut conn, &ws, &proj);
+        // Simulate the crash: the row still says 'active', but nothing has
+        // heartbeated it, so its lease lapsed.
+        conn.execute(
+            "UPDATE managed_runs SET lease_expires_at = ?1 WHERE state = 'active'",
+            rusqlite::params![Timestamp::now().as_microsecond() - 1],
+        )
+        .unwrap();
+
+        let summary = purge_project(&mut conn, &ws, &proj, "default/scratch", None, false)
+            .expect("a lapsed lease is not a running agent");
+
+        assert_eq!(summary.workstreams_deleted, 1);
+        assert_eq!(summary.managed_runs_deleted, 1);
     }
 
     /// A `rename_project` writes an attributed audit row, committed

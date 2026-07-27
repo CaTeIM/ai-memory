@@ -26,6 +26,7 @@ use crate::ops::{
     self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
     PurgeSummary, ReorgSummary,
 };
+use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
@@ -113,6 +114,31 @@ pub(crate) enum WriteCmd {
         ingest_key: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    EnqueueSessionConsolidation {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ClaimSessionConsolidation {
+        now: i64,
+        stale_before: i64,
+        reply: oneshot::Sender<StoreResult<Option<SessionConsolidationJob>>>,
+    },
+    CompleteSessionConsolidation {
+        job: SessionConsolidationJob,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    FailSessionConsolidation {
+        job: SessionConsolidationJob,
+        error: String,
+        retry_at: Option<i64>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ReleaseSessionConsolidation {
+        job: SessionConsolidationJob,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -183,6 +209,8 @@ pub(crate) enum WriteCmd {
         /// Authenticated operator recorded in the `audit_log` row (NULL when
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
+        /// Purge even when a managed workstream still holds a live run lease.
+        force: bool,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
@@ -463,7 +491,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Mark a session ended, optionally linking its summary page.
+    /// Mark a session ended, optionally linking its summary page, and persist
+    /// the observation generation covered by this end.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
@@ -560,6 +589,81 @@ impl WriterHandle {
             reply: tx,
         })
         .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist one opt-in SessionEnd consolidation job for the current
+    /// observation generation. Duplicate generations are idempotent.
+    pub async fn enqueue_session_consolidation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnqueueSessionConsolidation {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically claim the oldest due SessionEnd consolidation job.
+    pub async fn claim_session_consolidation(
+        &self,
+        now: i64,
+        stale_before: i64,
+    ) -> StoreResult<Option<SessionConsolidationJob>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClaimSessionConsolidation {
+            now,
+            stale_before,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a claimed SessionEnd consolidation job complete.
+    pub async fn complete_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteSessionConsolidation { job, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a failed SessionEnd consolidation attempt.
+    pub async fn fail_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+        error: String,
+        retry_at: Option<i64>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FailSessionConsolidation {
+            job,
+            error,
+            retry_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Return an in-flight SessionEnd consolidation job to the durable queue.
+    pub async fn release_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
+            .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -751,6 +855,7 @@ impl WriterHandle {
         project_id: ProjectId,
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
+        force: bool,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -758,6 +863,7 @@ impl WriterHandle {
             project_id,
             label: label.into(),
             author_id,
+            force,
             reply: tx,
         })
         .await?;
@@ -1367,6 +1473,45 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::complete_observation_ingest(&mut conn, &project_id, &ingest_key);
                 send_or_warn(reply, result, "complete_observation_ingest");
             }
+            WriteCmd::EnqueueSessionConsolidation {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_consolidation::enqueue(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "enqueue_session_consolidation");
+            }
+            WriteCmd::ClaimSessionConsolidation {
+                now,
+                stale_before,
+                reply,
+            } => {
+                let result = crate::session_consolidation::claim_next(&mut conn, now, stale_before);
+                send_or_warn(reply, result, "claim_session_consolidation");
+            }
+            WriteCmd::CompleteSessionConsolidation { job, reply } => {
+                let result = crate::session_consolidation::complete(&mut conn, &job);
+                send_or_warn(reply, result, "complete_session_consolidation");
+            }
+            WriteCmd::FailSessionConsolidation {
+                job,
+                error,
+                retry_at,
+                reply,
+            } => {
+                let result = crate::session_consolidation::fail(&mut conn, &job, &error, retry_at);
+                send_or_warn(reply, result, "fail_session_consolidation");
+            }
+            WriteCmd::ReleaseSessionConsolidation { job, reply } => {
+                let result = crate::session_consolidation::release(&mut conn, &job);
+                send_or_warn(reply, result, "release_session_consolidation");
+            }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
@@ -1461,10 +1606,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 project_id,
                 label,
                 author_id,
+                force,
                 reply,
             } => {
-                let result =
-                    ops::purge_project(&mut conn, &workspace_id, &project_id, &label, author_id);
+                let result = ops::purge_project(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &label,
+                    author_id,
+                    force,
+                );
                 send_or_warn(reply, result, "purge_project");
             }
             WriteCmd::DeleteWorkspace {

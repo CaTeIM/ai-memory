@@ -53,12 +53,12 @@ struct FinalizeSessionReport {
 /// sessions or rejects a synthetic `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
     let agent = args.agent.kind();
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let sessions =
-        fetch_open_sessions(&endpoint, &args.workspace, &project, agent, args.all).await?;
+    let sessions = fetch_open_sessions(&endpoint, &workspace, &project, agent, args.all).await?;
     if sessions.is_empty() {
-        return print_report(args, project, agent, Vec::new());
+        return print_report(args, workspace, project, agent, Vec::new());
     }
 
     let client = reqwest::Client::new();
@@ -70,7 +70,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
             &endpoint,
             session,
             fallback_cwd.as_str(),
-            &args.workspace,
+            &workspace,
             &project,
             agent,
         )
@@ -78,7 +78,7 @@ pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
         finalized.push(session.session_id.clone());
     }
 
-    print_report(args, project, agent, finalized)
+    print_report(args, workspace, project, agent, finalized)
 }
 
 /// List open sessions for the scope + agent via the server. An unknown
@@ -119,12 +119,13 @@ async fn fetch_open_sessions(
 
 fn print_report(
     args: FinalizeSessionArgs,
+    workspace: String,
     project: String,
     agent: AgentKind,
     finalized: Vec<String>,
 ) -> Result<()> {
     let report = FinalizeSessionReport {
-        workspace: args.workspace,
+        workspace,
         project,
         agent: agent.as_str().to_string(),
         finalized,
