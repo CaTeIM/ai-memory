@@ -58,7 +58,7 @@ fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
 const AUTHORITY_CANDIDATE_MULTIPLIER: usize = 4;
 const AUTHORITY_MAX_EXTRA_CANDIDATES: usize = 300;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct PageAuthority {
     factor: f64,
 }
@@ -2131,14 +2131,19 @@ impl ReaderPool {
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
         // Fetch FTS5 hits first.
-        let fts_hits: Vec<PageHit> = self
+        let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
                 project_id,
                 query,
                 limit.saturating_mul(2),
             )
-            .await?
+            .await?;
+        let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
+            .iter()
+            .map(|(hit, authority)| (hit.id, *authority))
+            .collect();
+        let fts_hits: Vec<PageHit> = fts_candidates
             .into_iter()
             .map(|(hit, _authority)| hit)
             .collect();
@@ -2221,13 +2226,14 @@ impl ReaderPool {
                 rank: -fused_rank, // lower = better (matches FTS5 convention)
             })
             .collect();
-        let authorities = self
-            .page_authorities_for_project(
-                workspace_id,
-                project_id,
-                out.iter().map(|hit| hit.id).collect(),
-            )
-            .await?;
+        let missing_authorities: Vec<PageId> = out
+            .iter()
+            .filter_map(|hit| (!authorities.contains_key(&hit.id)).then_some(hit.id))
+            .collect();
+        authorities.extend(
+            self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
+                .await?,
+        );
         for hit in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
                 hit.rank = authority.adjust_rank(hit.rank);
