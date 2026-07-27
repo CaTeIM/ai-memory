@@ -96,6 +96,12 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    EndSessionWithHandoff {
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
     SweepHollowProjects {
         min_age_days: u32,
         reply: oneshot::Sender<StoreResult<Vec<String>>>,
@@ -113,6 +119,11 @@ pub(crate) enum WriteCmd {
         project_id: ProjectId,
         ingest_key: String,
         reply: oneshot::Sender<StoreResult<()>>,
+    },
+    CompleteObservationIngestIfClaimed {
+        project_id: ProjectId,
+        ingest_key: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     EnqueueSessionConsolidation {
         workspace_id: WorkspaceId,
@@ -511,6 +522,27 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically end a session and insert its automatic handoff.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_session_with_handoff(
+        &self,
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+    ) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndSessionWithHandoff {
+            session_id,
+            summary_page_id,
+            handoff,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Delete hollow project rows (no data of any kind) older than
     /// `min_age_days`; returns the deleted names. See
     /// [`ops::sweep_hollow_projects`].
@@ -584,6 +616,24 @@ impl WriterHandle {
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CompleteObservationIngest {
+            project_id,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a keyed hook event complete if its observation claim exists.
+    ///
+    /// Returns `false` for an unkeyed or unrelated duplicate recovery attempt.
+    pub async fn complete_observation_ingest_if_claimed(
+        &self,
+        project_id: ProjectId,
+        ingest_key: String,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteObservationIngestIfClaimed {
             project_id,
             ingest_key,
             reply: tx,
@@ -1446,6 +1496,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
             }
+            WriteCmd::EndSessionWithHandoff {
+                session_id,
+                summary_page_id,
+                handoff,
+                reply,
+            } => {
+                let result = ops::end_session_with_handoff(
+                    &mut conn,
+                    &session_id,
+                    summary_page_id.as_ref(),
+                    &handoff,
+                );
+                send_or_warn(reply, result, "end_session_with_handoff");
+            }
             WriteCmd::SweepHollowProjects {
                 min_age_days,
                 reply,
@@ -1472,6 +1536,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::complete_observation_ingest(&mut conn, &project_id, &ingest_key);
                 send_or_warn(reply, result, "complete_observation_ingest");
+            }
+            WriteCmd::CompleteObservationIngestIfClaimed {
+                project_id,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::complete_observation_ingest_if_claimed(
+                    &mut conn,
+                    &project_id,
+                    &ingest_key,
+                );
+                send_or_warn(reply, result, "complete_observation_ingest_if_claimed");
             }
             WriteCmd::EnqueueSessionConsolidation {
                 workspace_id,

@@ -837,6 +837,14 @@ pub fn end_session(
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
+    end_session_row(conn, session_id, summary_page_id)
+}
+
+fn end_session_row(
+    conn: &Connection,
+    session_id: &SessionId,
+    summary_page_id: Option<&PageId>,
+) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
     let page_blob: Option<&[u8]> = summary_page_id.map(|p| &p.as_bytes()[..]);
     conn.execute(
@@ -922,6 +930,23 @@ pub fn complete_observation_ingest(
     project_id: &ProjectId,
     ingest_key: &str,
 ) -> StoreResult<()> {
+    if !complete_observation_ingest_if_claimed(conn, project_id, ingest_key)? {
+        return Err(StoreError::InvalidState(
+            "cannot complete an ingest key that was not claimed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mark a keyed hook event complete when its observation claim exists.
+///
+/// Recovery paths use the boolean result to distinguish a pending native-hook
+/// replay from an unkeyed or unrelated duplicate SessionEnd.
+pub fn complete_observation_ingest_if_claimed(
+    conn: &mut Connection,
+    project_id: &ProjectId,
+    ingest_key: &str,
+) -> StoreResult<bool> {
     let completed_at = Timestamp::now().as_microsecond();
     let matched = conn.execute(
         "UPDATE ingest_keys \
@@ -929,12 +954,7 @@ pub fn complete_observation_ingest(
          WHERE project_id = ?2 AND key = ?3",
         params![completed_at, project_id.as_bytes(), ingest_key],
     )?;
-    if matched == 0 {
-        return Err(StoreError::InvalidState(
-            "cannot complete an ingest key that was not claimed".into(),
-        ));
-    }
-    Ok(())
+    Ok(matched != 0)
 }
 
 /// The observation INSERT itself, shared by the plain and keyed paths
@@ -1166,6 +1186,54 @@ pub fn hard_delete_decayed_pages(
 
 /// Insert a new handoff in state=open.
 pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
+    let tx = conn.transaction()?;
+    let id = insert_handoff_row(&tx, h)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Atomically stamp a session ended and insert its automatic handoff.
+///
+/// A failed handoff insert rolls the end stamp back, so a keyed retry can run
+/// the complete SessionEnd path instead of observing a partially ended session.
+pub fn end_session_with_handoff(
+    conn: &mut Connection,
+    session_id: &SessionId,
+    summary_page_id: Option<&PageId>,
+    handoff: &NewHandoff,
+) -> StoreResult<HandoffId> {
+    if handoff.from_session_id.as_ref() != Some(session_id) {
+        return Err(StoreError::InvalidState(
+            "automatic handoff source does not match the ended session".into(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    let session_scope: Option<(Vec<u8>, Vec<u8>)> = tx
+        .query_row(
+            "SELECT workspace_id, project_id FROM sessions WHERE id = ?1",
+            params![session_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((workspace_id, project_id)) = session_scope else {
+        return Err(StoreError::InvalidState(
+            "cannot end a missing session with an automatic handoff".into(),
+        ));
+    };
+    if workspace_id.as_slice() != handoff.workspace_id.as_bytes()
+        || project_id.as_slice() != handoff.project_id.as_bytes()
+    {
+        return Err(StoreError::InvalidState(
+            "automatic handoff scope does not match the ended session".into(),
+        ));
+    }
+    end_session_row(&tx, session_id, summary_page_id)?;
+    let id = insert_handoff_row(&tx, handoff)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
     let open_q = serde_json::to_string(&h.open_questions)?;
@@ -1191,8 +1259,7 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
     // user, so the audit author is NULL — the row records the lifecycle event
     // (op + workspace/project + time), not an operator identity.
-    let tx = conn.transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
           open_questions, next_steps, files_touched, state, created_at) \
@@ -1213,7 +1280,7 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
         ],
     )?;
     audit(
-        &tx,
+        conn,
         "insert_handoff",
         Some(h.workspace_id.as_bytes()),
         Some(h.project_id.as_bytes()),
@@ -1221,7 +1288,6 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
         None,
         now,
     )?;
-    tx.commit()?;
     Ok(id)
 }
 

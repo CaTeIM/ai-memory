@@ -241,9 +241,13 @@ pub enum SessionEndDisposition {
     /// The session is open in the resolved scope/agent: run the normal end
     /// path.
     Open,
-    /// Missing, cross-scope, cross-agent, or already ended with no observations
-    /// beyond the persisted end generation: a duplicate or stale end — drop it.
-    DropStale,
+    /// The session is missing or does not match the resolved scope/agent. Drop
+    /// the event without attempting recovery against an unrelated session.
+    DropInvalid,
+    /// The matching session already ended with no observations beyond the
+    /// persisted end generation. Converge any interrupted downstream effects,
+    /// then drop the duplicate end.
+    AlreadyEnded,
     /// Already ended, but the observation count exceeds the persisted end
     /// generation: the agent resumed the session under the same id — run the
     /// full end path again so the resumed work reaches the compiled page
@@ -1536,7 +1540,7 @@ impl ReaderPool {
                 .optional()?;
             let Some((ended_at, ended_observation_count)) = end_state else {
                 // Missing, cross-scope, or cross-agent: never end it.
-                return Ok(SessionEndDisposition::DropStale);
+                return Ok(SessionEndDisposition::DropInvalid);
             };
             if ended_at.is_none() {
                 return Ok(SessionEndDisposition::Open);
@@ -1549,7 +1553,7 @@ impl ReaderPool {
             if current_observation_count > ended_observation_count {
                 Ok(SessionEndDisposition::ReEndWithNewWork)
             } else {
-                Ok(SessionEndDisposition::DropStale)
+                Ok(SessionEndDisposition::AlreadyEnded)
             }
         })
         .await

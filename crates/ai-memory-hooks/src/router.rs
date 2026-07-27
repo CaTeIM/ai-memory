@@ -1969,16 +1969,38 @@ async fn process(
             .await?
         {
             ai_memory_store::SessionEndDisposition::Open => {}
-            ai_memory_store::SessionEndDisposition::DropStale => {
-                // A first delivery can be cancelled after `end_session` but
-                // before its durable LLM job is queued. The replay must ensure
-                // that job exists before acknowledging the already-ended
-                // session; enqueue is generation-idempotent.
-                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+            ai_memory_store::SessionEndDisposition::DropInvalid => {
                 info!(
                     session = %session_id,
                     agent = %env.agent.as_str(),
-                    "ignoring SessionEnd for missing, mismatched, or already-ended session"
+                    "ignoring SessionEnd for missing, mismatched, or cross-agent session"
+                );
+                return Ok(());
+            }
+            ai_memory_store::SessionEndDisposition::AlreadyEnded => {
+                // End stamping and the legacy handoff commit atomically. A
+                // first delivery can still be cancelled after that transaction
+                // but before the wiki commit, durable LLM enqueue, or ingest-key
+                // completion. Re-run those idempotent tail effects before
+                // acknowledging the already-ended session.
+                let commit_msg = format!("repair session {}", short_id(&session_id.to_string()),);
+                match state.wiki.commit_all(&commit_msg) {
+                    Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                    Ok(None) => debug!("wiki clean during SessionEnd recovery"),
+                    Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
+                }
+                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+                if let Some(key) = env.ingest_key {
+                    let completed = state
+                        .writer
+                        .complete_observation_ingest_if_claimed(proj, key.clone())
+                        .await?;
+                    debug!(key, completed, "SessionEnd recovery ingest-key completion");
+                }
+                info!(
+                    session = %session_id,
+                    agent = %env.agent.as_str(),
+                    "recovered tail effects for already-ended SessionEnd"
                 );
                 return Ok(());
             }
@@ -2181,8 +2203,8 @@ async fn process(
                 actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
-        state.writer.end_session(session_id, Some(page_id)).await?;
         let handoff_id = if managed {
+            state.writer.end_session(session_id, Some(page_id)).await?;
             None
         } else {
             let handoff = build_auto_handoff(
@@ -2193,7 +2215,12 @@ async fn process(
                 env.cwd.clone(),
                 &observations,
             );
-            Some(state.writer.insert_handoff(handoff).await?)
+            Some(
+                state
+                    .writer
+                    .end_session_with_handoff(session_id, Some(page_id), handoff)
+                    .await?,
+            )
         };
         // Auto-commit the wiki tree so the session/handoff/log.md
         // changes land in git in one atomic snapshot.
@@ -5187,7 +5214,18 @@ mod tests {
     #[tokio::test]
     async fn mismatched_session_end_does_not_create_summary_or_handoff() {
         let tmp = TempDir::new().unwrap();
-        let state = make_state(&tmp).await;
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
         let target = state
             .writer
             .get_or_create_project(state.workspace_id, "target", None)
@@ -5252,6 +5290,16 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "mismatched SessionEnd must not create a target handoff"
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "mismatched SessionEnd must not enter consolidation recovery"
         );
     }
 
@@ -5423,7 +5471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_session_end_redelivery_repairs_missing_queue_job() {
+    async fn stale_session_end_redelivery_converges_interrupted_tail_effects() {
         let tmp = TempDir::new().unwrap();
         let mut state = make_state(&tmp).await;
         let llm = Arc::new(RecordingLlm(Mutex::new(None)));
@@ -5439,24 +5487,94 @@ mod tests {
         state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
         let sid = "20202020-2020-2020-2020-202020202020";
         let session_id: SessionId = sid.parse().unwrap();
-        let fire = |event: &str| {
+        let fire = |event: &str, key: Option<&str>| {
             HookEnvelope::from_query_and_body(
                 HookQuery {
                     event: event.into(),
                     agent: Some("codex".into()),
+                    ingest_key: key.map(str::to_string),
                     ..Default::default()
                 },
                 serde_json::json!({ "session_id": sid, "prompt": "finish" }),
             )
         };
-        process(&state, fire("user-prompt-submit"), None)
+        process(&state, fire("user-prompt-submit", None), None)
             .await
             .unwrap();
-        // Reproduce the persisted boundary from #260: the original request
-        // reached end_session, then was cancelled before it could enqueue.
-        state.writer.end_session(session_id, None).await.unwrap();
+        let (workspace_id, project_id, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_observation = || {
+            Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::SessionEnd,
+                    extension: None,
+                    source_event: None,
+                    title: "session-end".into(),
+                    body: "finish".into(),
+                    importance: 7,
+                },
+                &state.sanitizer,
+            )
+        };
+        assert!(matches!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::Inserted(_)
+        ));
 
-        process(&state, fire("session-end"), None).await.unwrap();
+        // Reproduce the durable boundary from #270: the summary file exists and
+        // the atomic end+handoff transaction committed, then the request was
+        // cancelled before the wiki commit, queue insert, or key completion.
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let page = synthesize_session_page(workspace_id, project_id, session_id, &observations);
+        let page_id = state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id,
+                project_id,
+                path: page.path,
+                frontmatter: page.frontmatter_json,
+                body: page.body,
+                tier: page.tier,
+                pinned: page.pinned,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+        let handoff = build_auto_handoff(
+            workspace_id,
+            project_id,
+            AgentKind::Codex,
+            session_id,
+            None,
+            &observations,
+        );
+        state
+            .writer
+            .end_session_with_handoff(session_id, Some(page_id), handoff)
+            .await
+            .unwrap();
+
+        process(&state, fire("session-end", Some("entry-recovery")), None)
+            .await
+            .unwrap();
         let now = Timestamp::now().as_microsecond();
         let job = state
             .writer
@@ -5465,7 +5583,33 @@ mod tests {
             .unwrap()
             .expect("stale redelivery must restore the missing durable job");
         assert_eq!(job.session_id(), session_id);
-        assert_eq!(job.generation(), 1);
+        assert_eq!(job.generation(), 2);
+        assert_eq!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::AlreadyComplete,
+            "the recovered event must finish its pending ingest key"
+        );
+        let briefing = state
+            .reader
+            .briefing_for_project(workspace_id, project_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            briefing.pending_handoff_count, 1,
+            "recovery must preserve exactly one automatic handoff"
+        );
+        assert!(
+            state
+                .wiki
+                .commit_all("verify recovery clean")
+                .unwrap()
+                .is_none(),
+            "recovery must commit the summary file left by the interrupted request"
+        );
     }
 
     // Issue #152: an agent that resumes an ended session under the same id
@@ -5511,7 +5655,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
             "a freshly-ended session with no newer work must drop duplicate ends"
         );
         let page_after_first_end = state
@@ -5585,7 +5729,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
             "after the re-end, the generation watermark must cover resumed work"
         );
     }

@@ -68,16 +68,19 @@ from hook paths.
    overlapping retry with the original processor. Downstream effects remain
    at-least-once until that completion marker, so a process crash during those
    effects may repeat an already applied effect rather than silently lose the
-   rest. `log.md` gets an appended
+   rest. For an interrupted already-ended SessionEnd, the replay converges the
+   wiki commit, durable provider job, and pending key without appending another
+   observation. `log.md` gets an appended
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
-   `Handoff` row for the next agent. The same transaction that stamps the
-   session ended records the covered observation count. A later SessionEnd
-   re-runs the path only when that generation advances, so resumed sessions
-   are captured while duplicate delivery and clock skew converge. Existing
-   ended sessions are baselined at migration instead of becoming historical
-   catch-up work. Auto-commits the wiki. Clients
+   `Handoff` row for the next agent. One SQLite transaction inserts that
+   automatic handoff, stamps the session ended, and records the covered
+   observation count, so recovery never sees only half of those DB effects. A
+   later SessionEnd re-runs the path only when that generation advances, so
+   resumed sessions are captured while duplicate delivery and clock skew
+   converge. Existing ended sessions are baselined at migration instead of
+   becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
    Codex provides `ai-memory finalize-session`, while Antigravity CLI should
    call `memory_handoff_begin` before quitting when a handoff is needed.

@@ -670,7 +670,9 @@ drain latency does not cancel it. Failed jobs retry with backoff and survive a
 server restart. A resumed native session is ended again only after its
 observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
-provider work.
+provider work. The end watermark and automatic handoff commit atomically, and
+an interrupted keyed replay finishes the wiki commit, queue insert, and key
+completion without duplicating that handoff.
 
 Recommended defaults:
 
