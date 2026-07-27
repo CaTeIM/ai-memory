@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] - 2026-07-27
+
 ### Changed
 - Wiki search now applies a bounded source-authority adjustment after FTS5,
   graph, and optional vector candidate generation. Canonical rules, decisions,
@@ -2490,7 +2492,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.1...HEAD
+[1.19.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.1
 [1.19.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.0
 [1.18.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.18.0
 [1.17.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.17.3
