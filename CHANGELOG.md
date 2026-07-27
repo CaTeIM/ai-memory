@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completion. An interruption after `ended_at` can no longer strand a missing
   handoff or permanently pending spool key, and missing or scope/agent-
   mismatched SessionEnd events no longer attempt consolidation recovery against
-  an unrelated session. (#270)
+  an unrelated session. (#271)
 - Bare `install-hooks --apply` re-runs, including the Docker wrapper's
   post-upgrade refresh, now preserve an install's baked `repo-root` project
   strategy for every supported hook integration. An explicit
