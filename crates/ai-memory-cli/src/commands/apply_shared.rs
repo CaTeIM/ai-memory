@@ -104,21 +104,43 @@ fn backup_path_for(path: &Path) -> PathBuf {
 }
 
 /// Atomic write via the canonical [`ai_memory_wiki::write_atomic`]
-/// (tempfile + fsync + rename + parent-dir fsync). The one wrinkle kept
-/// here: the tempfile MUST land in the same directory as the target so
-/// `rename(2)` stays intra-filesystem — otherwise we get EXDEV
-/// ("Invalid cross-device link"). A bare relative path like `CLAUDE.md`
-/// has an *empty* parent, so treat it as `.` (current directory); a
-/// `$TMPDIR` fallback would sit on a different filesystem than the
-/// project in just about every realistic setup.
+/// (tempfile + fsync + rename + parent-dir fsync). Two wrinkles kept here:
+///
+/// - When the target is a **symlink**, write to the file it points at instead
+///   of letting `rename(2)` replace the link with a regular file. Dotfiles
+///   managers (stow, chezmoi, bare-git) symlink config files like
+///   `~/.claude/settings.json` into a tracked repo; clobbering the link
+///   silently de-syncs that repo. The staged-hooks dir is already followed
+///   (see `same_canonical_dir`); this brings file writes in line with it.
+/// - The tempfile MUST land in the same directory as the (resolved) target so
+///   `rename(2)` stays intra-filesystem — otherwise we get EXDEV
+///   ("Invalid cross-device link"). A bare relative path like `CLAUDE.md`
+///   has an *empty* parent, so treat it as `.` (current directory); a
+///   `$TMPDIR` fallback would sit on a different filesystem than the
+///   project in just about every realistic setup.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let path = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => path.to_path_buf(),
-        _ => Path::new(".").join(path),
+    let target = deref_symlink(path);
+    let has_parent = target.parent().is_some_and(|p| !p.as_os_str().is_empty());
+    let target = if has_parent {
+        target
+    } else {
+        Path::new(".").join(&target)
     };
-    ai_memory_wiki::write_atomic(&path, content.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
+    ai_memory_wiki::write_atomic(&target, content.as_bytes())
+        .with_context(|| format!("writing {}", target.display()))?;
     Ok(())
+}
+
+/// Resolve a symlinked target to the real file it points at. Non-symlinks —
+/// and dangling links, which can't be canonicalized — are returned unchanged,
+/// preserving the prior behavior for every non-symlink caller.
+fn deref_symlink(path: &Path) -> PathBuf {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 // --------------------------------------------------------------------
@@ -235,6 +257,35 @@ mod tests {
         assert_eq!(backups.len(), 1, "exactly one backup file expected");
         let bak_content = fs::read_to_string(backups[0].path()).unwrap();
         assert_eq!(bak_content, "old\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_through_symlink_updates_target_and_keeps_link() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        // A tracked "dotfiles" file, plus a symlink standing in for the config
+        // path the tool is pointed at (e.g. ~/.claude/settings.json).
+        let target = tmp.path().join("dotfiles/settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "old\n").unwrap();
+        let link = tmp.path().join("settings.json");
+        symlink(&target, &link).unwrap();
+
+        let outcome = apply_atomic(&link, |_| Ok("new\n".into())).unwrap();
+
+        assert_eq!(outcome, ApplyOutcome::Updated);
+        // The link must survive as a link, not be replaced by a regular file.
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the write"
+        );
+        // The write landed on the real file the link points at.
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(&link).unwrap(), "new\n");
     }
 
     #[test]
