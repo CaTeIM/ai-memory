@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including subdirectories and linked worktrees. (#259)
 
 ### Fixed
+- Capture exclusions now canonicalize an existing hook working directory
+  before matching paths, so filesystem aliases such as macOS `/var` versus
+  `/private/var` cannot turn an excluded file event into a spooled event.
+  Marker discovery tests likewise accept the canonical path they request.
+  (#265)
 - Opt-in SessionEnd LLM consolidation now runs from a durable, generation-
   idempotent queue instead of inside the hook batch request. The hook commits
   its deterministic session page and handoff, persists the provider job, and
