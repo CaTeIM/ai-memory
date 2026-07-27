@@ -174,9 +174,10 @@ pub enum Command {
 #[derive(Debug, Args)]
 #[command(trailing_var_arg = true)]
 pub struct RunArgs {
-    /// Workspace containing the managed workstream.
-    #[arg(long, default_value = "default")]
-    pub workspace: String,
+    /// Workspace containing the managed workstream. Defaults to the nearest
+    /// `.ai-memory.toml` marker's `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project override. Defaults to the current repository project.
     #[arg(long)]
     pub project: Option<String>,
@@ -469,9 +470,15 @@ pub struct ReorgArgs {
 /// Arguments for `purge-project`.
 #[derive(Debug, Args)]
 pub struct PurgeProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Workstreams cascade out of the project row, so without
+    /// this the purge refuses rather than deleting a running session's lease.
+    #[arg(long)]
+    pub force: bool,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -485,9 +492,10 @@ pub struct PurgeProjectArgs {
 /// Arguments for `rename-project`.
 #[derive(Debug, Args)]
 pub struct RenameProjectArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Current project name. When omitted, auto-derives from the
     /// basename of the current git repo root (or CWD) — handy when
     /// running `ai-memory rename-project --to new-name` from a dir
@@ -503,9 +511,11 @@ pub struct RenameProjectArgs {
 /// Arguments for `move-project`.
 #[derive(Debug, Args)]
 pub struct MoveProjectArgs {
-    /// Source workspace. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub from_workspace: String,
+    /// Source workspace. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Only the source is marker-resolved;
+    /// `--to-workspace` names the destination and stays literal.
+    #[arg(long)]
+    pub from_workspace: Option<String>,
     /// Project name to move. When omitted, auto-derived from the basename
     /// of the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -517,10 +527,9 @@ pub struct MoveProjectArgs {
     /// source, both irreversible. Without this flag the CLI errors out.
     #[arg(long)]
     pub confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409) to
-    /// move the project a hook session is actively writing to; `--force`
-    /// proceeds anyway (still safe — the move keeps the active pointer correct
-    /// and the schema rejects any stale write).
+    /// Override the active-project guard. In a copy-purge merge this never
+    /// overrides a live managed-workstream lease, because deleting that lease
+    /// would strand the running agent's transcript.
     #[arg(long)]
     pub force: bool,
     /// Merge conflict policy (copy-purge path only): what to do when a source
@@ -626,10 +635,11 @@ pub struct BootstrapArgs {
     /// any subdir of the project works).
     #[arg(long)]
     pub repo_path: Option<PathBuf>,
-    /// Workspace name. Defaults to `default` (the single workspace
-    /// all hook-captured sessions land in today).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default` — the same resolution the lifecycle hooks
+    /// use, so bootstrap pages land where the session captures do.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the resolved repo path — same heuristic the hook router uses
     /// to bucket per-cwd observations, so the bootstrap pages land
@@ -768,9 +778,10 @@ pub struct AuditContaminationArgs {
 pub struct SearchArgs {
     /// FTS5 query string (e.g. `"karpathy wiki"` or `quick OR slow`).
     pub query: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -791,9 +802,10 @@ pub struct ReadPageArgs {
     /// Exact wiki path (e.g. `notes/foo.md`). Takes precedence over `query`.
     #[arg(long)]
     pub path: Option<String>,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -808,11 +820,12 @@ pub struct DeletePageArgs {
     /// Exact wiki path to delete (e.g. `notes/foo.md`).
     #[arg(long)]
     pub path: String,
-    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
-    /// a cross-workspace project-name collision can never silently route
-    /// the delete to the wrong slot.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`. Resolution is announced on stderr so a
+    /// cross-workspace project-name collision can never silently route the
+    /// delete to the wrong slot.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project
     /// (same heuristic write-page/read-page use).
     #[arg(long)]
@@ -866,9 +879,10 @@ pub struct RestorePageArgs {
     /// Git checkpoint/revision to restore from.
     #[arg(long)]
     pub from: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -991,9 +1005,10 @@ pub struct FinalizeSessionArgs {
     /// true SessionEnd hook.
     #[arg(long, value_enum, default_value_t = AgentChoice::Codex)]
     pub agent: AgentChoice,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the current project.
     #[arg(long)]
     pub project: Option<String>,
@@ -1108,8 +1123,8 @@ pub struct EmbedArgs {
     #[arg(long)]
     pub force: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo). Matches the
     /// hook router's per-cwd convention so this command targets the
@@ -1125,8 +1140,8 @@ pub struct ForgetSweepArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1145,8 +1160,8 @@ pub struct LintArgs {
     #[arg(long)]
     pub no_llm: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1162,9 +1177,10 @@ pub struct CuratorArgs {
     /// Stage one pending curator report page for approval.
     #[arg(long)]
     pub stage: bool,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1177,9 +1193,10 @@ pub struct CuratorArgs {
 /// Arguments for `auto-improve-report`.
 #[derive(Debug, Args)]
 pub struct AutoImproveReportArgs {
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1204,9 +1221,10 @@ pub struct AutoImproveArgs {
     /// Completed session UUID to review.
     #[arg(long)]
     pub session_id: String,
-    /// Workspace name. Defaults to `default`.
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name. When omitted, auto-derived from the basename of
     /// the current git repo root (or CWD if no git repo).
     #[arg(long)]
@@ -1251,8 +1269,8 @@ pub enum PendingWritesCommand {
 
 #[derive(Debug, Args)]
 pub struct PendingWritesListArgs {
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1266,8 +1284,8 @@ pub struct PendingWritesListArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteIdArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -1277,8 +1295,8 @@ pub struct PendingWriteIdArgs {
 #[derive(Debug, Args)]
 pub struct PendingWriteRejectArgs {
     pub id: String,
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long, default_value = "rejected by reviewer")]
@@ -1515,6 +1533,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub no_watcher: bool,
     /// Workspace name (auto-created).
+    ///
+    /// Not marker-aware, unlike the client commands: the server has no
+    /// caller cwd to walk up from, and this is the baked fallback for hook
+    /// events that arrive without a usable one.
     #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
     pub workspace: String,
     /// Project name within the workspace (auto-created).
@@ -1595,8 +1617,8 @@ pub struct WritePageArgs {
     #[arg(long)]
     pub pinned: bool,
     /// Workspace name (auto-created if absent).
-    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
-    pub workspace: String,
+    #[arg(long)]
+    pub workspace: Option<String>,
     /// Project name within the workspace. When omitted, auto-detect from the
     /// current project using the same resolver as read-page/search.
     #[arg(long)]
