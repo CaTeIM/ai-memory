@@ -42,18 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hybrid search now gives its FTS, vector, and graph streams the same bounded
   candidate window used by authority-aware FTS search. Small result limits no
   longer exclude a canonical page before post-fusion authority ranking can
-  promote it, and candidate-limit arithmetic is saturating throughout. (#276)
+  promote it, and candidate-limit arithmetic is saturating throughout. (#277)
 - Forced workspace deletion now removes the immutable managed-workstream
   segment directories whose database rows are removed by the workspace
   cascade. Its admin report includes workstream/run counts and IDs, and raw
   segment cleanup participates in the existing filesystem partial-failure
-  reporting instead of leaving transcript data orphaned. (#274)
+  reporting instead of leaving transcript data orphaned. (#275)
 - Lossless `move-project` true moves now re-stamp managed workstreams into the
   destination workspace in the same transaction as the project and its other
   denormalized child rows. Previously the project moved while its managed
   workstreams retained the source `workspace_id`, hiding portable history from
   destination-scope lookup and violating the project/workspace pairing
-  invariant. The admin response now reports `workstreams_moved`. (#272)
+  invariant. The admin response now reports `workstreams_moved`. (#273)
 - SessionEnd recovery now commits the ended generation and automatic handoff in
   one SQLite transaction, then lets an already-ended native replay converge the
   remaining wiki commit, durable consolidation enqueue, and ingest-key
