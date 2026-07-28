@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Source installation no longer fails when `cargo install --path` resolves
+  rmcp 1.8, whose `peer_info()` return type differs from rmcp 1.7. CI now checks
+  the unlocked source-install resolution separately from the workspace's
+  lock-aware gates, while the documented persistent Windows install uses
+  `--locked` for reproducibility. (#285)
 - Antigravity CLI hook installation and documentation now expose the existing
   agent-aware manual finalizer:
   `ai-memory finalize-session --agent antigravity-cli`. Antigravity's `Stop`
