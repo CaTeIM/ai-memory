@@ -14,9 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event ends one execution loop rather than the conversation, so it remains a
   normal observation; the explicit command closes the latest scoped session
   through the canonical SessionEnd path, producing its summary and automatic
-  handoff and queueing opt-in consolidation. The docs also clarify why a
-  manual MCP handoff over Antigravity's static HTTP connection has no dynamic
-  session attribution. (#284)
+  handoff and queueing opt-in consolidation. The docs also clarify that
+  `memory_handoff_begin` deliberately creates a session-neutral, project-wide
+  manual handoff for every MCP client; attributed handoffs come from canonical
+  SessionEnd processing. (#284)
 
 ## [1.19.1] - 2026-07-27
 

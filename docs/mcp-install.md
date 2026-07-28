@@ -490,13 +490,12 @@ The rendered hooks config looks like:
   the conversation. After the final turn, run
   `ai-memory finalize-session --agent antigravity-cli` to create the final
   summary and automatic handoff and to queue opt-in SessionEnd consolidation.
-- A manual `memory_handoff_begin` call over Antigravity's static HTTP MCP
-  connection cannot carry the hook's dynamic `conversationId`. The resulting
-  project-wide handoff therefore has no `from_session_id` and uses
-  `from_agent = other`; this is expected. The explicit finalizer selects the
-  latest scoped Antigravity session instead. ai-memory does not guess session
-  attribution for arbitrary MCP calls because concurrent conversations could
-  be assigned to one another.
+- `memory_handoff_begin` always creates an explicit, project-wide manual
+  handoff with no `from_session_id` and `from_agent = other`; that
+  session-neutral shape is the same for every MCP client. Handoffs carrying a
+  Codex or Claude session id came from canonical SessionEnd processing, not
+  from the manual tool. Use the explicit Antigravity finalizer when the
+  session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
   `observations` counts from `ai-memory status` before and after a prompt.
