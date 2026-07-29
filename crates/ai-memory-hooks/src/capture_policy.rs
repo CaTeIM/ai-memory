@@ -556,13 +556,28 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
 
 fn family(name: &str) -> ToolFamily {
     match name.to_ascii_lowercase().as_str() {
-        "read" | "write" | "edit" | "apply_patch" | "notebookedit" | "notebook_edit"
-        | "create_file" | "delete_file" | "rename_file" | "move_file" | "multi_edit"
-        | "multiedit" | "replace" | "replace_all" => ToolFamily::File,
-        "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir" => {
-            ToolFamily::SearchList
-        }
-        "bash" | "shell" | "execute" | "run_command" | "web_search" => ToolFamily::NonFile,
+        "read"
+        | "write"
+        | "edit"
+        | "apply_patch"
+        | "notebookedit"
+        | "notebook_edit"
+        | "create_file"
+        | "delete_file"
+        | "rename_file"
+        | "move_file"
+        | "multi_edit"
+        | "multiedit"
+        | "replace"
+        | "replace_all"
+        | "view_file"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "write_to_file" => ToolFamily::File,
+        "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
+        | "list_dir" | "grep_search" => ToolFamily::SearchList,
+        "bash" | "shell" | "execute" | "run_command" | "web_search" | "read_url_content"
+        | "read_resource" | "call_mcp_tool" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -622,6 +637,9 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
         "absolute_path",
         "AbsolutePath",
         "notebook_path",
+        "TargetFile",
+        "SearchPath",
+        "DirectoryPath",
     ] {
         if let Some(value) = object.get(key) {
             if paths.len() == MAX_CAPTURE_CANDIDATES {
@@ -968,6 +986,61 @@ mod tests {
             .unwrap()
             .insert("paths".into(), json!(["x"]));
         assert!(CaptureProtocol::parse(&bad).is_none());
+    }
+    #[test]
+    fn antigravity_native_tools_are_no_longer_unknown() {
+        for (tool, expected) in [
+            ("view_file", ToolFamily::File),
+            ("replace_file_content", ToolFamily::File),
+            ("multi_replace_file_content", ToolFamily::File),
+            ("write_to_file", ToolFamily::File),
+            ("list_dir", ToolFamily::SearchList),
+            ("grep_search", ToolFamily::SearchList),
+            ("read_url_content", ToolFamily::NonFile),
+            ("read_resource", ToolFamily::NonFile),
+            ("call_mcp_tool", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+    #[test]
+    fn antigravity_direct_paths_recognizes_native_arg_keys() {
+        let target = json!({"TargetFile": "/repo/src/main.rs"});
+        assert_eq!(
+            direct_paths(target.as_object().unwrap()).unwrap(),
+            vec!["/repo/src/main.rs".to_string()]
+        );
+        let search = json!({"SearchPath": "/repo/src"});
+        assert_eq!(
+            direct_paths(search.as_object().unwrap()).unwrap(),
+            vec!["/repo/src".to_string()]
+        );
+        let dir = json!({"DirectoryPath": "/repo"});
+        assert_eq!(
+            direct_paths(dir.as_object().unwrap()).unwrap(),
+            vec!["/repo".to_string()]
+        );
+    }
+    #[test]
+    fn antigravity_view_file_is_captured_and_matched_like_other_agents() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let ignored =
+            json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "secret/keys.txt"}}});
+        let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let kept =
+            json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "src/main.rs"}}});
+        let decision = policy.inspect(AgentKind::AntigravityCli, &kept, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
     #[test]
     fn normalization_and_matcher_bounds() {

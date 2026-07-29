@@ -549,10 +549,20 @@ fn safe_tool_body(
             if metadata.tool_family == crate::capture_policy::ToolFamily::Unknown {
                 return Some(summary);
             }
-            let result =
-                extract_content(raw, &["tool_response", "tool_output", "output", "result"])
-                    .or_else(|| extract_content(raw, &["error"]))
-                    .unwrap_or_else(|| "(no output captured)".into());
+            let result = extract_content(
+                raw,
+                &[
+                    "tool_response",
+                    "tool_output",
+                    "output",
+                    "result",
+                    "ReplacementContent",
+                    "CodeContent",
+                    "ReplacementChunks",
+                ],
+            )
+            .or_else(|| extract_content(raw, &["error"]))
+            .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
             Some(truncate_excerpt(&summary))
@@ -641,6 +651,9 @@ fn extraction_candidates(value: &serde_json::Value) -> Vec<&serde_json::Value> {
     }
     if let Some(event) = value.get("event") {
         push_candidates(&mut out, event);
+    }
+    if let Some(args) = value.get("toolCall").and_then(|call| call.get("args")) {
+        push_candidates(&mut out, args);
     }
     out
 }
@@ -1905,6 +1918,141 @@ mod tests {
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":id}),
         );
         assert!(!env.body_excerpt.unwrap().contains("tool_call_id"));
+    }
+
+    #[test]
+    fn antigravity_native_file_and_search_tools_render_captured_content() {
+        for (tool, args, family) in [
+            (
+                "view_file",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "replace_file_content",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "list_dir",
+                serde_json::json!({"DirectoryPath": "src"}),
+                "search-list",
+            ),
+            (
+                "grep_search",
+                serde_json::json!({"SearchPath": "src"}),
+                "search-list",
+            ),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {"name": tool, "args": args},
+                    "tool_response": "SENTINEL_CONTENT",
+                }),
+            );
+            let body = env.body_excerpt.unwrap();
+            assert!(
+                body.contains(&format!("tool_family: {family}")),
+                "tool: {tool}, body: {body}"
+            );
+            assert!(
+                body.contains("SENTINEL_CONTENT"),
+                "tool: {tool}, body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_edit_tools_capture_real_written_content() {
+        // Fixture shapes captured verbatim from a live antigravity-cli session
+        // (docs-celo/03-antigravity-tool-family-mapping/08 and 10) — the hook
+        // never sends a top-level result; the written content lives nested
+        // under toolCall.args.
+        let write_to_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "CodeContent": "# Scratch Test File 09\n\nLine 1: first line\n",
+                        "Description": "Temporary scratch file",
+                        "Overwrite": true,
+                        "TargetFile": "/repo/scratch-test-09.md"
+                    }
+                }
+            }),
+        );
+        let body = write_to_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Scratch Test File 09"));
+
+        let replace_file_content = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/1-visao.md",
+                        "TargetContent": "old line",
+                        "ReplacementContent": "new line REPLACED_SENTINEL",
+                        "Instruction": "Add debug test comment"
+                    }
+                }
+            }),
+        );
+        let body = replace_file_content.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("REPLACED_SENTINEL"));
+
+        let multi_replace = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "multi_replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/scratch-test-09.md",
+                        "Instruction": "Edit Line 1 and Line 4",
+                        "ReplacementChunks": [
+                            {
+                                "TargetContent": "Line 1: first line",
+                                "ReplacementContent": "Line 1: first line edited",
+                                "StartLine": 3,
+                                "EndLine": 3,
+                                "AllowMultiple": false
+                            },
+                            {
+                                "TargetContent": "Line 4: fourth line",
+                                "ReplacementContent": "Line 4: fourth line edited",
+                                "StartLine": 6,
+                                "EndLine": 6,
+                                "AllowMultiple": false
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        let body = multi_replace.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Line 1: first line edited"));
+        assert!(body.contains("Line 4: fourth line edited"));
     }
 
     #[test]
