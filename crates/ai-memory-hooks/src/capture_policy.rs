@@ -576,8 +576,7 @@ fn family(name: &str) -> ToolFamily {
         | "write_to_file" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
         | "list_dir" | "grep_search" => ToolFamily::SearchList,
-        "bash" | "shell" | "execute" | "run_command" | "web_search" | "read_url_content"
-        | "read_resource" | "call_mcp_tool" => ToolFamily::NonFile,
+        "bash" | "shell" | "execute" | "run_command" | "web_search" => ToolFamily::NonFile,
         _ => ToolFamily::Unknown,
     }
 }
@@ -638,8 +637,6 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
         "AbsolutePath",
         "notebook_path",
         "TargetFile",
-        "SearchPath",
-        "DirectoryPath",
     ] {
         if let Some(value) = object.get(key) {
             if paths.len() == MAX_CAPTURE_CANDIDATES {
@@ -996,33 +993,20 @@ mod tests {
             ("write_to_file", ToolFamily::File),
             ("list_dir", ToolFamily::SearchList),
             ("grep_search", ToolFamily::SearchList),
-            ("read_url_content", ToolFamily::NonFile),
-            ("read_resource", ToolFamily::NonFile),
-            ("call_mcp_tool", ToolFamily::NonFile),
         ] {
             assert_eq!(family(tool), expected, "tool: {tool}");
         }
     }
     #[test]
-    fn antigravity_direct_paths_recognizes_native_arg_keys() {
+    fn antigravity_target_file_is_a_proven_path() {
         let target = json!({"TargetFile": "/repo/src/main.rs"});
         assert_eq!(
             direct_paths(target.as_object().unwrap()).unwrap(),
             vec!["/repo/src/main.rs".to_string()]
         );
-        let search = json!({"SearchPath": "/repo/src"});
-        assert_eq!(
-            direct_paths(search.as_object().unwrap()).unwrap(),
-            vec!["/repo/src".to_string()]
-        );
-        let dir = json!({"DirectoryPath": "/repo"});
-        assert_eq!(
-            direct_paths(dir.as_object().unwrap()).unwrap(),
-            vec!["/repo".to_string()]
-        );
     }
     #[test]
-    fn antigravity_view_file_is_captured_and_matched_like_other_agents() {
+    fn antigravity_file_tools_honor_capture_exclusions() {
         let policy = CapturePolicy::resolve(
             CaptureSource::Parsed(&CaptureConfig {
                 ignore_paths: vec!["secret/**".into()],
@@ -1030,11 +1014,26 @@ mod tests {
             "/repo",
             None,
         );
-        let ignored =
-            json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "secret/keys.txt"}}});
-        let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
-        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
-        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+        for tool in [
+            "view_file",
+            "write_to_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+        ] {
+            let ignored = json!({
+                "toolCall": {
+                    "name": tool,
+                    "args": {"TargetFile": "secret/keys.txt"}
+                }
+            });
+            let decision = policy.inspect(AgentKind::AntigravityCli, &ignored, "/repo");
+            assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+            assert_eq!(
+                decision.protocol().disposition(),
+                CaptureDisposition::Drop,
+                "tool: {tool}"
+            );
+        }
 
         let kept =
             json!({"toolCall": {"name": "view_file", "args": {"TargetFile": "src/main.rs"}}});

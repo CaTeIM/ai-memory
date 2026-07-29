@@ -8,25 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Antigravity CLI's native tools (`view_file`, `replace_file_content`,
-  `multi_replace_file_content`, `write_to_file`, `list_dir`, `grep_search`,
-  `read_url_content`, `read_resource`, `call_mcp_tool`) are now recognized by
-  `capture_policy::family()` instead of falling through to `ToolFamily::Unknown`.
-  Previously every Antigravity file read/edit and search observation was
-  reduced to a bare `tool_family: unknown` stub with no captured content,
-  leaving session-end LLM consolidation with nothing to summarize. (#294)
-- Antigravity's edit tools (`write_to_file`, `replace_file_content`,
-  `multi_replace_file_content`) now capture the content actually written,
-  read from `toolCall.args.CodeContent` / `.ReplacementContent` /
-  `.ReplacementChunks`. Previously `post-tool-use` observations for these
-  tools rendered `(no output captured)` even after the family fix above,
-  because Antigravity's hook payload never sends a top-level
-  `tool_response`/`output`/`result` field; the written content lives nested
-  under `toolCall.args` instead. Antigravity's read/search tools
-  (`view_file`, `list_dir`, `grep_search`, ...) still summarize to
-  `tool_family` + outcome only — Antigravity's `post-tool-use` payload does
-  not echo back read/search results at all, so there is nothing to capture
-  for those. (#294)
+- Recognized Antigravity CLI's native file/edit and search tools, applied path
+  exclusions to its `TargetFile` operations, and captured bounded successful
+  edit content from `toolCall.args` when the hook omits an output field. Generic
+  MCP/resource tools remain fail-closed until their path schemas are proven,
+  while failed edits retain their error instead of attempted content. (#294)
 
 ## [1.19.2] - 2026-07-28
 
