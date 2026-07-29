@@ -552,6 +552,7 @@ fn safe_tool_body(
             let result =
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| antigravity_edit_content(agent, raw))
                     .unwrap_or_else(|| "(no output captured)".into());
             summary.push_str("\n---\n");
             summary.push_str(&result);
@@ -559,6 +560,25 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::AntigravityCli {
+        return None;
+    }
+    let tool_call = raw.get("toolCall")?;
+    let tool = tool_call.get("name")?.as_str()?;
+    if !matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "write_to_file" | "replace_file_content" | "multi_replace_file_content"
+    ) {
+        return None;
+    }
+    let args = tool_call.get("args")?;
+    extract_content(
+        args,
+        &["ReplacementContent", "CodeContent", "ReplacementChunks"],
+    )
 }
 
 fn extract_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -1905,6 +1925,202 @@ mod tests {
             serde_json::json!({"tool_name":"Bash","tool_input":{},"tool_use_id":id}),
         );
         assert!(!env.body_excerpt.unwrap().contains("tool_call_id"));
+    }
+
+    #[test]
+    fn antigravity_native_file_and_search_tools_render_captured_content() {
+        for (tool, args, family) in [
+            (
+                "view_file",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "replace_file_content",
+                serde_json::json!({"TargetFile": "src/main.rs"}),
+                "file",
+            ),
+            (
+                "list_dir",
+                serde_json::json!({"DirectoryPath": "src"}),
+                "search-list",
+            ),
+            (
+                "grep_search",
+                serde_json::json!({"SearchPath": "src"}),
+                "search-list",
+            ),
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {"name": tool, "args": args},
+                    "tool_response": "SENTINEL_CONTENT",
+                }),
+            );
+            let body = env.body_excerpt.unwrap();
+            assert!(
+                body.contains(&format!("tool_family: {family}")),
+                "tool: {tool}, body: {body}"
+            );
+            assert!(
+                body.contains("SENTINEL_CONTENT"),
+                "tool: {tool}, body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_edit_tools_capture_real_written_content() {
+        // Fixture shapes captured from a live antigravity-cli session. The hook
+        // never sends a top-level result; the written content lives in args.
+        let write_to_file = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "write_to_file",
+                    "args": {
+                        "CodeContent": "# Scratch Test File 09\n\nLine 1: first line\n",
+                        "Description": "Temporary scratch file",
+                        "Overwrite": true,
+                        "TargetFile": "/repo/scratch-test-09.md"
+                    }
+                }
+            }),
+        );
+        let body = write_to_file.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Scratch Test File 09"));
+
+        let replace_file_content = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/1-visao.md",
+                        "TargetContent": "old line",
+                        "ReplacementContent": "new line REPLACED_SENTINEL",
+                        "Instruction": "Add debug test comment"
+                    }
+                }
+            }),
+        );
+        let body = replace_file_content.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("REPLACED_SENTINEL"));
+
+        let multi_replace = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "name": "multi_replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/scratch-test-09.md",
+                        "Instruction": "Edit Line 1 and Line 4",
+                        "ReplacementChunks": [
+                            {
+                                "TargetContent": "Line 1: first line",
+                                "ReplacementContent": "Line 1: first line edited",
+                                "StartLine": 3,
+                                "EndLine": 3,
+                                "AllowMultiple": false
+                            },
+                            {
+                                "TargetContent": "Line 4: fourth line",
+                                "ReplacementContent": "Line 4: fourth line edited",
+                                "StartLine": 6,
+                                "EndLine": 6,
+                                "AllowMultiple": false
+                            }
+                        ]
+                    }
+                }
+            }),
+        );
+        let body = multi_replace.body_excerpt.unwrap();
+        assert!(body.contains("tool_family: file"));
+        assert!(body.contains("Line 1: first line edited"));
+        assert!(body.contains("Line 4: fourth line edited"));
+    }
+
+    #[test]
+    fn antigravity_failed_edit_prefers_error_over_attempted_content() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "error": "EDIT_FAILED_SENTINEL",
+                "toolCall": {
+                    "name": "replace_file_content",
+                    "args": {
+                        "TargetFile": "/repo/src/main.rs",
+                        "ReplacementContent": "CONTENT_WAS_NOT_WRITTEN"
+                    }
+                }
+            }),
+        );
+        let body = env.body_excerpt.unwrap();
+        assert!(body.contains("outcome: error"));
+        assert!(body.contains("EDIT_FAILED_SENTINEL"));
+        assert!(!body.contains("CONTENT_WAS_NOT_WRITTEN"));
+    }
+
+    #[test]
+    fn antigravity_generic_tools_and_unrelated_events_fail_closed() {
+        for tool in ["read_url_content", "read_resource", "call_mcp_tool"] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("antigravity-cli".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "toolCall": {
+                        "name": tool,
+                        "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                    },
+                    "tool_response": "UNPROVEN_OUTPUT_SENTINEL"
+                }),
+            );
+            assert_eq!(
+                env.body_excerpt.as_deref(),
+                Some("tool_family: unknown\noutcome: unknown")
+            );
+        }
+
+        let notification = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "notification".into(),
+                agent: Some("antigravity-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "toolCall": {
+                    "args": {"message": "NESTED_ARGUMENT_SENTINEL"}
+                }
+            }),
+        );
+        assert!(notification.body_excerpt.is_none());
     }
 
     #[test]

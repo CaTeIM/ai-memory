@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Recognized Antigravity CLI's native file/edit and search tools, applied path
+  exclusions to its `TargetFile` operations, and captured bounded successful
+  edit content from `toolCall.args` when the hook omits an output field. Generic
+  MCP/resource tools remain fail-closed until their path schemas are proven,
+  while failed edits retain their error instead of attempted content. (#294)
+
 ## [1.19.2] - 2026-07-28
 
 ### Fixed
