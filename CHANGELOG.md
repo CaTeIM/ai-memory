@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `capture_policy::family()` instead of falling through to `ToolFamily::Unknown`.
   Previously every Antigravity file read/edit and search observation was
   reduced to a bare `tool_family: unknown` stub with no captured content,
-  leaving session-end LLM consolidation with nothing to summarize.
+  leaving session-end LLM consolidation with nothing to summarize. (#294)
 - Antigravity's edit tools (`write_to_file`, `replace_file_content`,
   `multi_replace_file_content`) now capture the content actually written,
   read from `toolCall.args.CodeContent` / `.ReplacementContent` /
@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`view_file`, `list_dir`, `grep_search`, ...) still summarize to
   `tool_family` + outcome only — Antigravity's `post-tool-use` payload does
   not echo back read/search results at all, so there is nothing to capture
-  for those.
+  for those. (#294)
 
 ## [1.19.2] - 2026-07-28
 
