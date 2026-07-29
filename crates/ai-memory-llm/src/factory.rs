@@ -15,7 +15,7 @@ use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
 use crate::auth::{AuthRequirement, ProviderAuth};
-use crate::embedding::{Embedder, OpenAiEmbedder, VoyageEmbedder};
+use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
 use crate::provider::LlmProvider;
@@ -110,6 +110,9 @@ pub enum EmbedderChoice {
     Voyage,
     /// Google Gemini Embeddings API (`embedContent`).
     Google,
+    /// OpenAI-compatible embeddings endpoint (Ollama / LM Studio /
+    /// vLLM). Keyless-capable; base URL, model, and dim are required.
+    OpenAiCompat,
 }
 
 impl EmbedderChoice {
@@ -121,6 +124,7 @@ impl EmbedderChoice {
             Self::OpenAi => "openai",
             Self::Voyage => "voyage",
             Self::Google => "google",
+            Self::OpenAiCompat => "openai-compat",
         }
     }
 }
@@ -135,38 +139,65 @@ pub struct EmbedderConfig {
     /// Vector dimensionality. Refused on mismatch with the stored
     /// pages' dim.
     pub dim: u32,
-    /// API key.
-    pub api_key: SecretString,
-    /// Optional base URL override.
+    /// API key. Required for openai/voyage/google; optional for
+    /// openai-compat (local engines such as Ollama run keyless).
+    pub api_key: Option<SecretString>,
+    /// Optional base URL override. Required for openai-compat.
     pub base_url: Option<String>,
+}
+
+impl EmbedderConfig {
+    fn require_api_key(&self) -> LlmResult<SecretString> {
+        self.api_key.clone().ok_or_else(|| {
+            LlmError::NotConfigured(format!(
+                "API key required for {} embeddings",
+                self.provider.name()
+            ))
+        })
+    }
 }
 
 /// Construct an `Arc<dyn Embedder>` from the config.
 ///
 /// # Errors
-/// Propagates HTTP-client construction errors.
+/// Returns [`LlmError::NotConfigured`] for a missing required API key
+/// or base URL; propagates HTTP-client construction errors.
 pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
     let arc: Arc<dyn Embedder> = match config.provider {
         EmbedderChoice::OpenAi => {
-            let mut e = OpenAiEmbedder::new(config.api_key, config.model, config.dim)?;
+            let key = config.require_api_key()?;
+            let mut e = OpenAiEmbedder::new(key, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
             }
             Arc::new(e)
         }
         EmbedderChoice::Voyage => {
-            let mut e = VoyageEmbedder::new(config.api_key, config.model, config.dim)?;
+            let key = config.require_api_key()?;
+            let mut e = VoyageEmbedder::new(key, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
             }
             Arc::new(e)
         }
         EmbedderChoice::Google => {
-            let mut e = GoogleEmbedder::new(config.api_key, config.model, config.dim)?;
+            let key = config.require_api_key()?;
+            let mut e = GoogleEmbedder::new(key, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
             }
             Arc::new(e)
+        }
+        EmbedderChoice::OpenAiCompat => {
+            let base = config
+                .base_url
+                .ok_or_else(|| LlmError::NotConfigured("AI_MEMORY_EMBEDDING_BASE_URL".into()))?;
+            Arc::new(OpenAiCompatEmbedder::new(
+                base,
+                config.api_key,
+                config.model,
+                config.dim,
+            )?)
         }
     };
     Ok(arc)
@@ -174,18 +205,20 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
 
 /// Default dim for known embedding models. Used when the operator
 /// omits `AI_MEMORY_EMBEDDING_DIM`. Falls back to a model-family
-/// default; unknown models still require an explicit dim.
+/// default; openai-compat (unknown self-hosted models) and unknown
+/// models return `None` and require an explicit dim.
 #[must_use]
-pub fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> u32 {
+pub fn default_embedding_dim(provider: EmbedderChoice, model: &str) -> Option<u32> {
     match (provider, model) {
-        (EmbedderChoice::OpenAi, "text-embedding-3-small") => 1536,
-        (EmbedderChoice::OpenAi, "text-embedding-3-large") => 3072,
-        (EmbedderChoice::OpenAi, _) => 1536,
-        (EmbedderChoice::Voyage, "voyage-3-large") => 1024,
-        (EmbedderChoice::Voyage, _) => 1024,
-        (EmbedderChoice::Google, "gemini-embedding-2") => 768,
-        (EmbedderChoice::Google, "gemini-embedding-001") => 768,
-        (EmbedderChoice::Google, _) => 768,
+        (EmbedderChoice::OpenAi, "text-embedding-3-small") => Some(1536),
+        (EmbedderChoice::OpenAi, "text-embedding-3-large") => Some(3072),
+        (EmbedderChoice::OpenAi, _) => Some(1536),
+        (EmbedderChoice::Voyage, "voyage-3-large") => Some(1024),
+        (EmbedderChoice::Voyage, _) => Some(1024),
+        (EmbedderChoice::Google, "gemini-embedding-2") => Some(768),
+        (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
+        (EmbedderChoice::Google, _) => Some(768),
+        (EmbedderChoice::OpenAiCompat, _) => None,
     }
 }
 

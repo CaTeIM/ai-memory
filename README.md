@@ -671,8 +671,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > default.
 
 Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
-you want vector reranking in addition to FTS5 + graph-neighbor retrieval.
+`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
+`openai-compat` when you want vector reranking in addition to FTS5 +
+graph-neighbor retrieval. `openai-compat` targets self-hosted engines
+(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
+`AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
+`AI_MEMORY_EMBEDDING_DIM`.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
