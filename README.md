@@ -673,7 +673,11 @@ observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
 an interrupted keyed replay finishes the wiki commit, queue insert, and key
-completion without duplicating that handoff.
+completion without duplicating that handoff. On the next SessionStart, the
+newest cwd-eligible automatic handoff wins; accepting it expires older eligible
+automatic handoffs without consuming manual or sibling-directory work. A new
+automatic handoff also expires prior open automatic handoffs from its exact
+cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
 
 Recommended defaults:
 

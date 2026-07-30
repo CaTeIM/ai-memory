@@ -124,9 +124,10 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        ActorContext, AgentKind, LinkTarget, ManagedRunId, NewHandoff, NewObservation, NewPage,
-        NewSession, NewWorkstreamEvent, ObservationId, ObservationKind, PageId, PagePath,
-        ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
+        ActorContext, AgentKind, HandoffId, HandoffState, LinkTarget, ManagedRunId, NewHandoff,
+        NewObservation, NewPage, NewSession, NewWorkstreamEvent, ObservationId, ObservationKind,
+        PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId,
+        WorkstreamEventKind,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -4803,6 +4804,7 @@ mod tests {
                 AgentKind::Codex,
                 None,
                 Some(run.run_id),
+                None,
             )
             .await
             .unwrap();
@@ -4830,6 +4832,7 @@ mod tests {
                 AgentKind::Codex,
                 None,
                 Some(run.run_id),
+                None,
             )
             .await
             .unwrap();
@@ -4848,6 +4851,71 @@ mod tests {
             Some(second_handoff),
             "a failed managed claim must roll back the handoff transition"
         );
+
+        async fn insert_auto_handoff(
+            store: &Store,
+            workspace_id: WorkspaceId,
+            project_id: ProjectId,
+            cwd: &str,
+        ) -> HandoffId {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id,
+                    project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: cwd.into(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                })
+                .await
+                .unwrap()
+        }
+
+        let stale_auto = insert_auto_handoff(&store, ws, proj, "/repo/api").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let selected_auto = insert_auto_handoff(&store, ws, proj, "/repo").await;
+        let rejected_auto = store
+            .writer
+            .accept_startup_context(
+                Some(selected_auto),
+                AgentKind::Codex,
+                None,
+                Some(run.run_id),
+                Some("/repo/api/src".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_auto, StartupContextAcceptance::default());
+        for handoff_id in [stale_auto, selected_auto] {
+            assert_eq!(
+                store
+                    .reader
+                    .handoff_by_id(handoff_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                HandoffState::Open,
+                "a rejected managed claim must not accept or expire automatic handoffs"
+            );
+        }
     }
 
     #[tokio::test]
