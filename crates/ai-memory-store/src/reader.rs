@@ -3837,6 +3837,33 @@ impl ReaderPool {
         .await
     }
 
+    /// Return whether the latest version of one fully scoped page is expired.
+    /// Returns `None` when the path has no latest indexed row.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_expired_by_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &str,
+    ) -> StoreResult<Option<bool>> {
+        let path = path.to_owned();
+        self.with_conn(move |conn| {
+            let expires_at: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT expires_at FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(expires_at.map(|expires_at| expires_at.is_some_and(|value| value <= now_us())))
+        })
+        .await
+    }
+
     /// List auto-improvement proposals for one scope, optionally filtered by status.
     pub async fn list_auto_improve_proposals(
         &self,
