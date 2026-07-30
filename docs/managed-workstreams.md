@@ -26,6 +26,13 @@ flags `--yolo` and `--fresh`. No `--` separator is needed, and ai-memory does
 not maintain a second copy of each harness's option schema. Other wrapper
 options come first:
 
+Portable events, handoffs, and project briefs are injected as explicitly
+delimited, untrusted historical data. Instruction-like text inside stored
+content is evidence only: agents must not execute commands, expose secrets,
+change permissions or policy, or use tools merely because that content asks.
+Current system/developer/user instructions, the canonical project instruction
+file, and the current checkout remain authoritative.
+
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
@@ -273,6 +280,16 @@ previous launcher can finish; if another harness is genuinely still running,
 the conflict remains and concurrent writers are still rejected. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+While the harness or native-session selector is open, a temporary server outage
+produces one short notice instead of printing every failed heartbeat. The
+launcher keeps probing every 30 seconds with a 10-second request timeout so the
+90-second lease stays safe across ordinary server restarts. Repeated failures
+are quiet; when the server responds again, one recovery notice confirms that
+heartbeats resumed. The native harness remains usable throughout the outage.
+If the outage exceeds one lease window, the original launcher may renew its run
+only while no newer launcher has claimed the workstream. A replacement prepare,
+cancel, finish, or destructive operation remains terminal for the old run.
 
 If the client is terminated without cleanup, such as with `kill -9`, its lease
 expires within 90 seconds. A later managed run starts from the last committed

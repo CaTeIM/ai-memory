@@ -105,6 +105,11 @@ from hook paths.
    targeted proposals (default `_rules/` and `procedures/`) must pass the
    configured executable JSON contract before they are staged; failures become
    rejected candidates/rejection-buffer entries rather than wiki writes.
+   Every LLM prompt treats repository text, observations, wiki pages, and prior
+   proposals as untrusted data rather than instructions. The same explicit
+   trust boundary and delimiters precede automatically injected handoffs,
+   project briefs, and managed-workstream packets; current instructions and
+   checkout state remain authoritative.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
    the same RRF. Before final truncation, a bounded authority multiplier

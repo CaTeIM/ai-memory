@@ -4424,7 +4424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_run_heartbeat_extends_only_a_live_lease() {
+    async fn managed_run_heartbeat_extends_only_an_active_run() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let (ws, proj) = open_managed_scope(&store, "managed-heartbeat").await;
@@ -4449,10 +4449,11 @@ mod tests {
             "heartbeat must extend the lease"
         );
 
-        // A lease that already lapsed cannot be revived by a heartbeat.
+        // A still-active launcher can recover after the server was unavailable
+        // for longer than one lease window.
         set_managed_run_lease(store.db_path(), run.run_id, 1);
         assert!(
-            !store
+            store
                 .writer
                 .heartbeat_managed_run(run.run_id)
                 .await
@@ -4478,6 +4479,34 @@ mod tests {
             !store
                 .writer
                 .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+
+        // Once another prepare transaction has claimed the workstream, the
+        // superseded run is terminal and cannot displace the replacement.
+        let superseded = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:superseded"))
+            .await
+            .unwrap();
+        set_managed_run_lease(store.db_path(), superseded.run_id, 1);
+        let replacement = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:replacement"))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .writer
+                .heartbeat_managed_run(superseded.run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .writer
+                .cancel_managed_run(replacement.run_id)
                 .await
                 .unwrap()
         );

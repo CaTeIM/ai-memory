@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.2] - 2026-07-30
+
+### Fixed
+- Docker build contexts now exclude the gitignored operator deployment files,
+  preventing local server configuration and production environment secrets
+  from being sent to the Docker builder. A packaging regression test keeps the
+  exclusions as the final ignore rules so later negations cannot re-include
+  them. (#314)
+- Managed workstream heartbeats now bound each server request and condense an
+  outage into one short notice plus one recovery notice. Active launchers keep
+  the lease-safe 30-second retry cadence without printing the same timeout on
+  every attempt, and may renew their original run after a longer outage unless
+  another launcher has already claimed the workstream. (#311)
+
+## [1.20.1] - 2026-07-30
+
+### Fixed
+- Managed workstream packets, handoffs, project briefs, MCP routing prompts,
+  and all LLM maintenance prompts now identify stored project material as
+  untrusted historical data rather than executable instructions. This limits
+  persistent prompt injection through captured prompts, tool output, wiki
+  pages, commit messages, or another authenticated user's shared content.
+  (#302)
+- Docker wrapper installation and self-upgrade now use checksum-verified assets
+  from the latest GitHub Release instead of executing the mutable `main` branch.
+  The standalone hook installer and hook bundle use the same verified release
+  path and install only the expected hook members without extracting arbitrary
+  archive paths. Release jobs publish POSIX/Windows wrapper and hook assets with
+  SHA-256 companions, all GitHub Actions are commit-pinned, and default
+  workflow permissions are read-only outside the release publisher.
+  (#302)
+
+## [1.20.0] - 2026-07-30
+
 ### Added
 - Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
   `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
@@ -2564,7 +2598,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.19.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.20.2...HEAD
+[1.20.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.2
+[1.20.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.1
+[1.20.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.0
 [1.19.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.2
 [1.19.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.1
 [1.19.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.0
