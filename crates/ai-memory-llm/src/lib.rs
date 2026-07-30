@@ -61,7 +61,7 @@ pub use embedding::{
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
-    default_embedding_dim,
+    default_embedding_dim, try_default_embedding_dim,
 };
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
