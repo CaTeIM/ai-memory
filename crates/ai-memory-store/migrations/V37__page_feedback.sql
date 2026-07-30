@@ -6,7 +6,9 @@
 -- `pages.salience` is NULL for every existing page, which the decay
 -- math reads as "use salience_default" — so behaviour is unchanged
 -- until a page actually receives feedback. It is a derived value:
--- `page_feedback` is the append-only source of truth.
+-- `page_feedback` is the append-only source of truth. Each row stores
+-- the post-signal salience so the derived page value can be rebuilt even
+-- if the configured default changes later.
 --
 -- Feedback attaches to a page *version* (`page_id`), so rewriting a
 -- flagged page retires both its salience and its lint findings: the
@@ -24,6 +26,7 @@ CREATE TABLE page_feedback (
     -- surface the page in memory_lint reports.
     kind          TEXT NOT NULL CHECK (kind IN ('helpful', 'not_helpful', 'stale', 'wrong')),
     reason        TEXT,
+    salience_after REAL NOT NULL CHECK (salience_after BETWEEN 0.25 AND 2.0),
     author_id     BLOB REFERENCES users(id) ON DELETE SET NULL,
     created_at    INTEGER NOT NULL
 );

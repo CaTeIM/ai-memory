@@ -2138,13 +2138,13 @@ impl ReaderPool {
                         (SELECT reason FROM page_feedback r \
                           WHERE r.page_id = f.page_id AND r.kind = f.kind \
                             AND r.reason IS NOT NULL \
-                          ORDER BY r.created_at DESC LIMIT 1) AS reason \
+                          ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
                  FROM page_feedback f \
                  JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
                  WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
                    AND f.kind IN ('stale', 'wrong') \
-                 GROUP BY pg.path, f.kind \
-                 ORDER BY latest DESC",
+                 GROUP BY f.page_id, pg.path, f.kind \
+                 ORDER BY latest DESC, pg.path ASC, f.kind ASC",
             )?;
             let rows = stmt.query_map(
                 params![workspace_id.as_bytes(), project_id.as_bytes()],
