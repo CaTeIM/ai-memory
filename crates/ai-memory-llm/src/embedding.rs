@@ -79,7 +79,7 @@ impl OpenAiEmbedder {
         // (small model, but still up to ~30s on first request after
         // unload). Subsequent requests with OLLAMA_KEEP_ALIVE warm are
         // sub-second. When the embedder still fails, memory_query
-        // degrades gracefully to BM25-only (see server.rs).
+        // degrades gracefully to FTS5 + graph (see server.rs).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;
@@ -365,7 +365,7 @@ impl VoyageEmbedder {
         // (small model, but still up to ~30s on first request after
         // unload). Subsequent requests with OLLAMA_KEEP_ALIVE warm are
         // sub-second. When the embedder still fails, memory_query
-        // degrades gracefully to BM25-only (see server.rs).
+        // degrades gracefully to FTS5 + graph (see server.rs).
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()?;

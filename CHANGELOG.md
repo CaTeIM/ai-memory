@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `memory_query` gained an optional `explain: true` mode for project and
+  explicit-scope searches. Each compiled-page hit then includes its 1-based
+  FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link
+  direction; per-stream RRF contributions; fused score; and bounded authority
+  multiplier. `streams_active` makes vector degradation visible. Global
+  cross-project search reports its distinct FTS-only stream but does not attach
+  RRF details to `global_hits`. Explain provenance is computed only when
+  requested. (#317)
 - Per-project consolidation instructions: write a reserved
   `_prompts/consolidation.md` wiki page (via `memory_write_page` or on
   disk - no config key) and its body is appended to both single-page and
@@ -18,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema-subordinate system-prompt contract. `memory_consolidate` also gained
   an optional `instructions` argument that overrides the page for one call;
   TTL-expired standing pages are ignored. (#316)
+
+### Fixed
+- Zero-LLM `memory_query` now keeps graph-neighbour expansion active instead
+  of falling back to FTS5 alone when no query embedding exists. Equal adjusted
+  hybrid and explicit multi-scope scores now use a deterministic path
+  tiebreak. (#317)
 
 ## [1.20.2] - 2026-07-30
 
@@ -54,20 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.20.0] - 2026-07-30
 
 ### Added
-- `memory_query` explain mode: pass `explain: true` and every hit carries
-  `score_details` — its 1-based rank and raw score in each retrieval
-  stream (FTS5 bm25 score, embedding cosine, graph-neighbour provenance
-  naming the seed page and link direction), the per-stream RRF
-  contributions, the fused score, and the bounded page-authority
-  multiplier applied after fusion — plus a top-level `streams_active`
-  list that makes degradation visible (an embedder failure shows up as
-  `["fts"]` instead of `["fts","vector","graph"]`). Reporting the
-  authority factor alongside `fused` is what keeps the surface honest:
-  the returned `rank` is the fused score *after* that multiplier, so
-  `fused` alone would not account for the ordering. Costs nothing extra:
-  the data was already computed and discarded. Hybrid ranking also gained
-  a deterministic path tiebreak for equal adjusted scores, which
-  previously fell back to hash-map iteration order.
 - Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
   `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
   `pages.expires_at` column (V36) and settable through a new optional
@@ -358,16 +358,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the complete response has been assembled; a failed or racing
   ledger claim cannot consume the handoff or suppress retry delivery.
   (#235)
-
-### Fixed
-- `memory_query` no longer skips the hybrid retrieval path when no
-  embedder is configured. The search branched to plain FTS5 whenever a
-  query vector was absent, which silently dropped the graph-neighbour
-  stream from every zero-LLM deployment — the documented default — and
-  would have left the new `explain` output reporting a single active
-  stream. All streams now run through one path; each contributes
-  nothing when its own input is missing, which is what the vector
-  stream already did.
 
 ## [1.18.0] - 2026-07-23
 

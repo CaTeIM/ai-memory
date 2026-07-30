@@ -2186,7 +2186,7 @@ impl ReaderPool {
                  SELECT id, path, title, snippet, stream_ord \
                  FROM neighbors \
                  WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = neighbors.id) \
-                 ORDER BY stream_ord ASC, updated_at DESC"
+                 ORDER BY stream_ord ASC, updated_at DESC, path ASC"
             )
             .expect("writing SQL into String cannot fail");
 
@@ -2316,7 +2316,7 @@ impl ReaderPool {
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
         Ok(self
-            .hybrid_search_explained(
+            .hybrid_search_inner(
                 workspace_id,
                 project_id,
                 query,
@@ -2326,6 +2326,7 @@ impl ReaderPool {
                 dim,
                 limit,
                 expiry_cutoff_us,
+                false,
             )
             .await?
             .into_iter()
@@ -2335,8 +2336,8 @@ impl ReaderPool {
 
     /// [`Self::hybrid_search`] plus a [`SearchExplain`] per hit — the
     /// per-stream ranks, raw scores, and RRF contributions the fusion
-    /// otherwise discards. Computing them is free (the data is already
-    /// in hand); callers that don't need them use `hybrid_search`.
+    /// otherwise discards. Callers that don't need the bounded provenance
+    /// bookkeeping use `hybrid_search`.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2353,6 +2354,39 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
+        Ok(self
+            .hybrid_search_inner(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                true,
+            )
+            .await?
+            .into_iter()
+            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hybrid_search_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        explain: bool,
+    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
@@ -2396,32 +2430,23 @@ impl ReaderPool {
 
         let mut seed_seen = std::collections::HashSet::new();
         let mut seed_ids = Vec::new();
-        for id in fts_hits
-            .iter()
-            .map(|h| h.id)
-            .chain(vec_hits.iter().map(|(id, _, _)| *id))
-        {
-            if seed_seen.insert(id) {
-                seed_ids.push(id);
+        let mut seed_paths = explain.then(Vec::new);
+        for hit in &fts_hits {
+            if seed_seen.insert(hit.id) {
+                seed_ids.push(hit.id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(hit.path.as_str().to_string());
+                }
             }
         }
-        // seed_ord → seed path, for graph provenance in the explain.
-        let seed_paths: Vec<String> = seed_ids
-            .iter()
-            .map(|id| {
-                fts_hits
-                    .iter()
-                    .find(|h| h.id == *id)
-                    .map(|h| h.path.as_str().to_string())
-                    .or_else(|| {
-                        vec_hits
-                            .iter()
-                            .find(|(vid, _, _)| vid == id)
-                            .map(|(_, p, _)| p.as_str().to_string())
-                    })
-                    .unwrap_or_default()
-            })
-            .collect();
+        for (id, path, _) in &vec_hits {
+            if seed_seen.insert(*id) {
+                seed_ids.push(*id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(path.as_str().to_string());
+                }
+            }
+        }
         let graph_hits = self
             .graph_neighbors_for_project_explained(
                 workspace_id,
@@ -2438,7 +2463,8 @@ impl ReaderPool {
             path: PagePath,
             title: String,
             snippet: String,
-            explain: SearchExplain,
+            score: f64,
+            explain: Option<SearchExplain>,
         }
         let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
@@ -2448,12 +2474,16 @@ impl ReaderPool {
                 path: h.path.clone(),
                 title: h.title.clone(),
                 snippet: h.snippet.clone(),
-                explain: SearchExplain::default(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
             });
-            entry.explain.fts_rank = Some(rank + 1);
-            entry.explain.fts_score = Some(h.rank);
-            entry.explain.rrf.fts = contrib;
-            entry.explain.fused += contrib;
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.fts_rank = Some(rank + 1);
+                details.fts_score = Some(h.rank);
+                details.rrf.fts = contrib;
+                details.fused += contrib;
+            }
         }
         for (rank, (id, path, cosine)) in vec_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
@@ -2461,12 +2491,16 @@ impl ReaderPool {
                 path: path.clone(),
                 title: String::new(),
                 snippet: String::new(),
-                explain: SearchExplain::default(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
             });
-            entry.explain.vector_rank = Some(rank + 1);
-            entry.explain.cosine = Some(*cosine);
-            entry.explain.rrf.vector = contrib;
-            entry.explain.fused += contrib;
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.vector_rank = Some(rank + 1);
+                details.cosine = Some(*cosine);
+                details.rrf.vector = contrib;
+                details.fused += contrib;
+            }
         }
         for (rank, n) in graph_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
@@ -2474,18 +2508,26 @@ impl ReaderPool {
                 path: n.hit.path.clone(),
                 title: n.hit.title.clone(),
                 snippet: n.hit.snippet.clone(),
-                explain: SearchExplain::default(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
             });
-            entry.explain.graph_rank = Some(rank + 1);
-            entry.explain.graph_via = Some(GraphVia {
-                seed_path: seed_paths.get(n.seed_ord).cloned().unwrap_or_default(),
-                direction: if n.incoming { "incoming" } else { "outgoing" },
-            });
-            entry.explain.rrf.graph = contrib;
-            entry.explain.fused += contrib;
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.graph_rank = Some(rank + 1);
+                details.graph_via = Some(GraphVia {
+                    seed_path: seed_paths
+                        .as_ref()
+                        .and_then(|paths| paths.get(n.seed_ord))
+                        .cloned()
+                        .unwrap_or_default(),
+                    direction: if n.incoming { "incoming" } else { "outgoing" },
+                });
+                details.rrf.graph = contrib;
+                details.fused += contrib;
+            }
         }
 
-        let mut out: Vec<(PageHit, SearchExplain)> = fused
+        let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
             .into_iter()
             .map(|(id, entry)| {
                 (
@@ -2494,7 +2536,7 @@ impl ReaderPool {
                         path: entry.path,
                         title: entry.title,
                         snippet: entry.snippet,
-                        rank: -entry.explain.fused, // lower = better (matches FTS5 convention)
+                        rank: -entry.score, // lower = better (matches FTS5 convention)
                     },
                     entry.explain,
                 )
@@ -2514,7 +2556,9 @@ impl ReaderPool {
                 // `fused` stays the raw RRF sum; without the multiplier
                 // beside it the explain could not account for the rank it
                 // returns, which is the whole point of the surface.
-                explain.authority = Some(authority.factor);
+                if let Some(details) = explain {
+                    details.authority = Some(authority.factor);
+                }
             }
         }
         out.sort_by(|a, b| {

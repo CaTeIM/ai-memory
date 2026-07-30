@@ -191,7 +191,9 @@ priors are at the [bottom](#influences-and-prior-art).
   (plus vector similarity when an embedder is configured). Pages are
   LLM-consolidated, so the hit is a coherent decision page, not a raw
   chat log. Pass `explain: true` to see why each hit ranked where it
-  did.
+  did in project or explicit-scope retrieval. Cross-project
+  `global: true` search uses its separate FTS-only ranker and reports
+  that active stream without per-hit RRF details.
 - **"Remember this permanently."** When something is worth keeping
   beyond auto-captured session logs - a decision, a convention, a
   gotcha - tell the agent "save a permanent note that we standardised
