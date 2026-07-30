@@ -215,7 +215,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_handoff_begin` | Mark session boundary, write handoff | destructive |
 | `memory_handoff_accept` | Fetch + ack the latest open handoff | destructive |
 | `memory_handoff_cancel` | Mark an exact mistakenly-created open handoff expired | destructive |
-| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out) | destructive |
+| `memory_consolidate` | LLM-driven page rewrite (`multi_page=true` for atomic fan-out); target-project `_prompts/consolidation.md` supplies bounded untrusted advisory preferences and `instructions` overrides them once | destructive |
 | `memory_auto_improve` | Manual learning review for a completed session; the server also schedules review for new sessions, and manual-review opt-in keeps proposals pending | write |
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |

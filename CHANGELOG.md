@@ -10,14 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Per-project consolidation instructions: write a reserved
   `_prompts/consolidation.md` wiki page (via `memory_write_page` or on
-  disk — no config key) and its body is appended to both single-page and
-  multi-page consolidation prompts as operator guidance ("prefer
+  disk - no config key) and its body is appended to both single-page and
+  multi-page consolidation prompts as advisory preferences ("prefer
   Portuguese titles", "skip CI noise", ...). The block is scrubbed
-  through the configured sanitizer, clipped to ~2000 chars, and injected
-  into the LLM *user message* inside `<<< >>>` markers with explicit
-  schema-rules-win framing — never the system prompt — bounding the
-  prompt-injection blast radius. `memory_consolidate` also gains an
-  optional `instructions` argument that overrides the page for one call.
+  through the configured sanitizer, capped at 2,000 characters, JSON-encoded,
+  and injected into the LLM user message under an explicitly untrusted,
+  schema-subordinate system-prompt contract. `memory_consolidate` also gained
+  an optional `instructions` argument that overrides the page for one call;
+  TTL-expired standing pages are ignored. (#316)
 
 ## [1.20.2] - 2026-07-30
 

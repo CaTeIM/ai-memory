@@ -137,8 +137,8 @@ impl Wiki {
     }
 
     /// Borrow the configured sanitizer, so components holding a `Wiki`
-    /// (e.g. the consolidator scrubbing operator-provided prompt
-    /// instructions) reuse the operator's patterns instead of
+    /// (e.g. the consolidator scrubbing project-provided prompt
+    /// preferences) reuse the operator's patterns instead of
     /// constructing a second, built-in-only instance.
     #[must_use]
     pub fn sanitizer(&self) -> &Sanitizer {
