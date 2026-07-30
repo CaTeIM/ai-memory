@@ -75,7 +75,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Where did we leave off?" | Existing handoff block, or `memory_handoff_accept` if no block exists | Resumes from the latest pending handoff. |
 | "Save context for the next session" | `memory_handoff_begin` | Writes a terse session-end handoff with open questions and next steps. Do not use for status or briefing requests. |
 | "Discard that handoff" / "I created a handoff by mistake" | `memory_handoff_cancel` | Marks an exact open handoff id expired before the next session can consume it. |
-| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
+| "Consolidate this session" | `memory_consolidate` | Manually runs LLM consolidation. A project can keep advisory preferences in `_prompts/consolidation.md`; `instructions` overrides them for one call. Also runs on PreCompact, and at session end only when `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` is set (off by default; session end otherwise writes a rule-based summary page). Opt-in SessionEnd provider work is durably queued outside the hook response, retried with backoff, and recovered after server restart. Resumed sessions re-end only when their persisted observation generation advances, so duplicate delivery and clock skew cannot loop consolidation. |
 | "What did we learn from this session?" / "what memory should we add?" | `memory_auto_improve` | Manually reviews the latest completed session by default. The server also runs scheduled auto-improvement for new completed sessions when an LLM is configured. `[auto_improve.scheduler] enabled = false` disables automatic review; `[auto_improve] require_approval = true` leaves scheduled and manual proposals in pending-writes for review. |
 | "Remember this permanently" / "add an annotation" | `memory_write_page` | Writes durable wiki knowledge; not a single-use handoff. |
 | "Remember this until Friday" / "expire this after the migration" | `memory_write_page` with `expires_at` | Writes a time-bounded page. Use RFC3339 or `YYYY-MM-DD` (end of day UTC); normal retrieval hides it after expiry and the next forget sweep deletes it. TTL outranks `pinned`. |
@@ -323,6 +323,23 @@ docker cp ai-memory:/data/wiki ./my-ai-memory-wiki
 # Time-travel:
 docker exec ai-memory git -C /data/wiki log --oneline
 ```
+
+## Project consolidation preferences
+
+Create `_prompts/consolidation.md` in a project's wiki when its compiled pages
+need stable style, terminology, emphasis, or noise-filtering preferences. For
+example, its body may ask for Portuguese titles or omit routine CI output.
+Automatic consolidation and both manual modes read only the target project's
+page. Passing `instructions` to `memory_consolidate` replaces that page for one
+call without modifying it.
+
+The page and per-call value remain untrusted project data. ai-memory applies the
+configured sanitizer, caps the value at 2,000 characters, and JSON-encodes it in
+the LLM user message. Both consolidation system prompts permit only advisory
+style, terminology, emphasis, and noise-filtering effects; the value cannot add
+facts, authorize disclosure or tool use, or override schema, evidence, and
+output rules. TTL-expired preference pages are ignored. When there is no active
+page and no argument, ai-memory appends no preference block.
 
 ## Rules vs facts
 

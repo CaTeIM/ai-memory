@@ -210,6 +210,7 @@ async fn run_session_consolidation_worker(
             false,
             ai_memory_core::ActorContext::anonymous(),
             None,
+            None,
         );
         tokio::pin!(consolidation);
         let result = tokio::select! {

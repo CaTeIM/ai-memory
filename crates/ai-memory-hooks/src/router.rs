@@ -2427,6 +2427,7 @@ async fn consolidate_or_synth(
                 false,
                 ai_memory_core::ActorContext::anonymous(),
                 None,
+                None,
             )
             .await?;
         debug!(

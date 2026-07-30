@@ -701,6 +701,17 @@ automatic handoffs without consuming manual or sibling-directory work. A new
 automatic handoff also expires prior open automatic handoffs from its exact
 cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
 
+To keep consolidation style project-specific, write
+`_prompts/consolidation.md` in that project's wiki. Its body can express
+preferences such as "prefer Portuguese titles" or "omit routine CI noise".
+Automatic, single-page, and multi-page consolidation use the page; a manual
+`memory_consolidate` call can pass `instructions` to override it once. ai-memory
+sanitizes and caps the value at 2,000 characters, JSON-encodes it in the user
+message, and treats it as untrusted advisory data. It cannot supply facts,
+request tool use or disclosure, or override the consolidation schema and
+faithfulness rules. TTL-expired preference pages are ignored. With no active
+page or argument, no preference block is appended.
+
 Recommended defaults:
 
 | Provider | Default | Use when |

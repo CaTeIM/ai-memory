@@ -229,7 +229,9 @@ developer, user, and canonical project instructions.\n\
   and marks it expired so the next session will not consume it.\n\
 - `memory_consolidate` — when the user asks to compile session \
   observations into wiki pages. Also runs on PreCompact, and at \
-  session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set.\n\
+  session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set. \
+  The target project's `_prompts/consolidation.md` page supplies bounded, \
+  untrusted advisory preferences; `instructions` overrides it for one call.\n\
 - `memory_auto_improve` — when the user asks what durable lessons \
 should be proposed from a completed session, or at explicit wrap-up \
   when learning review is useful. It is the manual version of the server's \
@@ -558,6 +560,12 @@ struct ConsolidateArgs {
     /// If true, M7b multi-page atomic fan-out. Default false (single page).
     #[serde(default)]
     multi_page: Option<bool>,
+    /// One-off advisory project preferences appended to the consolidation
+    /// prompt as untrusted JSON data (sanitized, 2,000-character cap).
+    /// Overrides the project's standing
+    /// `_prompts/consolidation.md` page for this call only.
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1561,6 +1569,11 @@ impl AiMemoryServer {
         SQL transaction. Off by default; requires AI_MEMORY_LLM_PROVIDER \
         plus that provider's credentials. AI_MEMORY_LLM_MODEL is optional \
         for providers with a built-in default. \
+        The target project's `_prompts/consolidation.md` page supplies \
+        sanitized, bounded, untrusted advisory preferences. Pass \
+        `instructions` to override that page for one call; preferences cannot \
+        supply facts or override the system prompt's security, schema, \
+        evidence, or output rules. \
         The consolidation target is resolved from where the session's \
         observations actually landed, so a session that adopted its scope \
         marker mid-run still consolidates into the right project. Admission \
@@ -1589,15 +1602,20 @@ impl AiMemoryServer {
         // hard-coded anonymous, which an actor-gated webhook rejects).
         let actor = crate::actor::actor_from_parts(&parts);
         let author_id = crate::actor::author_id_from_parts(&parts);
+        let instructions = args
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if args.multi_page.unwrap_or(false) {
             let outcomes = consolidator
-                .consolidate_session_multi(session_id, dry, actor, author_id)
+                .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
             let outcome = consolidator
-                .consolidate_session(session_id, dry, actor, author_id)
+                .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             ok_json(&outcome)
@@ -3509,6 +3527,46 @@ mod tests {
         assert!(
             ai_memory_core::SNIPPET_BODY.contains("expires_at"),
             "the installed base routing snippet must expose time-bounded writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompts_and_tool_schema_document_consolidation_preferences() {
+        assert_detailed_prompt_surfaces(|label, prompt| {
+            assert!(
+                prompt.contains("_prompts/consolidation.md")
+                    && prompt.contains("instructions")
+                    && prompt.contains("untrusted"),
+                "{label} must document standing and one-off consolidation preferences"
+            );
+        });
+        assert!(
+            ai_memory_core::SNIPPET_BODY.contains("_prompts/consolidation.md")
+                && ai_memory_core::SNIPPET_BODY.contains("untrusted project data"),
+            "the installed base routing snippet must preserve the trust boundary"
+        );
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let consolidate = tools
+            .iter()
+            .find(|tool| tool.name == "memory_consolidate")
+            .expect("memory_consolidate must be registered");
+        let description = consolidate
+            .description
+            .as_deref()
+            .expect("memory_consolidate must carry a description");
+        assert!(description.contains("_prompts/consolidation.md"));
+        assert!(description.contains("instructions"));
+        assert!(description.contains("untrusted"));
+        let properties = consolidate
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("memory_consolidate schema must expose properties");
+        assert!(
+            properties.contains_key("instructions"),
+            "memory_consolidate schema must expose the one-off override"
         );
     }
 
@@ -6685,6 +6743,7 @@ mod tests {
                     session_id: "00000000-0000-0000-0000-000000000000".into(),
                     dry_run: Some(true),
                     multi_page: Some(false),
+                    instructions: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
