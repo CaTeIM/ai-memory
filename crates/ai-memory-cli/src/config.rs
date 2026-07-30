@@ -102,7 +102,8 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
-    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`).
+    /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
+    /// or `openai-compat`).
     pub embedding_provider: Option<String>,
     /// Optional embedding model override.
     pub embedding_model: Option<String>,
@@ -782,9 +783,11 @@ impl Config {
             "openai" => EmbedderChoice::OpenAi,
             "voyage" => EmbedderChoice::Voyage,
             "google" | "gemini" => EmbedderChoice::Google,
+            "openai-compat" | "openai_compat" => EmbedderChoice::OpenAiCompat,
             other => {
                 return Err(LlmError::NotConfigured(format!(
-                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of openai|voyage|google|gemini"
+                    "AI_MEMORY_EMBEDDING_PROVIDER={other} not one of \
+                     openai|voyage|google|gemini|openai-compat"
                 )));
             }
         };
@@ -794,11 +797,32 @@ impl Config {
                 EmbedderChoice::OpenAi => "text-embedding-3-small".to_string(),
                 EmbedderChoice::Voyage => "voyage-3".to_string(),
                 EmbedderChoice::Google => ai_memory_llm::GOOGLE_DEFAULT_EMBED_MODEL.to_string(),
+                EmbedderChoice::OpenAiCompat => {
+                    return Err(LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_MODEL must be set explicitly for openai-compat \
+                         (no safe default for self-hosted engines)"
+                            .into(),
+                    ));
+                }
             },
         };
-        let dim = self
-            .embedding_dim
-            .unwrap_or_else(|| ai_memory_llm::default_embedding_dim(provider, &model));
+        let dim = match self.embedding_dim {
+            Some(0) => {
+                return Err(LlmError::NotConfigured(
+                    "AI_MEMORY_EMBEDDING_DIM must be greater than zero".into(),
+                ));
+            }
+            Some(d) => d,
+            None => {
+                ai_memory_llm::try_default_embedding_dim(provider, &model).ok_or_else(|| {
+                    LlmError::NotConfigured(
+                        "AI_MEMORY_EMBEDDING_DIM must be set explicitly for openai-compat \
+                         (self-hosted model dims vary)"
+                            .into(),
+                    )
+                })?
+            }
+        };
         let api_key = match provider {
             EmbedderChoice::OpenAi => self.openai_embedding_api_key()?,
             EmbedderChoice::Voyage => self
@@ -809,13 +833,26 @@ impl Config {
             EmbedderChoice::Google => self.runtime_env.gemini_api_key.clone().ok_or_else(|| {
                 LlmError::NotConfigured("GEMINI_API_KEY or GOOGLE_API_KEY".into())
             })?,
+            // Keyless engines (Ollama, LM Studio) are the norm; a
+            // gateway key rides on LLM_API_KEY when present.
+            EmbedderChoice::OpenAiCompat => self
+                .runtime_env
+                .llm_api_key
+                .clone()
+                .unwrap_or_else(|| SecretString::from(String::new())),
         };
+        let base_url = self.embedding_base_url.clone();
+        if provider == EmbedderChoice::OpenAiCompat && non_empty(base_url.as_deref()).is_none() {
+            return Err(LlmError::NotConfigured(
+                "AI_MEMORY_EMBEDDING_BASE_URL required for openai-compat embeddings".into(),
+            ));
+        }
         Ok(Some(EmbedderConfig {
             provider,
             model,
             dim,
             api_key,
-            base_url: self.embedding_base_url.clone(),
+            base_url,
         }))
     }
 
@@ -1220,6 +1257,72 @@ mod tests {
             embedder.base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
+    }
+
+    #[test]
+    fn openai_compat_embedding_is_keyless_and_requires_explicit_settings() {
+        // Fully specified, no key: valid (Ollama / LM Studio).
+        let cfg = Config {
+            embedding_provider: Some("openai-compat".into()),
+            embedding_model: Some("nomic-embed-text".into()),
+            embedding_dim: Some(768),
+            embedding_base_url: Some("http://localhost:11434/v1".into()),
+            ..Config::default()
+        };
+        let embedder = cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.provider, EmbedderChoice::OpenAiCompat);
+        assert_eq!(embedder.model, "nomic-embed-text");
+        assert_eq!(embedder.dim, 768);
+        assert!(embedder.api_key.expose_secret().is_empty());
+        assert_eq!(
+            embedder.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+
+        // A gateway key rides on LLM_API_KEY when present.
+        let cfg_with_key = Config {
+            runtime_env: RuntimeEnv {
+                llm_api_key: Some(SecretString::from("sk-or-key")),
+                ..RuntimeEnv::default()
+            },
+            ..cfg.clone()
+        };
+        let embedder = cfg_with_key.embedder_config().unwrap().unwrap();
+        assert_eq!(embedder.api_key.expose_secret(), "sk-or-key");
+
+        // Missing model / dim / base URL each fail closed.
+        let missing_model = Config {
+            embedding_model: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_model.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_MODEL")
+        ));
+        let missing_dim = Config {
+            embedding_dim: None,
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            missing_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_DIM")
+        ));
+        let zero_dim = Config {
+            embedding_dim: Some(0),
+            ..cfg.clone()
+        };
+        assert!(matches!(
+            zero_dim.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("greater than zero")
+        ));
+        let missing_base = Config {
+            embedding_base_url: None,
+            ..cfg
+        };
+        assert!(matches!(
+            missing_base.embedder_config().unwrap_err(),
+            LlmError::NotConfigured(msg) if msg.contains("AI_MEMORY_EMBEDDING_BASE_URL")
+        ));
     }
 
     #[test]

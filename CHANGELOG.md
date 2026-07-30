@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New `openai-compat` embedding provider for self-hosted engines
+  (Ollama, LM Studio, vLLM). Set
+  `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` together with explicit
+  `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
+  `AI_MEMORY_EMBEDDING_DIM` — there is no safe default model or
+  dimensionality for a self-hosted engine, so each is required rather
+  than guessed. Unlike the other providers it is keyless: a bearer
+  token is sent only when `LLM_API_KEY` is present, for gateways that
+  want one. Embeddings are stored under their own
+  `provider="openai-compat"` identity, so switching an existing
+  `openai`+base-URL setup over changes the stored
+  `{provider, model, dim}` triple — run `ai-memory embed --force` to
+  re-embed. (#300)
+
 ### Fixed
 - Antigravity CLI's `PreInvocation` hook now maps only its documented
   `invocationNum = 0` call to ai-memory's synthetic `SessionStart`. Later model

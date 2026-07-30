@@ -55,11 +55,13 @@ pub use copilot::{
     GITHUB_ACCESS_TOKEN_URL, GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_URL,
     GITHUB_DEVICE_CODE_URL,
 };
-pub use embedding::{Embedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine};
+pub use embedding::{
+    Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, SyntheticEmbedder, VoyageEmbedder, cosine,
+};
 pub use error::{LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
-    default_embedding_dim,
+    default_embedding_dim, try_default_embedding_dim,
 };
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};

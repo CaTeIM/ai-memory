@@ -41,7 +41,7 @@
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
-| Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
+| Embedding providers | Supported | OpenAI, Voyage, Google Gemini, and keyless OpenAI-compatible endpoints such as Ollama, LM Studio, and vLLM. |
 
 ## What it is
 
@@ -727,11 +727,14 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
 Embeddings are optional and separate from the LLM provider. Set
-`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
-you want vector reranking in addition to FTS5 + graph-neighbor retrieval.
-Both the FTS-only and hybrid paths apply the same bounded page-authority
-adjustment after candidate generation; embeddings improve relevance recall but
-do not decide which source is canonical.
+`AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
+`openai-compat` when you want vector reranking in addition to FTS5 +
+graph-neighbor retrieval. `openai-compat` targets self-hosted engines
+(Ollama, LM Studio, vLLM): it needs no API key and requires explicit
+`AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
+`AI_MEMORY_EMBEDDING_DIM`. Both the FTS-only and hybrid paths apply the same
+bounded page-authority adjustment after candidate generation; embeddings
+improve relevance recall but do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and

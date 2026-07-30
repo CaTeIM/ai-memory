@@ -89,7 +89,7 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 ## 5. Embedding & LLM
 
 **Embeddings:**
-- The original prototype proposed a default local `ort` / `fastembed-rs` model. The shipped v1 posture is instead **off by default**, with opt-in OpenAI, Voyage, or Google Gemini embeddings. Local ONNX embeddings remain future work; the current provider and model reference lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+- The original prototype proposed a default local `ort` / `fastembed-rs` model. The shipped v1 posture is instead **off by default**, with opt-in OpenAI, Voyage, Google Gemini, or keyless OpenAI-compatible embeddings. The compatible path requires an explicit base URL, model, and dimension because self-hosted engines have no safe common defaults, and it uses a distinct provider identity to prevent vector-family mixing. Local ONNX embeddings remain future work; the current provider and model reference lives in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - Persist `{provider, model, dim}` next to every vector. On mismatch, warn and ignore stale vectors until `ai-memory embed --force` or scheduled backfill re-embeds them (agentmemory #469 lesson, without blocking startup).
 - Any future local model cache belongs under `<data_dir>/models/`, never `/tmp` (basic-memory #741).
 - The shipped provider implementations share the `Embedder` trait and are selected through typed configuration.

@@ -505,13 +505,20 @@ Copilot chat endpoint.
 
 **Embedder env** (opt-in):
 ```
-AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini
+AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat
 AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
-AI_MEMORY_EMBEDDING_BASE_URL   optional OpenAI-compatible embeddings endpoint
-AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google)
+AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
+AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
+                               required explicitly for openai-compat
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
-LLM_API_KEY                    accepted for openai embeddings only with a custom base URL
+LLM_API_KEY                    accepted for openai with a custom base URL and as
+                               optional bearer auth for openai-compat
 ```
+
+`openai-compat` also requires an explicit model because self-hosted engines have
+no safe shared model or dimensionality default. It sends no authorization header
+when `LLM_API_KEY` is absent and stores vectors under the distinct
+`provider="openai-compat"` identity.
 
 ## Future work
 
