@@ -78,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TTL-expired standing pages are ignored. (#316)
 
 ### Fixed
+- A project-scoped forget sweep now purges aged decay tombstones only from its
+  resolved workspace/project instead of deleting eligible derived rows across
+  every project. Entity-index rows orphaned by the scoped purge are removed in
+  the same transaction, and `hard_deleted` reports only the target scope. (#323)
 - Zero-LLM `memory_query` now keeps graph-neighbour expansion active instead
   of falling back to FTS5 alone when no query embedding exists. Equal adjusted
   hybrid and explicit multi-scope scores now use a deterministic path
