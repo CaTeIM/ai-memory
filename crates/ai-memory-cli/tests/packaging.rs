@@ -27,6 +27,7 @@ fn read_repo(path: &str) -> String {
     let path = repo_root().join(path);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 // Unix-only alongside run_wrapper_on_fake_macos below — these helpers'
