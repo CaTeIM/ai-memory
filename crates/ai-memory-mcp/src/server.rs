@@ -417,6 +417,12 @@ struct QueryArgs {
     /// default; they are deleted by the next forget sweep). Default false.
     #[serde(default)]
     include_expired: Option<bool>,
+    /// Attach `score_details` to each hit: per-stream ranks (FTS5,
+    /// vector, graph), raw scores, and RRF contributions, plus a
+    /// top-level `streams_active` list. Costs nothing extra — use it to
+    /// understand why a page ranked where it did. Default false.
+    #[serde(default)]
+    explain: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -446,9 +452,29 @@ struct StatusArgs {
     workspace: Option<String>,
 }
 
+/// One `memory_query` hit; serializes exactly like a bare
+/// [`ai_memory_store::PageHit`] unless `explain=true` attached
+/// `score_details`.
+#[derive(Debug, Serialize)]
+struct QueryHit {
+    #[serde(flatten)]
+    hit: ai_memory_store::PageHit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_details: Option<ai_memory_store::SearchExplain>,
+}
+
+impl From<ai_memory_store::PageHit> for QueryHit {
+    fn from(hit: ai_memory_store::PageHit) -> Self {
+        Self {
+            hit,
+            score_details: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
-    hits: Vec<ai_memory_store::PageHit>,
+    hits: Vec<QueryHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
     /// Populated only by a `global=true` query: cross-project hits, each
@@ -462,6 +488,12 @@ struct MemoryQueryResponse {
     /// `global=true`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     global_scope_hits: Vec<ai_memory_store::PageHit>,
+    /// Present only when `explain=true`: which retrieval streams ran for
+    /// the primary search (`fts` always; `vector` + `graph` only when an
+    /// embedder produced a query vector). Lets callers see degradation —
+    /// e.g. the embedder erroring drops the response to `["fts"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streams_active: Option<Vec<&'static str>>,
 }
 
 /// Response for `memory_recent`. `hits` carries the current project's recent
@@ -1071,36 +1103,35 @@ impl AiMemoryServer {
         query_vec: Option<&[f32]>,
         limit: usize,
         include_expired: bool,
-    ) -> ai_memory_store::StoreResult<Vec<PageHit>> {
+    ) -> ai_memory_store::StoreResult<Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = include_expired.then_some(i64::MIN);
-        if let (Some(embedder), Some(qv)) = (&self.embedder, query_vec) {
-            return self
-                .reader
-                .hybrid_search(
-                    workspace_id,
-                    project_id,
-                    query.to_owned(),
-                    Some(qv.to_vec()),
-                    embedder.provider().to_string(),
-                    embedder.model().to_string(),
-                    embedder.dim(),
-                    limit,
-                    expiry_cutoff,
-                )
-                .await;
-        }
-        self.reader
-            .search_pages_for_project(
+        // Provider/model/dim only select which stored vectors are
+        // eligible; with no query vector the vector stream never runs,
+        // so the empty triple is inert rather than a fake identity.
+        let (provider, model, dim) = match (&self.embedder, query_vec) {
+            (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
+            _ => (String::new(), String::new(), 0),
+        };
+        Ok(self
+            .reader
+            .hybrid_search_explained(
                 workspace_id,
                 project_id,
                 query.to_owned(),
+                query_vec.map(<[f32]>::to_vec),
+                provider,
+                model,
+                dim,
                 limit,
                 expiry_cutoff,
             )
-            .await
+            .await?
+            .into_iter()
+            .map(|(hit, explain)| (hit, Some(explain)))
+            .collect())
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -1210,6 +1241,7 @@ impl AiMemoryServer {
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
+                streams_active: None,
             });
         }
         if !args.scopes.is_empty()
@@ -1236,7 +1268,8 @@ impl AiMemoryServer {
             Some(self.resolve_query_scopes(&args.scopes).await?)
         };
         let hits = if let Some(scopes) = &resolved_scopes {
-            let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
+            let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
+                HashMap::new();
             for &(ws, proj) in scopes {
                 let hits = self
                     .search_project(
@@ -1251,19 +1284,20 @@ impl AiMemoryServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 for hit in hits {
                     hits_by_id
-                        .entry(hit.id)
+                        .entry(hit.0.id)
                         .and_modify(|existing| {
-                            if hit.rank < existing.rank {
+                            if hit.0.rank < existing.0.rank {
                                 *existing = hit.clone();
                             }
                         })
                         .or_insert(hit);
                 }
             }
-            let mut hits: Vec<PageHit> = hits_by_id.into_values().collect();
+            let mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> =
+                hits_by_id.into_values().collect();
             hits.sort_by(|a, b| {
-                a.rank
-                    .partial_cmp(&b.rank)
+                a.0.rank
+                    .partial_cmp(&b.0.rank)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             hits.truncate(limit);
@@ -1287,7 +1321,7 @@ impl AiMemoryServer {
             .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
+        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
         // for explicit `scopes` — the recommended scope-bleed mitigation —
@@ -1362,8 +1396,8 @@ impl AiMemoryServer {
                             )
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-                        hits
+                        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+                        hits.into_iter().map(|(h, _)| h).collect()
                     }
                 }
                 Ok(None) => Vec::new(),
@@ -1372,11 +1406,27 @@ impl AiMemoryServer {
         } else {
             Vec::new()
         };
+        let explain = args.explain.unwrap_or(false);
+        let streams_active = explain.then(|| {
+            if query_vec.is_some() {
+                vec!["fts", "vector", "graph"]
+            } else {
+                vec!["fts"]
+            }
+        });
+        let hits = hits
+            .into_iter()
+            .map(|(hit, score_details)| QueryHit {
+                hit,
+                score_details: score_details.filter(|_| explain),
+            })
+            .collect();
         let response = MemoryQueryResponse {
             hits,
             raw_hits,
             global_hits: Vec::new(),
             global_scope_hits,
+            streams_active,
         };
         ok_json(&response)
     }
@@ -4042,6 +4092,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4088,6 +4139,7 @@ mod tests {
             workspace: workspace.map(str::to_string),
             global: None,
             include_expired: None,
+            explain: None,
         };
 
         let result = server
@@ -4139,6 +4191,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4264,6 +4317,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4340,6 +4394,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 test_optional_parts(),
             )
@@ -4433,6 +4488,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4497,6 +4553,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4537,6 +4594,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 test_optional_parts(),
             )
@@ -4608,6 +4666,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4670,6 +4729,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5045,6 +5105,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5133,6 +5194,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5168,6 +5230,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: Some(true),
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5244,6 +5307,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5274,6 +5338,7 @@ mod tests {
                     workspace: Some("ops".into()),
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5308,6 +5373,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6867,6 +6933,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6899,6 +6966,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

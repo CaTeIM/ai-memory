@@ -42,6 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.20.0] - 2026-07-30
 
 ### Added
+- `memory_query` explain mode: pass `explain: true` and every hit carries
+  `score_details` — its 1-based rank and raw score in each retrieval
+  stream (FTS5 bm25 score, embedding cosine, graph-neighbour provenance
+  naming the seed page and link direction), the per-stream RRF
+  contributions, the fused score, and the bounded page-authority
+  multiplier applied after fusion — plus a top-level `streams_active`
+  list that makes degradation visible (an embedder failure shows up as
+  `["fts"]` instead of `["fts","vector","graph"]`). Reporting the
+  authority factor alongside `fused` is what keeps the surface honest:
+  the returned `rank` is the fused score *after* that multiplier, so
+  `fused` alone would not account for the ordering. Costs nothing extra:
+  the data was already computed and discarded. Hybrid ranking also gained
+  a deterministic path tiebreak for equal adjusted scores, which
+  previously fell back to hash-map iteration order.
 - Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
   `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
   `pages.expires_at` column (V36) and settable through a new optional
@@ -332,6 +346,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the complete response has been assembled; a failed or racing
   ledger claim cannot consume the handoff or suppress retry delivery.
   (#235)
+
+### Fixed
+- `memory_query` no longer skips the hybrid retrieval path when no
+  embedder is configured. The search branched to plain FTS5 whenever a
+  query vector was absent, which silently dropped the graph-neighbour
+  stream from every zero-LLM deployment — the documented default — and
+  would have left the new `explain` output reporting a single active
+  stream. All streams now run through one path; each contributes
+  nothing when its own input is missing, which is what the vector
+  stream already did.
 
 ## [1.18.0] - 2026-07-23
 
