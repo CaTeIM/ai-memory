@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.1] - 2026-07-30
+
 ### Fixed
 - Managed workstream packets, handoffs, project briefs, MCP routing prompts,
   and all LLM maintenance prompts now identify stored project material as
@@ -2569,7 +2571,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.20.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.20.1...HEAD
+[1.20.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.1
 [1.20.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.0
 [1.19.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.2
 [1.19.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.19.1
