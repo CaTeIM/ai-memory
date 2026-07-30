@@ -2267,8 +2267,8 @@ impl ReaderPool {
     /// ancestor-or-equal of `cwd_filter` (path-boundary, the prior art's
     /// check rather than exact equality: a handoff left in `/repo` reaches a
     /// session in `/repo/api`, but never `/repo-other`). Among candidates a
-    /// manual handoff wins over an auto one, then the most specific cwd, then
-    /// the most recent — so an explicit "where we left off" baton
+    /// manual handoff wins over an auto one, then the most recent, with cwd
+    /// specificity only breaking timestamp ties — so an explicit "where we left off" baton
     /// deterministically beats the heuristic SessionEnd handoff, regardless of
     /// whether the model passed a cwd. With `cwd_filter == None` every open
     /// handoff is a candidate (project-wide read, e.g. the web overview). The
@@ -5015,7 +5015,7 @@ fn telemetry_count_from_row(
 /// Normalize a cwd for comparison: treat Windows backslashes as path
 /// separators and trim trailing separators while keeping a bare root as `/`.
 /// Pure and string-only; it does not touch the filesystem.
-fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
     let replaced = if p.contains('\\') {
         std::borrow::Cow::Owned(p.replace('\\', "/"))
     } else {
@@ -5036,7 +5036,7 @@ fn normalize_cwd(p: &str) -> std::borrow::Cow<'_, str> {
 /// `/repo/api` but neither `/repo-other` nor `/repository`. Inputs are
 /// normalized first. Pure; no SQL `LIKE`, so `%`/`_` in a path cannot act
 /// as wildcards.
-fn cwd_within(ancestor: &str, descendant: &str) -> bool {
+pub(crate) fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     let a = normalize_cwd(ancestor);
     let d = normalize_cwd(descendant);
     if a == d {
@@ -5060,7 +5060,17 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
     if h.from_session_id.is_none() {
         return true;
     }
-    match (cwd_filter, h.cwd.as_deref()) {
+    auto_handoff_matches_cwd(h.cwd.as_deref(), cwd_filter)
+}
+
+/// Whether an automatic handoff is eligible for a session starting in
+/// `cwd_filter`. Shared with the acceptance path so selection and supersession
+/// apply exactly the same path-boundary rule.
+pub(crate) fn auto_handoff_matches_cwd(
+    handoff_cwd: Option<&str>,
+    cwd_filter: Option<&str>,
+) -> bool {
+    match (cwd_filter, handoff_cwd) {
         // Project-wide read: every open handoff is a candidate.
         (None, _) => true,
         // No stored cwd: treat as project-wide.
@@ -5070,33 +5080,50 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {
     }
 }
 
-fn handoff_selection_key(h: &Handoff) -> (bool, usize, Timestamp) {
-    let manual = h.from_session_id.is_none();
-    // cwd specificity discriminates only AUTO handoffs (most specific subdir
-    // wins). For manual handoffs it must be neutral so the NEWEST manual wins,
-    // not whichever happens to carry the longest cwd. Normalize before counting
-    // so legacy `/repo/` rows do not outrank equivalent `/repo` rows.
+pub(crate) fn handoff_selection_key(
+    manual: bool,
+    created_at_micros: i64,
+    cwd: Option<&str>,
+    id: HandoffId,
+) -> (bool, i64, usize, [u8; 16]) {
+    // Cwd specificity discriminates only equal-time AUTO handoffs. For manual
+    // handoffs it must be neutral so the newest manual wins, not whichever
+    // happens to carry the longest cwd. Normalize before counting so legacy
+    // `/repo/` rows do not outrank equivalent `/repo` rows.
     let auto_specificity = if manual {
         0
     } else {
-        h.cwd.as_deref().map_or(0, |cwd| normalize_cwd(cwd).len())
+        cwd.map_or(0, |cwd| normalize_cwd(cwd).len())
     };
     (
-        manual,           // manual beats auto
-        auto_specificity, // most specific auto cwd
-        h.created_at,     // newest
+        manual,            // manual beats auto
+        created_at_micros, // newest
+        auto_specificity,  // most specific equal-time auto cwd
+        *id.as_bytes(),    // deterministic final tie-break
     )
 }
 
 fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
-    handoff_selection_key(a).cmp(&handoff_selection_key(b))
+    handoff_selection_key(
+        a.from_session_id.is_none(),
+        a.created_at.as_microsecond(),
+        a.cwd.as_deref(),
+        a.id,
+    )
+    .cmp(&handoff_selection_key(
+        b.from_session_id.is_none(),
+        b.created_at.as_microsecond(),
+        b.cwd.as_deref(),
+        b.id,
+    ))
 }
 
 /// Pick the handoff to deliver from a project's open handoffs.
 ///
 /// See [`ReaderPool::latest_open_handoff`] for the full contract: manual handoffs
 /// are project-wide, auto handoffs are filtered by cwd path-boundary, and a
-/// manual handoff always beats an auto one, then most specific cwd, then newest.
+/// manual handoff always beats an auto one, then newest, with cwd specificity
+/// only breaking timestamp ties.
 #[cfg(test)]
 fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Option<Handoff> {
     candidates
@@ -5434,7 +5461,8 @@ mod tests {
     use crate::Store;
 
     use ai_memory_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, ProjectId, SessionId, WorkspaceId,
+        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, NewSession, ProjectId, SessionId,
+        WorkspaceId,
     };
 
     #[test]
@@ -5592,12 +5620,12 @@ mod tests {
     }
 
     #[test]
-    fn handoff_most_specific_ancestor_wins() {
+    fn handoff_newer_parent_beats_stale_specific_ancestor() {
         let c = vec![
             handoff("a", Some("/a"), false, 2),
             handoff("ab", Some("/a/b"), false, 1),
         ];
-        assert_eq!(pick(c, Some("/a/b/c")), "ab");
+        assert_eq!(pick(c, Some("/a/b/c")), "a");
     }
 
     #[test]
@@ -5695,6 +5723,148 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(handoff.summary, "right project");
+    }
+
+    #[tokio::test]
+    async fn accepting_newest_auto_expires_only_older_matching_autos() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "repo", Some("/repo".into()))
+            .await
+            .unwrap();
+
+        async fn insert_auto(
+            store: &Store,
+            workspace_id: WorkspaceId,
+            project_id: ProjectId,
+            cwd: &str,
+            summary: &str,
+        ) -> HandoffId {
+            let session_id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                })
+                .await
+                .unwrap();
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id,
+                    project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: summary.into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                })
+                .await
+                .unwrap()
+        }
+
+        let superseded_same_cwd =
+            insert_auto(&store, ws, proj, "/repo/api", "older same cwd").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let stale_specific = insert_auto(&store, ws, proj, "/repo/api", "stale specific").await;
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(superseded_same_cwd)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Expired,
+            "a newer auto from the exact cwd must bound pre-accept accumulation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newest_parent = insert_auto(&store, ws, proj, "/repo", "newest parent").await;
+        let sibling = insert_auto(&store, ws, proj, "/repo/web", "sibling").await;
+
+        let selected = store
+            .reader
+            .latest_open_handoff(ws, proj, Some("/repo/api/src".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, newest_parent, "newest eligible auto must win");
+
+        // A manual handoff appearing between selection and acceptance must not
+        // be swept by automatic-handoff cleanup.
+        let manual = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "manual".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .accept_handoff(
+                selected.id,
+                AgentKind::Codex,
+                None,
+                Some("/repo/api/src".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(stale_specific)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Expired
+        );
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(newest_parent)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Accepted
+        );
+        for untouched in [sibling, manual] {
+            assert_eq!(
+                store
+                    .reader
+                    .handoff_by_id(untouched)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                HandoffState::Open
+            );
+        }
     }
 
     /// A stored `repo_path` equal to the operator's `$HOME` must never be

@@ -158,6 +158,7 @@ pub(crate) enum WriteCmd {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     CancelHandoff {
@@ -347,6 +348,7 @@ pub(crate) enum WriteCmd {
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -737,12 +739,14 @@ impl WriterHandle {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        receiving_cwd: Option<String>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             handoff_id,
             accepting_agent,
             accepting_session,
+            receiving_cwd,
             reply: tx,
         })
         .await?;
@@ -1358,6 +1362,7 @@ impl WriterHandle {
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         managed_run_id: Option<ManagedRunId>,
+        receiving_cwd: Option<String>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
@@ -1365,6 +1370,7 @@ impl WriterHandle {
             accepting_agent,
             accepting_session,
             managed_run_id,
+            receiving_cwd,
             reply: tx,
         })
         .await?;
@@ -1596,6 +1602,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff_id,
                 accepting_agent,
                 accepting_session,
+                receiving_cwd,
                 reply,
             } => {
                 let result = ops::accept_handoff(
@@ -1603,6 +1610,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &handoff_id,
                     accepting_agent,
                     accepting_session.as_ref(),
+                    receiving_cwd.as_deref(),
                 );
                 send_or_warn(reply, result, "accept_handoff");
             }
@@ -1860,6 +1868,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 accepting_agent,
                 accepting_session,
                 managed_run_id,
+                receiving_cwd,
                 reply,
             } => {
                 let result = (|| {
@@ -1879,6 +1888,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                             &handoff_id,
                             accepting_agent,
                             accepting_session.as_ref(),
+                            receiving_cwd.as_deref(),
                         )?,
                         None => false,
                     };

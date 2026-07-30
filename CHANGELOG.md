@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Automatic handoff selection now prefers the newest cwd-eligible session over
+  a stale, more-specific ancestor. A new automatic handoff expires prior open
+  automatic handoffs from the exact cwd, and accepting the winner atomically
+  expires older eligible automatic handoffs. Manual and sibling-directory
+  handoffs remain open, preventing stale delivery and inflated pending counts.
+  (#293)
 - OpenAI-compatible providers now send each structured operation's JSON Schema
   through `response_format=json_schema` by default, so local models cannot
   replace consolidation JSON with prose or omit required fields. Explicit

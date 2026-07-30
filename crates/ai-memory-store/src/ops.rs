@@ -1257,6 +1257,30 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     });
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
+    // A newer automatic handoff from the exact same cwd is the only one that
+    // can ever win there, even before a SessionStart occurs. Bound abandoned
+    // same-directory sessions without touching deliberate manual handoffs or
+    // independent parent/sibling cwd scopes.
+    if from_session.is_some() {
+        let expired = conn.execute(
+            "UPDATE handoffs SET state = 'expired' \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND state = 'open' AND from_session_id IS NOT NULL \
+               AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL))",
+            params![h.workspace_id.as_bytes(), h.project_id.as_bytes(), cwd],
+        )?;
+        if expired > 0 {
+            audit(
+                conn,
+                "expire_superseded_handoffs",
+                Some(h.workspace_id.as_bytes()),
+                Some(h.project_id.as_bytes()),
+                None,
+                None,
+                now,
+            )?;
+        }
+    }
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
     // user, so the audit author is NULL — the row records the lifecycle event
     // (op + workspace/project + time), not an operator identity.
@@ -1324,9 +1348,16 @@ pub fn accept_handoff(
     handoff_id: &HandoffId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
+    receiving_cwd: Option<&str>,
 ) -> StoreResult<()> {
     let tx = conn.transaction()?;
-    accept_handoff_in_transaction(&tx, handoff_id, accepting_agent, accepting_session)?;
+    accept_handoff_in_transaction(
+        &tx,
+        handoff_id,
+        accepting_agent,
+        accepting_session,
+        receiving_cwd,
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -1336,10 +1367,30 @@ pub(crate) fn accept_handoff_in_transaction(
     handoff_id: &HandoffId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
+    receiving_cwd: Option<&str>,
 ) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
+    let metadata = tx
+        .query_row(
+            "SELECT workspace_id, project_id, from_session_id IS NOT NULL, cwd, created_at \
+             FROM handoffs WHERE id = ?1 AND state = 'open'",
+            params![handoff_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((workspace_id, project_id, automatic, cwd, created_at)) = metadata else {
+        return Ok(false);
+    };
     let (ws, proj) = handoff_scope(tx, handoff_id)?;
     let changed = tx.execute(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
@@ -1358,8 +1409,90 @@ pub(crate) fn accept_handoff_in_transaction(
             None,
             now,
         )?;
+        if automatic {
+            let expired = expire_superseded_auto_handoffs(
+                tx,
+                handoff_id,
+                &workspace_id,
+                &project_id,
+                cwd.as_deref(),
+                created_at,
+                receiving_cwd,
+            )?;
+            if expired > 0 {
+                audit(
+                    tx,
+                    "expire_superseded_handoffs",
+                    ws.as_ref(),
+                    proj.as_ref(),
+                    None,
+                    None,
+                    now,
+                )?;
+            }
+        }
     }
     Ok(changed > 0)
+}
+
+/// Expire older automatic handoffs that were eligible for the same receiving
+/// cwd as the accepted handoff. Manual and sibling-directory handoffs are
+/// deliberately excluded.
+fn expire_superseded_auto_handoffs(
+    tx: &Transaction<'_>,
+    accepted_id: &HandoffId,
+    workspace_id: &[u8],
+    project_id: &[u8],
+    accepted_cwd: Option<&str>,
+    accepted_created_at: i64,
+    receiving_cwd: Option<&str>,
+) -> StoreResult<usize> {
+    let receiving_cwd = receiving_cwd.or(accepted_cwd);
+    let accepted_key = crate::reader::handoff_selection_key(
+        false,
+        accepted_created_at,
+        accepted_cwd,
+        *accepted_id,
+    );
+    let mut stmt = tx.prepare(
+        "SELECT id, cwd, created_at FROM handoffs \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND state = 'open' AND from_session_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![workspace_id, project_id], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let (id_bytes, cwd, created_at) = row?;
+        let id = HandoffId::from_slice(&id_bytes)?;
+        if crate::reader::auto_handoff_matches_cwd(cwd.as_deref(), receiving_cwd)
+            && crate::reader::handoff_selection_key(false, created_at, cwd.as_deref(), id)
+                < accepted_key
+        {
+            ids.push(id_bytes);
+        }
+    }
+    drop(stmt);
+
+    let mut expired = 0;
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        expired += tx.execute(
+            &format!(
+                "UPDATE handoffs SET state = 'expired' \
+                 WHERE state = 'open' AND id IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(chunk.iter().map(Vec::as_slice)),
+        )?;
+    }
+    Ok(expired)
 }
 
 /// Mark an open handoff expired so it will no longer be consumed.
@@ -2708,7 +2841,7 @@ mod tests {
         assert_eq!(state, "open");
         assert!(accepted_by.is_none());
 
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
         let (state, accepted_by): (String, Option<String>) = conn
             .query_row(
                 "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
@@ -2723,8 +2856,58 @@ mod tests {
         // either succeed silently or fail clearly, never corrupt
         // the row. (Current impl is a no-op UPDATE with a state
         // guard.)
-        let second = accept_handoff(&mut conn, &id, AgentKind::Codex, None);
+        let second = accept_handoff(&mut conn, &id, AgentKind::Codex, None, None);
         assert!(second.is_ok(), "double-accept must not error");
+    }
+
+    #[test]
+    fn failed_auto_handoff_insert_rolls_back_same_cwd_expiration() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let first_session = SessionId::new();
+        begin_session(
+            &mut conn,
+            &NewSession {
+                id: first_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/repo".into()),
+            },
+        )
+        .unwrap();
+        let handoff = |session_id| NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: Some(session_id),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: Some("/repo".into()),
+            summary: "continue".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+        };
+        let first = insert_handoff(&mut conn, &handoff(first_session)).unwrap();
+
+        let error = insert_handoff(&mut conn, &handoff(SessionId::new()))
+            .expect_err("a missing source session must violate the foreign key");
+        assert!(matches!(error, StoreError::Sqlite(_)));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                params![first.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "open",
+            "the failed transaction must restore the prior handoff"
+        );
+        assert_eq!(
+            audit_row_for(&conn, "expire_superseded_handoffs").0,
+            0,
+            "the rolled-back expiration must leave no audit row"
+        );
     }
 
     /// The handoff lifecycle (insert / accept / cancel) writes audit rows,
@@ -2746,7 +2929,7 @@ mod tests {
             files_touched: vec![],
         };
         let id = insert_handoff(&mut conn, &new()).unwrap();
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
         let id2 = insert_handoff(&mut conn, &new()).unwrap();
         assert!(cancel_handoff(&mut conn, &id2).unwrap());
 
@@ -2762,7 +2945,7 @@ mod tests {
         );
         // Idempotent misses stay out of the trail: a double-accept and a
         // cancel of an already-accepted handoff change no row, audit nothing.
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None).unwrap();
+        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
         assert!(!cancel_handoff(&mut conn, &id).unwrap());
         assert_eq!(
             audit_row_for(&conn, "accept_handoff").0,
