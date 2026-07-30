@@ -478,6 +478,7 @@ AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini 
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override

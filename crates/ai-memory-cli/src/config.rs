@@ -80,14 +80,11 @@ pub struct Config {
     pub llm_model: Option<String>,
     /// Optional LLM base URL override.
     pub llm_base_url: Option<String>,
-    /// Opt-in: send `response_format=json_schema` (strict) to the
-    /// `openai-compat` provider instead of asking for prose JSON and
-    /// extracting the first balanced object. Off by default — the tolerant
-    /// parser stays the default for older local engines that ignore
-    /// `response_format`. Modern engines (recent Ollama, vLLM, LM Studio,
-    /// llama.cpp) honour structured output; this lets the operator opt in.
-    /// If the strict raw call fails, the provider falls back to the tolerant
-    /// parser. Set with `AI_MEMORY_LLM_COMPAT_STRICT=true`.
+    /// Send `response_format=json_schema` (strict) to the `openai-compat`
+    /// provider instead of relying on prose instructions and extracting the
+    /// first balanced object. On by default because every structured call
+    /// already supplies its own schema. Set
+    /// `AI_MEMORY_LLM_COMPAT_STRICT=false` for an incompatible endpoint.
     pub llm_compat_strict: bool,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
@@ -413,7 +410,7 @@ impl Default for Config {
             llm_provider: None,
             llm_model: None,
             llm_base_url: None,
-            llm_compat_strict: false,
+            llm_compat_strict: true,
             consolidate_on_session_end: false,
             capture_assistant: false,
             embedding_provider: None,
@@ -1270,7 +1267,7 @@ mod tests {
             provider.auth.require_api_key().unwrap().expose_secret(),
             "sk-test-key"
         );
-        assert!(!provider.compat_strict);
+        assert!(provider.compat_strict);
     }
 
     #[test]
@@ -1327,12 +1324,11 @@ mod tests {
     }
 
     #[test]
-    fn openai_compat_provider_threads_strict_flag() {
-        let cfg = Config {
+    fn openai_compat_provider_defaults_strict_and_allows_opt_out() {
+        let mut cfg = Config {
             llm_provider: Some("openai-compat".into()),
             llm_model: Some("qwen3:32b".into()),
             llm_base_url: Some("http://localhost:11434/v1".into()),
-            llm_compat_strict: true,
             ..Config::default()
         };
 
@@ -1345,6 +1341,10 @@ mod tests {
             Some("http://localhost:11434/v1")
         );
         assert!(provider.compat_strict);
+
+        cfg.llm_compat_strict = false;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(!provider.compat_strict);
     }
 
     #[test]
