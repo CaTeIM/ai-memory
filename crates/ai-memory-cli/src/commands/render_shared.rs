@@ -263,20 +263,55 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     project_strategy: Option<&str>,
     capture_assistant: bool,
 ) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::for_bash_runner(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_claude_code_script_payload_for_test(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+) -> serde_json::Value {
+    build_claude_code_payload_with_data_dir_for_platform(
+        emit_root,
+        server_url,
+        auth_token,
+        data_dir,
+        project_strategy,
+        capture_assistant,
+        HookCommandPlatform::Posix,
+    )
+}
+
+fn build_claude_code_payload_with_data_dir_for_platform(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+    capture_assistant: bool,
+    platform: HookCommandPlatform,
+) -> serde_json::Value {
     build_hook_payload_for_platform(
         &CLAUDE_CODE_EVENTS,
         emit_root,
         server_url,
         auth_token,
         HookShape::Nested,
-        HookCommandContext::new(
-            HookCommandPlatform::for_bash_runner(),
-            "claude-code",
-            data_dir,
-            project_strategy,
-        )
-        .allow_claude_windows_exec()
-        .with_capture_assistant(capture_assistant),
+        HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
+            .allow_claude_windows_exec()
+            .with_capture_assistant(capture_assistant),
     )
 }
 
@@ -670,6 +705,31 @@ pub(crate) fn build_profile_payload_for_agent(
         profile.shape,
         HookCommandContext::new(
             HookCommandPlatform::current(),
+            agent,
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_profile_script_payload_for_test(
+    profile: &HookProfile,
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    agent: &str,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> serde_json::Value {
+    build_hook_payload(
+        profile.events,
+        emit_root,
+        server_url,
+        auth_token,
+        profile.shape,
+        HookCommandContext::new(
+            HookCommandPlatform::Posix,
             agent,
             data_dir,
             project_strategy,

@@ -52,6 +52,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         auth_token: args.auth_token.or_else(|| config.auth.bearer_token.clone()),
         ..args
     };
+    validate_args(&args)?;
     if args.apply {
         return apply_to_config_file(&args);
     }
@@ -92,13 +93,20 @@ fn effective_mcp_server_url(config: &Config, args: &InstallMcpArgs) -> String {
     DEFAULT_MCP_URL.to_string()
 }
 
-fn mcp_server_url_from_base(server_url: &str) -> String {
+pub(crate) fn mcp_server_url_from_base(server_url: &str) -> String {
     let trimmed = server_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/mcp") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/mcp")
     }
+}
+
+fn validate_args(args: &InstallMcpArgs) -> Result<()> {
+    if args.session_aware && !matches!(args.client, McpClient::ClaudeCode) {
+        bail!("--session-aware is supported only for --client claude-code");
+    }
+    Ok(())
 }
 
 /// Default MCP config-file path for a client (ignores any
@@ -132,12 +140,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             }
             #[cfg(target_os = "windows")]
             {
-                // %APPDATA% is roughly ~/AppData/Roaming.
-                home()?
-                    .join("AppData")
-                    .join("Roaming")
-                    .join("Claude")
-                    .join("claude_desktop_config.json")
+                let local_data_dir = dirs::data_local_dir()
+                    .context("could not locate %LOCALAPPDATA% for Claude Desktop config")?;
+                let roaming_config_dir = dirs::config_dir()
+                    .context("could not locate %APPDATA% for Claude Desktop config")?;
+                claude_desktop_config_path_in(&local_data_dir, &roaming_config_dir)?
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {
@@ -176,6 +183,87 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".vscode")
             .join("mcp.json"),
     })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn claude_desktop_config_path_in(
+    local_data_dir: &Path,
+    roaming_config_dir: &Path,
+) -> Result<PathBuf> {
+    let local_packages_dir = local_data_dir.join("Packages");
+    Ok(
+        packaged_claude_desktop_config_path(&local_packages_dir)?.unwrap_or_else(|| {
+            roaming_config_dir
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        }),
+    )
+}
+
+/// Detect an MSIX/AppX-packaged Claude Desktop under
+/// `%LOCALAPPDATA%\Packages`. Prefer the package that already contains a
+/// config file; otherwise a single package directory is enough because the
+/// atomic apply path creates its lazy `LocalCache` descendants.
+#[cfg(any(target_os = "windows", test))]
+fn packaged_claude_desktop_config_path(local_packages_dir: &Path) -> Result<Option<PathBuf>> {
+    let entries = match std::fs::read_dir(local_packages_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect Claude Desktop packages under {}",
+                    local_packages_dir.display()
+                )
+            });
+        }
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.get(.."Claude_".len()))
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Claude_"))
+        })
+        .collect();
+    candidates.sort();
+
+    let config_path = |package_dir: &Path| {
+        package_dir
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    };
+    let existing: Vec<PathBuf> = candidates
+        .iter()
+        .map(|package_dir| config_path(package_dir))
+        .filter(|path| path.is_file())
+        .collect();
+
+    match (existing.as_slice(), candidates.as_slice()) {
+        ([path], _) => Ok(Some(path.clone())),
+        ([], []) => Ok(None),
+        ([], [package_dir]) => Ok(Some(config_path(package_dir))),
+        _ => {
+            let package_names = candidates
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "multiple Claude Desktop packages were found under {} ({package_names}); \
+                 pass --config-file with the active package's \
+                 LocalCache\\Roaming\\Claude\\claude_desktop_config.json path",
+                local_packages_dir.display()
+            )
+        }
+    }
 }
 
 /// Claude Code reads MCP-server registrations from `.claude.json`
@@ -281,6 +369,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
 }
 
 fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
+    validate_args(args)?;
     match args.client {
         McpClient::OpenCode => build_mcp_entry_opencode(args),
         McpClient::Openclaw => build_mcp_entry_openclaw(args),
@@ -388,10 +477,22 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let mut entry = serde_json::Map::new();
     match args.client {
         McpClient::ClaudeCode => {
-            entry.insert("type".into(), json!("http"));
-            entry.insert("url".into(), json!(server_url));
-            if let Some(b) = &bearer {
-                entry.insert("headers".into(), json!({"Authorization": b}));
+            if args.session_aware {
+                entry.insert("type".into(), json!("stdio"));
+                entry.insert("command".into(), json!("ai-memory"));
+                entry.insert(
+                    "args".into(),
+                    json!(["mcp-bridge", "--server-url", server_url]),
+                );
+                if let Some(token) = &args.auth_token {
+                    entry.insert("env".into(), json!({"AI_MEMORY_AUTH_TOKEN": token}));
+                }
+            } else {
+                entry.insert("type".into(), json!("http"));
+                entry.insert("url".into(), json!(server_url));
+                if let Some(b) = &bearer {
+                    entry.insert("headers".into(), json!({"Authorization": b}));
+                }
             }
         }
         McpClient::ClaudeDesktop => {
@@ -636,7 +737,18 @@ fn upsert_toml_mcp_server(doc: &mut toml_edit::DocumentMut, name: &str, server: 
 
 fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<String> {
     let bearer = bearer_header_value(args.auth_token.as_deref());
-    let cli_line = if let Some(b) = &bearer {
+    let cli_line = if args.session_aware {
+        let env = args
+            .auth_token
+            .as_deref()
+            .map(|token| format!(" --env \"AI_MEMORY_AUTH_TOKEN={token}\""))
+            .unwrap_or_default();
+        format!(
+            "claude mcp add --transport stdio{env} {name} -- \\\n    ai-memory mcp-bridge --server-url {url}",
+            name = args.name,
+            url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        )
+    } else if let Some(b) = &bearer {
         format!(
             "claude mcp add --transport http {name} {url} \\\n    --header \"Authorization: {b}\"",
             name = args.name,
@@ -764,7 +876,10 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Claude Desktop — write to claude_desktop_config.json:\n\
          #   - macOS:    ~/Library/Application Support/Claude/claude_desktop_config.json\n\
-         #   - Windows:  %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (unpackaged): %APPDATA%\\Claude\\claude_desktop_config.json\n\
+         #   - Windows (MSIX):       %LOCALAPPDATA%\\Packages\\Claude_<id>\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json\n\
+         #     --apply detects the installed form; if multiple MSIX packages\n\
+         #     are present, select the active one with --config-file.\n\
          #   - Linux:    Claude Desktop is not officially distributed for Linux;\n\
          #               use Claude Code or another HTTP client instead.\n\
          #\n\
@@ -932,6 +1047,7 @@ mod tests {
             auth_token: None,
             apply: false,
             config_file: None,
+            session_aware: false,
         }
     }
 
@@ -943,7 +1059,19 @@ mod tests {
             auth_token: Some("test-token-deadbeef".into()),
             apply: false,
             config_file: None,
+            session_aware: false,
         }
+    }
+
+    #[test]
+    fn claude_desktop_render_lists_packaged_and_unpacked_windows_paths() {
+        let rendered = render_claude_desktop(&args_for(McpClient::ClaudeDesktop)).unwrap();
+        assert!(rendered.contains(r"%APPDATA%\Claude\claude_desktop_config.json"));
+        assert!(rendered.contains(
+            r"%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json"
+        ));
+        assert!(rendered.contains("--apply detects the installed form"));
+        assert!(rendered.contains("--config-file"));
     }
 
     #[test]
@@ -968,6 +1096,100 @@ mod tests {
     }
 
     #[test]
+    fn packaged_claude_desktop_path_prefers_localcache_when_package_dir_exists() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_pzs8sxrjxfjjc")).unwrap();
+
+        let found = packaged_claude_desktop_config_path(packages.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found,
+            packages
+                .path()
+                .join("Claude_pzs8sxrjxfjjc")
+                .join("LocalCache")
+                .join("Roaming")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_ignores_unrelated_and_non_dir_entries() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Microsoft.WindowsTerminal_abc123")).unwrap();
+        fs::write(packages.path().join("Claude_notadir"), b"").unwrap();
+
+        assert!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_none_when_packages_dir_absent_or_empty() {
+        let missing = tempfile::TempDir::new().unwrap();
+        assert!(
+            packaged_claude_desktop_config_path(&missing.path().join("does-not-exist"))
+                .unwrap()
+                .is_none()
+        );
+
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(
+            packaged_claude_desktop_config_path(empty.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_desktop_path_uses_resolved_app_data_roots() {
+        let root = tempfile::TempDir::new().unwrap();
+        let local = root.path().join("redirected-local");
+        let roaming = root.path().join("redirected-roaming");
+
+        assert_eq!(
+            claude_desktop_config_path_in(&local, &roaming).unwrap(),
+            roaming.join("Claude").join("claude_desktop_config.json")
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_prefers_existing_config_among_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_old")).unwrap();
+        let active_config = packages
+            .path()
+            .join("Claude_current")
+            .join("LocalCache")
+            .join("Roaming")
+            .join("Claude")
+            .join("claude_desktop_config.json");
+        fs::create_dir_all(active_config.parent().unwrap()).unwrap();
+        fs::write(&active_config, b"{}").unwrap();
+
+        assert_eq!(
+            packaged_claude_desktop_config_path(packages.path())
+                .unwrap()
+                .unwrap(),
+            active_config
+        );
+    }
+
+    #[test]
+    fn packaged_claude_desktop_path_rejects_ambiguous_packages() {
+        let packages = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(packages.path().join("Claude_first")).unwrap();
+        fs::create_dir_all(packages.path().join("Claude_second")).unwrap();
+
+        let error = packaged_claude_desktop_config_path(packages.path()).unwrap_err();
+        assert!(error.to_string().contains("--config-file"));
+    }
+
+    #[test]
     fn claude_code_render_shows_resolved_config_path() {
         let args = args_for(McpClient::ClaudeCode);
         let config_path = std::path::Path::new("/stores/claude/.claude.json");
@@ -979,6 +1201,71 @@ mod tests {
         assert!(
             !out.contains("~/.claude.json"),
             "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
+    #[test]
+    fn claude_code_session_aware_entry_uses_owned_stdio_bridge() {
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("https://memory.example/mcp".into());
+        args.session_aware = true;
+
+        let entry = build_mcp_entry(&args).unwrap();
+
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], "ai-memory");
+        assert_eq!(
+            entry["args"],
+            json!(["mcp-bridge", "--server-url", "https://memory.example/mcp"])
+        );
+        assert_eq!(entry["env"]["AI_MEMORY_AUTH_TOKEN"], "test-token-deadbeef");
+        assert!(entry.get("url").is_none());
+        assert!(entry.get("headers").is_none());
+
+        let rendered = render_claude_code(&args, Path::new("/home/alice/.claude.json")).unwrap();
+        assert!(rendered.contains("claude mcp add --transport stdio"));
+        assert!(rendered.contains("ai-memory mcp-bridge --server-url"));
+    }
+
+    #[test]
+    fn claude_code_session_aware_apply_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_file = tmp.path().join(".claude.json");
+        let mut args = args_with_token(McpClient::ClaudeCode);
+        args.server_url = Some("http://192.168.0.90:49374/mcp".into());
+        args.config_file = Some(config_file.clone());
+        args.session_aware = true;
+        args.apply = true;
+
+        apply_to_config_file(&args).unwrap();
+        let first = fs::read_to_string(&config_file).unwrap();
+        apply_to_config_file(&args).unwrap();
+        let second = fs::read_to_string(&config_file).unwrap();
+
+        assert_eq!(first, second);
+        let value: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(
+            value["mcpServers"]["ai-memory"]["args"],
+            json!([
+                "mcp-bridge",
+                "--server-url",
+                "http://192.168.0.90:49374/mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn session_aware_rejects_non_claude_clients() {
+        let mut args = args_for(McpClient::Codex);
+        args.session_aware = true;
+
+        let error = build_json_mcp_entry(&args).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("supported only for --client claude-code"),
+            "{error:#}"
         );
     }
 

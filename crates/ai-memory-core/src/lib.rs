@@ -47,10 +47,13 @@ pub use ids::{
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{LinkTarget, NewPage, Page, Tier};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
-pub use sanitize::{SanitizeConfig, Sanitized, Sanitizer};
+pub use sanitize::{
+    OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
+};
 pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, validate_username};
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
-    ManagedRunContextResponse, ManagedRunStatus, NewWorkstreamEvent, PrepareManagedRunRequest,
-    PrepareManagedRunResponse, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse, ManagedRunStatus,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse, WorkstreamCheckpoint,
+    WorkstreamEvent, WorkstreamEventKind,
 };

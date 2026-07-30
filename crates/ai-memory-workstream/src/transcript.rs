@@ -6,7 +6,9 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_memory_core::{AgentKind, NewWorkstreamEvent, WorkstreamEventKind};
+use ai_memory_core::{
+    AgentKind, MANAGED_WORKSTREAM_PACKET_MARKER, NewWorkstreamEvent, WorkstreamEventKind,
+};
 use anyhow::{Context as _, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,7 @@ use crate::ManagedHarness;
 const MAX_SCAN_FILES: usize = 50_000;
 const MAX_EVENT_BYTES: usize = 128 * 1024;
 const MAX_NATIVE_SESSION_ID_BYTES: usize = 512;
+const LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX: &str = "> **ai-memory managed workstream:";
 
 /// Checkout-local native session that can seed an otherwise-empty workstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,11 +48,18 @@ pub struct ExportedTranscript {
 struct FileCursor {
     path: String,
     offset: u64,
-    /// Hash of every committed byte through `offset`. Kimi Code can rewrite
-    /// its journal in place, so its adapter validates this prefix before
-    /// trusting the byte offset. Other JSONL adapters remain offset-only.
+    /// Hash of every committed byte through `offset`. Kimi Code and Grok can
+    /// rewrite their journals in place (Kimi on fork/compaction/resume, Grok
+    /// on rewind), so those adapters validate this prefix before trusting the
+    /// byte offset. Other JSONL adapters remain offset-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefix_sha256: Option<String>,
+}
+
+/// Harnesses whose JSONL journal can be rewritten in place, requiring
+/// prefix-validated cursors and content-hash record ids.
+const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
+    matches!(harness, ManagedHarness::Kimi | ManagedHarness::Grok)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +170,26 @@ pub async fn list_native_sessions(
     Ok(sessions)
 }
 
+/// Check whether one exact native session still exists in the harness's
+/// read-only transcript store. `Ok(false)` means the resume target is
+/// definitely absent; store access or schema failures remain errors so callers
+/// do not mistake an unreadable store for a deleted session.
+pub fn native_session_exists(
+    harness: ManagedHarness,
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    native_session_id: &str,
+) -> Result<bool> {
+    if harness == ManagedHarness::OpenCode {
+        return Ok(opencode_updated(home, session_dir, native_session_id)?.is_some());
+    }
+    if harness == ManagedHarness::Crush {
+        return Ok(crush_updated(cwd, session_dir, native_session_id)?.is_some());
+    }
+    Ok(locate_session_file(harness, home, cwd, session_dir, native_session_id)?.is_some())
+}
+
 /// Wait briefly for buffered transcript writers to settle before importing.
 pub async fn wait_for_transcript_flush(
     harness: ManagedHarness,
@@ -204,7 +234,7 @@ fn export_jsonl(
     let mut file = File::open(path)
         .with_context(|| format!("opening native transcript {}", path.display()))?;
     let len = file.metadata()?.len();
-    let (start, mut kimi_prefix_hasher) = if harness == ManagedHarness::Kimi {
+    let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
             && let Some(hasher) = hash_file_prefix(&mut file, cursor.offset)?
@@ -238,8 +268,8 @@ fn export_jsonl(
         if !line.ends_with(b"\n") {
             break;
         }
-        if harness == ManagedHarness::Kimi {
-            kimi_prefix_hasher.update(&line);
+        if journal_rewrites_in_place(harness) {
+            prefix_hasher.update(&line);
         }
         committed_offset = offset;
         let value: Value = match serde_json::from_slice(&line) {
@@ -252,10 +282,11 @@ fn export_jsonl(
                 continue;
             }
         };
-        let record_id = if harness == ManagedHarness::Kimi {
-            // Kimi wire records carry no envelope id, and the journal is
-            // rewritten wholesale on fork/compaction/resume — a byte-offset
-            // id would silently change meaning. Hashing the raw line keeps
+        let record_id = if journal_rewrites_in_place(harness) {
+            // Kimi wire records and Grok chat-history records carry no
+            // envelope id, and both journals can be rewritten wholesale (Kimi
+            // on fork/compaction/resume, Grok on rewind) — a byte-offset id
+            // would silently change meaning. Hashing the raw line keeps
             // record ids (and therefore server-side event dedup) stable
             // across rewrites.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
@@ -293,6 +324,13 @@ fn export_jsonl(
                 &mut events,
                 &mut losses,
             ),
+            ManagedHarness::Grok => parse_grok(
+                &value,
+                native_session_id,
+                &record_id,
+                &mut events,
+                &mut losses,
+            ),
             ManagedHarness::OpenCode | ManagedHarness::Crush => {
                 return Err(anyhow!(
                     "{} transcripts must use their SQLite adapter",
@@ -309,8 +347,8 @@ fn export_jsonl(
         source_cursor: Some(serde_json::to_string(&FileCursor {
             path: path.to_string_lossy().into_owned(),
             offset: committed_offset,
-            prefix_sha256: (harness == ManagedHarness::Kimi)
-                .then(|| format!("{:x}", kimi_prefix_hasher.finalize())),
+            prefix_sha256: journal_rewrites_in_place(harness)
+                .then(|| format!("{:x}", prefix_hasher.finalize())),
         })?),
         events,
         losses: deduplicate_losses(losses),
@@ -911,6 +949,127 @@ fn annotate_kimi_subagents(path: &Path, losses: &mut Vec<String>) {
     }
 }
 
+/// Grok chat history (`<session-dir>/chat_history.jsonl`): flat records
+/// `{type, ...}`. `system` carries the private system prompt and `reasoning`
+/// carries encrypted hidden reasoning — neither may reach the ledger. Tool
+/// calls ride on the `assistant` record's `tool_calls` array and pair with
+/// separate `tool_result` records; `backend_tool_call` records server-side
+/// tools such as web search. Unknown record types are ignored so newer Grok
+/// versions stay forward-compatible.
+fn parse_grok(
+    value: &Value,
+    session: &str,
+    record_id: &str,
+    events: &mut Vec<NewWorkstreamEvent>,
+    losses: &mut Vec<String>,
+) {
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match record_type {
+        "system" => {
+            losses.push("Grok system prompt records were intentionally excluded".into());
+        }
+        "reasoning" => {
+            losses.push("Grok hidden reasoning was intentionally excluded".into());
+        }
+        "user" => {
+            parse_content_blocks(
+                AgentKind::Grok,
+                session,
+                record_id,
+                "user",
+                value.get("content"),
+                timestamp(value),
+                events,
+                losses,
+            );
+        }
+        "assistant" => {
+            let block_count = if let Some(text) = value.get("content").and_then(Value::as_str) {
+                push_event(
+                    events,
+                    AgentKind::Grok,
+                    session,
+                    record_id,
+                    0,
+                    WorkstreamEventKind::Message,
+                    Some("assistant"),
+                    text,
+                    timestamp(value),
+                    json!({}),
+                );
+                1
+            } else {
+                0
+            };
+            let tool_calls = value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for (index, call) in tool_calls.iter().enumerate() {
+                let name = first_string(call, &["name"]).unwrap_or("tool");
+                // `arguments` is a JSON string; re-serialize it compact when
+                // it parses, mirroring parse_codex's tool-call shape.
+                let arguments = call
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .map(|raw| match serde_json::from_str::<Value>(raw) {
+                        Ok(parsed) => compact_json(&parsed),
+                        Err(_) => raw.to_string(),
+                    })
+                    .unwrap_or_default();
+                push_event(
+                    events,
+                    AgentKind::Grok,
+                    session,
+                    record_id,
+                    block_count + index,
+                    WorkstreamEventKind::ToolCall,
+                    Some("assistant"),
+                    &format!("{name}: {arguments}"),
+                    timestamp(value),
+                    json!({"tool": name}),
+                );
+            }
+        }
+        "tool_result" => {
+            let body = value.get("content").map(value_text).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::Grok,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolResult,
+                Some("tool"),
+                &body,
+                timestamp(value),
+                json!({}),
+            );
+        }
+        "backend_tool_call" => {
+            let kind = value.get("kind").unwrap_or(&Value::Null);
+            let tool = first_string(kind, &["tool_type"]).unwrap_or("backend_tool");
+            let action = kind.get("action").map(compact_json).unwrap_or_default();
+            push_event(
+                events,
+                AgentKind::Grok,
+                session,
+                record_id,
+                0,
+                WorkstreamEventKind::ToolCall,
+                Some("assistant"),
+                &format!("{tool}: {action}"),
+                timestamp(value),
+                json!({"tool": tool}),
+            );
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_content_blocks(
     agent: AgentKind,
@@ -991,6 +1150,13 @@ fn parse_content_blocks(
             }
             "tool_result" | "toolResult" => {
                 let body = block.get("content").map(value_text).unwrap_or_default();
+                if claude_managed_packet_echo(agent, &body) {
+                    losses.push(
+                        "Claude managed workstream delivery packets were intentionally excluded"
+                            .into(),
+                    );
+                    continue;
+                }
                 push_event(
                     events,
                     agent,
@@ -1015,6 +1181,15 @@ fn parse_content_blocks(
     }
 }
 
+fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
+    if agent != AgentKind::ClaudeCode {
+        return false;
+    }
+    let body = body.trim_start();
+    body.starts_with(MANAGED_WORKSTREAM_PACKET_MARKER)
+        || body.starts_with(LEGACY_MANAGED_WORKSTREAM_PACKET_PREFIX)
+}
+
 fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
     if role != "user" {
         return false;
@@ -1028,6 +1203,17 @@ fn codex_synthetic_context(agent: AgentKind, role: &str, text: &str) -> bool {
                 || trimmed.starts_with("<INSTRUCTIONS>")
         }
         AgentKind::ClaudeCode => trimmed.starts_with("<system-reminder>"),
+        // Grok stores harness scaffolding inside `user` records rather than a
+        // separate record type: an environment block, then Claude-style
+        // reminders carrying project instructions, the skills catalogue, and
+        // the connected MCP servers. A single session's reminders measured
+        // 42KB against 270 bytes of real input, so importing them both leaks
+        // harness internals into the portable ledger and evicts real
+        // conversation from the startup packet budget. Genuine input arrives
+        // wrapped in `<user_query>`.
+        AgentKind::Grok => {
+            trimmed.starts_with("<user_info>") || trimmed.starts_with("<system-reminder>")
+        }
         _ => false,
     }
 }
@@ -1412,6 +1598,12 @@ fn locate_session_file(
 }
 
 fn transcript_file(harness: ManagedHarness, path: &Path) -> bool {
+    if harness == ManagedHarness::Grok {
+        // Only the conversation journal. `events.jsonl`, `updates.jsonl`, and
+        // `rewind_points.jsonl` in the same session directory carry harness
+        // internals and are excluded.
+        return path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl");
+    }
     if harness == ManagedHarness::Kimi {
         // Only the main agent's journal: `agents/main/wire.jsonl`. Subagent
         // wire journals and any other *.jsonl in the store are excluded.
@@ -1437,6 +1629,9 @@ fn temporary_transcript(path: &Path) -> bool {
 fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String, PathBuf)>> {
     if harness == ManagedHarness::Kimi {
         return kimi_session_header(path);
+    }
+    if harness == ManagedHarness::Grok {
+        return grok_session_header(path);
     }
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
@@ -1464,7 +1659,10 @@ fn session_header(harness: ManagedHarness, path: &Path) -> Result<Option<(String
                 value.get("id").and_then(Value::as_str),
                 value.get("cwd").and_then(Value::as_str),
             ),
-            ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => (None, None),
+            ManagedHarness::OpenCode
+            | ManagedHarness::Crush
+            | ManagedHarness::Kimi
+            | ManagedHarness::Grok => (None, None),
         };
         if let (Some(id), Some(cwd)) = (id, cwd) {
             return Ok(Some((id.to_string(), PathBuf::from(cwd))));
@@ -1493,6 +1691,32 @@ fn kimi_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
         return Ok(None);
     };
     let Some(id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    Ok(Some((id.to_string(), PathBuf::from(cwd))))
+}
+
+/// Grok sessions are self-describing in `<session-dir>/summary.json`
+/// (`info.id` + `info.cwd`). The chat-history journal carries no session id or
+/// cwd, and the bucket directory name is a URL-encoded cwd that is never
+/// parsed — recorded metadata is the only accepted checkout identifier.
+/// Missing/invalid metadata means the session is unusable for checkout
+/// matching, not an error.
+fn grok_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> {
+    let Some(session_dir) = path.parent() else {
+        return Ok(None);
+    };
+    let Ok(raw) = fs::read_to_string(session_dir.join("summary.json")) else {
+        return Ok(None);
+    };
+    let Ok(summary) = serde_json::from_str::<Value>(&raw) else {
+        return Ok(None);
+    };
+    let info = summary.get("info").unwrap_or(&Value::Null);
+    let (Some(id), Some(cwd)) = (
+        info.get("id").and_then(Value::as_str),
+        info.get("cwd").and_then(Value::as_str),
+    ) else {
         return Ok(None);
     };
     Ok(Some((id.to_string(), PathBuf::from(cwd))))
@@ -1685,6 +1909,7 @@ fn session_root(harness: ManagedHarness, home: &Path, override_dir: Option<&Path
         ManagedHarness::Crush => home.join(".crush"),
         ManagedHarness::Omp => home.join(".omp/agent/sessions"),
         ManagedHarness::Kimi => home.join(".kimi-code/sessions"),
+        ManagedHarness::Grok => home.join(".grok/sessions"),
     }
 }
 
@@ -1842,9 +2067,13 @@ mod tests {
                         "{}\n",
                         json!({"type":"session","id":"other-id","cwd":other})
                     ),
-                    // Kimi's header lives in state.json, not the journal;
-                    // covered by kimi_discovery_matches_checkout_via_state_json.
-                    ManagedHarness::OpenCode | ManagedHarness::Crush | ManagedHarness::Kimi => {
+                    // Kimi's header lives in state.json and Grok's in
+                    // summary.json, not the journal; covered by their own
+                    // discovery tests.
+                    ManagedHarness::OpenCode
+                    | ManagedHarness::Crush
+                    | ManagedHarness::Kimi
+                    | ManagedHarness::Grok => {
                         unreachable!()
                     }
                 },
@@ -1854,10 +2083,19 @@ mod tests {
             let sessions = list_native_sessions(harness, temp.path(), &cwd, Some(&root), 8)
                 .await
                 .unwrap();
+            let expected_id = format!("{}-id", harness.as_str());
             assert_eq!(sessions.len(), 1, "{} candidates", harness.as_str());
-            assert_eq!(
-                sessions[0].native_session_id,
-                format!("{}-id", harness.as_str())
+            assert_eq!(sessions[0].native_session_id, expected_id);
+            assert!(
+                native_session_exists(harness, temp.path(), &cwd, Some(&root), &expected_id)
+                    .unwrap(),
+                "{} existing session",
+                harness.as_str()
+            );
+            assert!(
+                !native_session_exists(harness, temp.path(), &cwd, Some(&root), "missing").unwrap(),
+                "{} missing session",
+                harness.as_str()
             );
         }
     }
@@ -1907,6 +2145,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["newer", "older"]
         );
+        assert!(
+            native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "newer"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::OpenCode,
+                temp.path(),
+                &cwd,
+                Some(&db_root),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1952,6 +2210,13 @@ mod tests {
                 .map(|candidate| candidate.native_session_id.as_str())
                 .collect::<Vec<_>>(),
             ["newer", "older"]
+        );
+        assert!(
+            native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "newer").unwrap()
+        );
+        assert!(
+            !native_session_exists(ManagedHarness::Crush, temp.path(), &cwd, None, "missing")
+                .unwrap()
         );
 
         let first = export_crush(&cwd, None, "newer", None).unwrap();
@@ -2022,6 +2287,46 @@ mod tests {
         assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
         assert_eq!(events[1].content, "Done");
         assert_eq!(losses.len(), 1);
+    }
+
+    #[test]
+    fn claude_adapter_excludes_read_back_managed_packets_only_at_the_origin() {
+        let value = json!({
+            "type":"user",
+            "uuid":"record",
+            "message":{"role":"user","content":[
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "\n  {MANAGED_WORKSTREAM_PACKET_MARKER}\n> **ai-memory managed workstream: default**\nprivate packet"
+                    )
+                },
+                {
+                    "type":"tool_result",
+                    "content":"  > **ai-memory managed workstream: default**\nlegacy packet"
+                },
+                {
+                    "type":"tool_result",
+                    "content":format!(
+                        "ordinary file output\nmentions {MANAGED_WORKSTREAM_PACKET_MARKER} later"
+                    )
+                }
+            ]}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&value, "session", "record", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert!(events[0].content.starts_with("ordinary file output"));
+        assert_eq!(
+            losses,
+            [
+                "Claude managed workstream delivery packets were intentionally excluded",
+                "Claude managed workstream delivery packets were intentionally excluded"
+            ]
+        );
     }
 
     #[test]
@@ -2297,6 +2602,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.as_deref(), Some(wire_b.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "session_aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Kimi,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2534,5 +2859,233 @@ mod tests {
         parse_kimi(&value, "session", "record", &mut events, &mut losses);
         assert!(events.is_empty());
         assert_eq!(losses, ["Kimi system messages were intentionally excluded"]);
+    }
+
+    /// Build a two-bucket grok store: `session_a` checked out at `cwd`,
+    /// `session_b` at `other`. Returns `(root, chat_a)`.
+    fn grok_store_fixture(cwd: &Path, other: &Path) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        for (bucket, id, work_dir) in [
+            ("%2Fother%2Fencoded", "019f-session-aaa", cwd),
+            ("%2Frepo%2Fencoded", "019f-session-bbb", other),
+        ] {
+            let session_dir = root.path().join(bucket).join(id);
+            fs::create_dir_all(&session_dir).unwrap();
+            fs::write(
+                session_dir.join("summary.json"),
+                json!({"info": {"id": id, "cwd": work_dir}}).to_string(),
+            )
+            .unwrap();
+        }
+        let chat_a = root
+            .path()
+            .join("%2Fother%2Fencoded/019f-session-aaa/chat_history.jsonl");
+        (root, chat_a)
+    }
+
+    #[tokio::test]
+    async fn grok_discovery_matches_checkout_via_summary_json_not_bucket_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        // Bucket names deliberately contradict the recorded cwd, so only
+        // summary.json metadata can produce a correct match.
+        let (root, chat_a) = grok_store_fixture(&cwd, &other);
+        fs::write(&chat_a, "{\"type\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        let chat_b = root
+            .path()
+            .join("%2Frepo%2Fencoded/019f-session-bbb/chat_history.jsonl");
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&chat_b, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        // Sibling harness internals must never count as transcripts.
+        fs::write(chat_a.parent().unwrap().join("events.jsonl"), "{}\n").unwrap();
+
+        let sessions = list_native_sessions(
+            ManagedHarness::Grok,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].native_session_id, "019f-session-aaa");
+
+        let found = locate_session_file(
+            ManagedHarness::Grok,
+            temp.path(),
+            &cwd,
+            Some(root.path()),
+            "019f-session-aaa",
+        )
+        .unwrap();
+        assert_eq!(found.as_deref(), Some(chat_a.as_path()));
+        assert!(
+            native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "019f-session-aaa"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Grok,
+                temp.path(),
+                &cwd,
+                Some(root.path()),
+                "missing"
+            )
+            .unwrap()
+        );
+        assert!(!transcript_file(
+            ManagedHarness::Grok,
+            &chat_a.parent().unwrap().join("events.jsonl")
+        ));
+    }
+
+    #[test]
+    fn grok_adapter_excludes_private_records_and_keeps_visible_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat_history.jsonl");
+        let records = [
+            json!({"type":"system","content":"private system prompt"}),
+            json!({"type":"user","content":[{"type":"text","text":"<user_info>\nOS: linux\n</user_info>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"fix the bug"}]}),
+            json!({"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque","status":"done"}),
+            json!({"type":"assistant","content":"reading the file","model_id":"grok-4.5",
+                   "tool_calls":[{"id":"call-1","name":"read_file","arguments":"{\"target_file\":\"a.rs\"}"}]}),
+            json!({"type":"tool_result","tool_call_id":"call-1","content":"fn main() {}"}),
+            json!({"type":"backend_tool_call","kind":{"tool_type":"web_search","action":{"type":"search","query":"rust"}}}),
+        ];
+        let body = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        fs::write(&path, body).unwrap();
+
+        let export = export_jsonl(ManagedHarness::Grok, &path, "019f-session", None).unwrap();
+        let contents: Vec<_> = export
+            .events
+            .iter()
+            .map(|event| (event.kind, event.content.as_str()))
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                (WorkstreamEventKind::Message, "fix the bug"),
+                (WorkstreamEventKind::Message, "reading the file"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "read_file: {\"target_file\":\"a.rs\"}"
+                ),
+                (WorkstreamEventKind::ToolResult, "fn main() {}"),
+                (
+                    WorkstreamEventKind::ToolCall,
+                    "web_search: {\"type\":\"search\",\"query\":\"rust\"}"
+                ),
+            ]
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("system prompt records"))
+        );
+        assert!(
+            export
+                .losses
+                .iter()
+                .any(|loss| loss.contains("hidden reasoning"))
+        );
+        let cursor: FileCursor = serde_json::from_str(&export.source_cursor.unwrap()).unwrap();
+        assert!(cursor.prefix_sha256.is_some());
+    }
+
+    /// Grok keeps harness scaffolding in `user` records, unlike Kimi, which
+    /// isolates it in `config.update` records the adapter never reads. A real
+    /// session measured 42KB of reminders (skills catalogue plus connected MCP
+    /// servers) against 270 bytes of genuine input, which both leaked harness
+    /// internals into the ledger and evicted real conversation from the
+    /// startup packet budget.
+    #[test]
+    fn grok_adapter_excludes_injected_system_reminders_from_user_records() {
+        let records = [
+            json!({"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\n</user_info>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context\n</system-reminder>"}]}),
+            // Indented in real sessions, so the check must tolerate leading space.
+            json!({"type":"user","content":[{"type":"text","text":"  <system-reminder> The following skills are available for use: ego-browser…</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected: - ai-memory (16 tools)\n</system-reminder>"}]}),
+            json!({"type":"user","content":[{"type":"text","text":"<user_query>\nfix the bug\n</user_query>"}]}),
+        ];
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            parse_grok(
+                record,
+                "019f-session",
+                &format!("record-{index}"),
+                &mut events,
+                &mut losses,
+            );
+        }
+
+        let contents: Vec<_> = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            ["<user_query>\nfix the bug\n</user_query>"],
+            "only genuine user input may reach the ledger"
+        );
+    }
+
+    #[test]
+    fn grok_export_resets_cursor_after_an_in_place_journal_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat_history.jsonl");
+        fs::write(&path, "{\"type\":\"user\",\"content\":\"one\"}\n").unwrap();
+        let first = export_jsonl(ManagedHarness::Grok, &path, "019f-session", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+
+        // Appending keeps the validated prefix and resumes incrementally.
+        let mut appended = fs::read(&path).unwrap();
+        appended.extend(b"{\"type\":\"user\",\"content\":\"two\"}\n");
+        fs::write(&path, appended).unwrap();
+        let second = export_jsonl(
+            ManagedHarness::Grok,
+            &path,
+            "019f-session",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].content, "two");
+
+        // A rewind rewrites the journal in place: the stored prefix no longer
+        // matches, so the export replays from the start with stable event ids.
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"content\":\"one\"}\n{\"type\":\"assistant\",\"content\":\"rewound\"}\n",
+        )
+        .unwrap();
+        let third = export_jsonl(
+            ManagedHarness::Grok,
+            &path,
+            "019f-session",
+            second.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(third.events.len(), 2);
+        assert_eq!(
+            third.events[0].event_id, first.events[0].event_id,
+            "identical lines must keep identical event ids across rewrites"
+        );
     }
 }

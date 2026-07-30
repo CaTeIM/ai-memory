@@ -8,16 +8,37 @@
 # Walk up from "$1" toward $HOME (or /) looking for `.ai-memory.toml`.
 # Prints the absolute path of the first marker found, or nothing.
 # Stops at $HOME to avoid leaking declarations from a shared system
-# user's home into another user's session on multi-user boxes.
+# user's home into another user's session on multi-user boxes. When cwd is
+# outside HOME, stop at the nearest checkout root (`.git` file/dir); a plain
+# non-git directory checks only cwd. This keeps unrelated parent markers out.
 ai_memory_find_marker() {
     dir="$1"
     [ -z "$dir" ] && return 0
+    boundary=""
+    if [ -n "${HOME:-}" ]; then
+        case "$dir" in
+            "$HOME"|"$HOME"/*) boundary="$HOME" ;;
+            *)
+                probe="$dir"
+                while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+                    if [ -e "$probe/.git" ]; then
+                        boundary="$probe"
+                        break
+                    fi
+                    parent=$(dirname "$probe")
+                    [ "$parent" = "$probe" ] && break
+                    probe="$parent"
+                done
+                [ -n "$boundary" ] || boundary="$dir"
+                ;;
+        esac
+    fi
     while [ -n "$dir" ] && [ "$dir" != "/" ]; do
         if [ -f "$dir/.ai-memory.toml" ]; then
             printf '%s\n' "$dir/.ai-memory.toml"
             return 0
         fi
-        if [ -n "${HOME:-}" ] && [ "$dir" = "$HOME" ]; then
+        if [ -n "$boundary" ] && [ "$dir" = "$boundary" ]; then
             return 0
         fi
         parent=$(dirname "$dir")
@@ -93,6 +114,20 @@ ai_memory_extract_session_id() {
             return 0
         fi
     done
+}
+
+# Antigravity's PreInvocation hook fires before every model call. Only the
+# documented invocationNum=0 boundary represents the startup event that
+# ai-memory maps to SessionStart. Missing or malformed counters fail closed so
+# a repeated invocation cannot consume a next-session handoff.
+ai_memory_antigravity_is_initial_invocation() {
+    payload="${1:-$(cat)}"
+    rest=${payload#*\"invocationNum\"}
+    [ "$rest" != "$payload" ] || return 1
+    value=$(printf '%s' "$rest" \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*([,}]).*/\1/p' \
+        | head -n 1)
+    [ "$value" = "0" ]
 }
 
 ai_memory_managed_qs() {

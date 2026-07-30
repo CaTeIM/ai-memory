@@ -9,6 +9,7 @@
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
 //! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -42,19 +43,20 @@ use std::pin::Pin;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
-    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport, SourceCounts,
-    prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
-    render_curator_report_markdown, run_auto_improve_review, run_auto_improve_telemetry_report,
-    run_curator_report, run_lint, run_sweep,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
+    EmbedBackfillCounts, EmbedBackfillOptions, SourceCounts, prune_sources_to_budget,
+    render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report,
+    run_embedding_backfill, run_lint, run_sweep,
 };
 use ai_memory_core::{
-    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
+    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
+    DecayParams, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
     ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
     f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
@@ -73,7 +75,6 @@ use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
-const EMBEDDING_WRITE_BATCH: usize = 100;
 const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
 
 /// Shared state for the admin router.
@@ -528,6 +529,7 @@ pub fn admin_router(state: AdminState) -> Router {
         )
         .route("/admin/status", get(handle_status))
         .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/open-sessions", get(handle_open_sessions))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
@@ -637,7 +639,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }),
         Err(e) => {
             warn!(error = %e, "backup failed");
@@ -651,7 +653,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 })
         }
     }
@@ -815,6 +817,87 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 Json(serde_json::json!({ "error": e.to_string() })),
             ),
         },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// open-sessions
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/open-sessions` — open (not yet ended)
+/// sessions for one scope + agent, newest first. Backs the thin
+/// `ai-memory finalize-session` command, which posts synthetic
+/// session-end hooks for whatever this returns.
+#[derive(Debug, Deserialize)]
+struct OpenSessionsQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Agent kind filter, kebab-case (`codex`, `claude-code`, …).
+    agent: String,
+    /// When true, return every open session; otherwise just the newest.
+    #[serde(default)]
+    all: bool,
+}
+
+/// Wire shape for one open session in the `GET /admin/open-sessions`
+/// response.
+#[derive(Debug, Serialize)]
+struct OpenSessionEntry {
+    session_id: String,
+    cwd: Option<String>,
+}
+
+/// Parse a kebab-case agent wire string into an [`AgentKind`].
+fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
+}
+
+async fn handle_open_sessions(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<OpenSessionsQuery>,
+) -> impl IntoResponse {
+    let Some(agent) = parse_agent_kind(&query.agent) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown agent kind: {}", query.agent)
+            })),
+        );
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let limit = if query.all { None } else { Some(1) };
+    match state
+        .reader
+        .open_sessions_for_scope_agent(ws, proj, agent, limit)
+        .await
+    {
+        Ok(sessions) => {
+            let sessions: Vec<OpenSessionEntry> = sessions
+                .into_iter()
+                .map(|s| OpenSessionEntry {
+                    session_id: s.session_id.to_string(),
+                    cwd: s.cwd,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&sessions)
+                        .map(|list| serde_json::json!({ "sessions": list }))
+                        .unwrap_or_else(|_| serde_json::json!({ "sessions": [] })),
+                ),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -2460,23 +2543,6 @@ pub struct EmbedReport {
     pub dim: u32,
 }
 
-#[derive(Default)]
-struct EmbedCounts {
-    embedded: usize,
-    skipped: usize,
-    failed: usize,
-    would_embed: usize,
-}
-
-impl EmbedCounts {
-    fn absorb(&mut self, other: Self) {
-        self.embedded += other.embedded;
-        self.skipped += other.skipped;
-        self.failed += other.failed;
-        self.would_embed += other.would_embed;
-    }
-}
-
 async fn embed_project_pages(
     state: &AdminState,
     embedder: &Arc<dyn Embedder>,
@@ -2484,87 +2550,18 @@ async fn embed_project_pages(
     proj: ProjectId,
     reembed: bool,
     dry_run: bool,
-) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
-    let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
-    let dim = embedder.dim();
-
-    let candidates = state
-        .reader
-        .decay_candidates(ws, proj)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    let already: std::collections::HashSet<_> = if reembed {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .reader
-            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?
-            .into_iter()
-            .collect()
-    };
-
-    let mut counts = EmbedCounts::default();
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-
-    for cand in candidates {
-        if !reembed && already.contains(&cand.id) {
-            counts.skipped += 1;
-            continue;
-        }
-        if dry_run {
-            counts.would_embed += 1;
-            continue;
-        }
-        let md = match state.wiki.read_page(ws, proj, &cand.path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        if md.body.trim().is_empty() {
-            counts.skipped += 1;
-            continue;
-        }
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(
-                &state.writer,
-                &mut pending,
-                &mut counts.embedded,
-                &mut counts.failed,
-            )
-            .await;
-        }
-    }
-    flush_embedding_batch(
+) -> Result<EmbedBackfillCounts, (StatusCode, Json<serde_json::Value>)> {
+    run_embedding_backfill(
+        &state.reader,
         &state.writer,
-        &mut pending,
-        &mut counts.embedded,
-        &mut counts.failed,
+        &state.wiki,
+        embedder,
+        ws,
+        proj,
+        EmbedBackfillOptions { reembed, dry_run },
     )
-    .await;
-
-    Ok(counts)
+    .await
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 async fn handle_embed(
@@ -2587,7 +2584,7 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let mut totals = EmbedCounts::default();
+    let mut totals = EmbedBackfillCounts::default();
 
     if req.all_projects {
         if let Some(ws) = state
@@ -2654,25 +2651,6 @@ async fn handle_embed(
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     ))
-}
-
-async fn flush_embedding_batch(
-    writer: &WriterHandle,
-    pending: &mut Vec<EmbeddingWrite>,
-    embedded: &mut usize,
-    failed: &mut usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
-    let count = batch.len();
-    if let Err(e) = writer.store_embeddings(batch).await {
-        *failed += count;
-        warn!(count, error = %e, "embed: store_embeddings failed");
-    } else {
-        *embedded += count;
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -2883,6 +2861,11 @@ struct PurgeProjectRequest {
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Off by default: the cascade would delete that lease row
+    /// out from under a running agent, which then cannot save its history.
+    #[serde(default)]
+    force: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -2900,6 +2883,13 @@ pub struct PurgeProjectReport {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted.
     pub embeddings_deleted: u64,
+    /// Number of managed `workstreams` rows deleted via cascade.
+    pub workstreams_deleted: u64,
+    /// Number of `managed_runs` rows deleted via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose `raw/workstreams/<id>/` segment
+    /// directories were included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
     /// Paths removed from disk (the project's UUID-namespaced directory).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
@@ -2910,6 +2900,76 @@ pub struct PurgeProjectReport {
     /// Post-purge checkpoint, if the purge changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+}
+
+async fn remove_workstream_segment_storage(
+    state: &AdminState,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let mut deleted = Vec::with_capacity(workstream_ids.len());
+    let mut failed = Vec::new();
+
+    for workstream_id in workstream_ids {
+        let path = state
+            .data_dir
+            .join("raw")
+            .join("workstreams")
+            .join(workstream_id);
+        let path_display = path.display().to_string();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => deleted.push(path_display),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    operation,
+                    path = %path_display,
+                    error = %error,
+                    "scope purge failed to remove workstream segment directory"
+                );
+                failed.push(path_display);
+            }
+        }
+    }
+
+    (deleted, failed)
+}
+
+async fn remove_purged_project_storage(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let project_root = state.wiki.project_root(workspace_id, project_id);
+    let project_root_display = project_root.display().to_string();
+    let mut deleted = Vec::with_capacity(workstream_ids.len() + 1);
+    let mut failed = Vec::new();
+
+    match state
+        .wiki
+        .remove_project_dir(workspace_id, project_id)
+        .await
+    {
+        Ok(()) => deleted.push(project_root_display.clone()),
+        Err(error) => {
+            warn!(
+                operation,
+                path = %project_root_display,
+                error = %error,
+                "project purge failed to remove wiki directory"
+            );
+            failed.push(project_root_display);
+        }
+    }
+
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, workstream_ids, operation).await;
+    deleted.extend(raw_deleted);
+    failed.extend(raw_failed);
+
+    (deleted, failed)
 }
 
 async fn handle_purge_project(
@@ -2970,32 +3030,33 @@ async fn handle_purge_project(
 
     let summary = match state
         .writer
-        .purge_project(ws_id, proj_id, &label, author_id)
+        .purge_project(ws_id, proj_id, &label, author_id, req.force)
         .await
     {
         Ok(s) => s,
+        // A live managed run is a conflict, not a server fault: the operator
+        // can finish the session or retry with `force`. Same status the
+        // heartbeat itself returns when a lease is gone, so the two agree.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows. Directory removal remains best-effort
-    // and is reported separately, matching the pre-admission purge contract.
-    let proj_root_str = state
-        .wiki
-        .project_root(ws_id, proj_id)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(ws_id, proj_id).await {
-        Ok(()) => {
-            files_deleted.push(proj_root_str);
-        }
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // DB cascade already deleted all rows. Remove both the wiki project root
+    // and every raw managed-workstream segment directory best-effort, reporting
+    // partial failures without disguising the committed database purge.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        &state,
+        ws_id,
+        proj_id,
+        &summary.workstream_ids,
+        "purge-project",
+    )
+    .await;
     // Mirrors that track filesystem reality (a git-push mirror) want to
     // know the on-disk dir is still present even though the DB rows are
     // gone, so they can refuse to drop their own copy in violation of
@@ -3022,6 +3083,9 @@ async fn handle_purge_project(
         observations_deleted: summary.observations_deleted,
         handoffs_deleted: summary.handoffs_deleted,
         embeddings_deleted: summary.embeddings_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -3130,7 +3194,14 @@ pub struct DeleteWorkspaceResult {
     pub projects_deleted: u64,
     /// `pages` rows removed via cascade (all versions).
     pub pages_deleted: u64,
-    /// Paths removed from disk (the workspace's UUID-namespaced directory).
+    /// Managed `workstreams` rows removed via cascade.
+    pub workstreams_deleted: u64,
+    /// `managed_runs` rows removed via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose raw segment directories were
+    /// included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
+    /// Paths removed from disk (the workspace directory and raw segments).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
@@ -3231,7 +3302,7 @@ async fn delete_workspace_core(
         .join(ws_id.to_string())
         .display()
         .to_string();
-    let mut files_deleted = Vec::new();
+    let mut files_deleted = Vec::with_capacity(summary.workstream_ids.len() + 1);
     let mut files_failed = Vec::new();
     match state.wiki.remove_workspace_dir(ws_id).await {
         Ok(()) => files_deleted.push(ws_root_str.clone()),
@@ -3240,6 +3311,10 @@ async fn delete_workspace_core(
             files_failed.push(ws_root_str);
         }
     }
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, &summary.workstream_ids, "delete-workspace").await;
+    files_deleted.extend(raw_deleted);
+    files_failed.extend(raw_failed);
 
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -3256,6 +3331,9 @@ async fn delete_workspace_core(
         workspace: workspace.to_string(),
         projects_deleted: summary.projects_deleted,
         pages_deleted: summary.pages_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -3390,12 +3468,13 @@ struct MoveProjectRequest {
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
     confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409)
+    /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
     /// live session's next observation would carry a stale workspace id.
     /// `force: true` proceeds anyway (still safe: the move republishes the
     /// active pointer and the (workspace_id, project_id) trigger makes any
-    /// stale write fail cleanly rather than corrupt).
+    /// stale write fail cleanly rather than corrupt). It never overrides a
+    /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
@@ -3444,6 +3523,9 @@ pub struct MoveProjectReport {
     /// Number of latest pages copied into the destination (copy-purge) or
     /// re-stamped in place (true-move).
     pub pages_copied: u64,
+    /// Managed workstreams re-stamped in place by a lossless true move.
+    /// Copy-purge reports zero because it does not transfer managed history.
+    pub workstreams_moved: u64,
     /// Source paths whose on-disk file could not be read (copy skipped).
     /// When non-empty the source is NOT purged so a fixed re-run is safe.
     pub pages_skipped: Vec<String>,
@@ -3596,6 +3678,7 @@ async fn true_move_project(
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
+        workstreams_moved: summary.workstreams_moved,
         pages_skipped: Vec::new(),
         // Nothing is purged in a true move — the source rows ARE the
         // destination rows, just re-stamped.
@@ -4140,6 +4223,7 @@ async fn copy_purge_merge(
             merged_into_existing: true,
             moved_via: "copy-purge",
             pages_copied,
+            workstreams_moved: 0,
             pages_skipped,
             source_purged: false,
             source_pages_deleted: 0,
@@ -4184,31 +4268,44 @@ async fn copy_purge_merge(
     // `purge_project` here, so the audit author is left NULL.
     let summary = match state
         .writer
-        .purge_project(src_ws, src_proj, &label, None)
+        .purge_project(src_ws, src_proj, &label, None, false)
         .await
     {
         Ok(s) => s,
+        // A live managed run under the source always blocks the destructive
+        // second leg. `force` only overrides the active-project guard; unlike
+        // a true move, copy-purge would delete the lease and strand the raw
+        // transcript. The pages are already copied, so a later retry is
+        // idempotent and leaves the source intact meanwhile.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{pages_copied} page(s) were copied to {}/{}, but the source \
+                         {label} could not be purged: {e}. The source is intact. \
+                         move-project --force cannot delete a live managed \
+                         workstream during a copy-purge merge; finish or cancel \
+                         the managed run, then retry.",
+                        req.to_workspace, req.project,
+                    )
+                })),
+            ));
+        }
         Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    // Remove the source's on-disk dir, then dispatch the non-blocking
-    // purge webhook. Pass the workspace/project NAMES we cached in
-    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
-    // name-resolution lookup at dispatch time would find nothing.
-    let proj_root_str = state
-        .wiki
-        .project_root(src_ws, src_proj)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(src_ws, src_proj).await {
-        Ok(()) => files_deleted.push(proj_root_str),
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // Remove the source's wiki and raw-workstream directories, then dispatch
+    // the non-blocking purge webhook. Pass the workspace/project names cached
+    // in `resolved_purge_ctx`; the DB rows no longer exist for lookup.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        state,
+        src_ws,
+        src_proj,
+        &summary.workstream_ids,
+        "move-project",
+    )
+    .await;
     // See `handle_purge_project` for the rationale on `partial_failure`.
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -4244,6 +4341,7 @@ async fn copy_purge_merge(
         merged_into_existing: true,
         moved_via: "copy-purge",
         pages_copied,
+        workstreams_moved: 0,
         pages_skipped: Vec::new(),
         source_purged: true,
         source_pages_deleted: summary.pages_deleted,
@@ -5076,6 +5174,152 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn open_sessions_filters_by_scope_and_agent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_agent = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        for (id, project_id, agent) in [
+            (older, target, AgentKind::Codex),
+            (other_agent, target, AgentKind::ClaudeCode),
+            (other_scope, other_project, AgentKind::Codex),
+            (ended, target, AgentKind::Codex),
+            (latest, target, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+        });
+
+        // Default: only the newest open session for the scope + agent.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], latest.to_string());
+        assert_eq!(sessions[0]["cwd"], "/tmp/target");
+
+        // `all=true`: every open codex session in the scope, ended and
+        // other-scope/other-agent sessions excluded.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+
+        // Unknown agent kind fails closed with a 400.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=ghost&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
     }
 
     fn read_page_test_router() -> (TempDir, Router) {

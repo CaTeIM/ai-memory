@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BIN=${AI_MEMORY_ACCEPTANCE_BIN:-"$ROOT/target/debug/ai-memory"}
 KEEP=${AI_MEMORY_ACCEPTANCE_KEEP:-0}
 DETERMINISTIC_ONLY=${AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY:-0}
-HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi"}
+HARNESS_WORDS=${AI_MEMORY_ACCEPTANCE_HARNESSES:-"claude codex opencode pi crush omp kimi grok"}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-workstream-acceptance.XXXXXX")
 DATA="$TMP/data"
 REPO="$TMP/repo"
@@ -85,6 +85,83 @@ done
   exit 1
 }
 
+workstream_hex() {
+  local name=$1
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT lower(hex(id)) FROM workstreams WHERE name = '$name' ORDER BY selected_at DESC LIMIT 1;"
+}
+
+latest_workstream_sequence() {
+  local hex=$1
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT COALESCE(MAX(sequence), 0) FROM workstream_events WHERE workstream_id = x'$hex';"
+}
+
+current_delivery_cursor() {
+  local hex=$1
+  local agent=$2
+  sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT COALESCE((
+       SELECT delivery_cursor FROM workstream_native_sessions
+        WHERE workstream_id = x'$hex'
+          AND agent_kind = '$agent'
+          AND is_current = 1
+     ), 0);"
+}
+
+# Assert the deterministic boundaries of one real or fake managed leg:
+# the harness produced a new assistant event, and any assigned context delta
+# was acknowledged by its hook/launcher delivery path. Model recall is not a
+# protocol oracle: large hook results may be file-backed, and whether a model
+# chooses to read that file must not decide acceptance.
+assert_managed_leg() {
+  local hex=$1
+  local expected_agent=$2
+  local before_sequence=$3
+  local before_delivery=$4
+  local expect_context=$5
+  local log=$6
+  local native_id delivery sync_after sync_through context_delivered
+
+  native_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+    "SELECT native_session_id FROM workstream_events
+       WHERE workstream_id = x'$hex'
+         AND sequence > $before_sequence
+         AND agent_kind = '$expected_agent'
+         AND role = 'assistant'
+       ORDER BY sequence DESC LIMIT 1;")
+  [ -n "$native_id" ] || {
+    printf '%s did not persist a new assistant event after ledger sequence %s\n' \
+      "$expected_agent" "$before_sequence" >&2
+    tail -120 "$log" >&2
+    return 1
+  }
+
+  if [ "$expect_context" = 1 ]; then
+    if [ "$before_sequence" -le "$before_delivery" ]; then
+      printf '%s had no managed context delta to assign (ledger: %s, cursor: %s)\n' \
+        "$expected_agent" "$before_sequence" "$before_delivery" >&2
+      tail -120 "$log" >&2
+      return 1
+    fi
+    delivery=$(sqlite3 -separator '|' "$DATA/db/memory.sqlite" \
+      "SELECT sync_after, sync_through, context_delivered
+         FROM managed_runs
+        WHERE workstream_id = x'$hex' AND agent_kind = '$expected_agent'
+        ORDER BY started_at DESC LIMIT 1;")
+    IFS='|' read -r sync_after sync_through context_delivered <<<"$delivery"
+    if [ -z "$delivery" ] || [ "${sync_through:-0}" -ne "$before_sequence" ] ||
+      [ "${context_delivered:-0}" -ne 1 ]; then
+      printf '%s did not acknowledge its assigned managed context delta (state: %s)\n' \
+        "$expected_agent" "${delivery:-missing}" >&2
+      tail -120 "$log" >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$native_id"
+}
+
 FAKE="$TMP/fake-harness.sh"
 cat >"$FAKE" <<'EOF'
 #!/usr/bin/env bash
@@ -138,6 +215,32 @@ case "${AI_MEMORY_ACCEPTANCE_FAKE_MODE:-argv}" in
       "$(date +%s)000" "$sentinel" >>"$wire"
     printf '{"type":"context.append_message","time":%s,"message":{"role":"assistant","content":[{"type":"text","text":"%s reply"}],"toolCalls":[]}}\n' \
       "$(date +%s)000" "$sentinel" >>"$wire"
+    ;;
+  grok)
+    printf '%s\n' "$@" >"$AI_MEMORY_ACCEPTANCE_ARGV_LOG"
+    # Honor the wrapper-owned `--session-id <id>` (fresh) and `--resume <id>`
+    # (returning) selectors the way the real CLI does.
+    session_id=""
+    previous_arg=""
+    for arg in "$@"; do
+      case "$previous_arg" in
+        --session-id | --resume) session_id=$arg ;;
+      esac
+      previous_arg=$arg
+    done
+    [ -n "$session_id" ] || session_id="019f-fake-$(date +%s)-$$"
+    # The bucket directory name is a URL-encoded cwd in the real layout, but
+    # discovery must read summary.json's info.cwd instead of parsing it.
+    session_dir="${GROK_HOME:?grok fake mode requires GROK_HOME}/sessions/%2Ffixture%2Fbucket/$session_id"
+    mkdir -p "$session_dir"
+    chat="$session_dir/chat_history.jsonl"
+    if [ ! -f "$session_dir/summary.json" ]; then
+      printf '{"info":{"id":"%s","cwd":"%s"}}\n' "$session_id" "$PWD" >"$session_dir/summary.json"
+      printf '{"type":"system","content":"fake grok system prompt"}\n' >"$chat"
+    fi
+    sentinel=${AI_MEMORY_ACCEPTANCE_SENTINEL:-AMWS-FAKE-GROK}
+    printf '{"type":"user","content":[{"type":"text","text":"%s"}]}\n' "$sentinel" >>"$chat"
+    printf '{"type":"assistant","content":"%s reply"}\n' "$sentinel" >>"$chat"
     ;;
 esac
 EOF
@@ -287,6 +390,8 @@ mapfile -t auto_claude_first <"$TMP/auto-claude-first-argv.log"
   exit 1
 }
 auto_claude_id=${auto_claude_first[1]}
+printf '{"sessionId":"%s","cwd":"%s"}\n' "$auto_claude_id" "$REPO" \
+  >"$AUTO_CLAUDE_HOME/projects/fixture/$auto_claude_id.jsonl"
 (
   cd "$REPO"
   HOME="$AUTO_HOME" CODEX_HOME="$AUTO_CODEX_HOME" \
@@ -410,6 +515,152 @@ jq -e \
   exit 1
 }
 
+# Deleting the linked native store must heal the established workstream instead
+# of feeding the dead id back to Kimi forever.
+rm -rf "$kimi_session_dir"
+(
+  cd "$REPO"
+  KIMI_CODE_HOME="$KIMI_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=kimi \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/kimi-orphan-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-KIMI-RECOVERED" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      kimi >"$LOGS/edge-kimi-orphan.log" 2>&1
+)
+if grep -q . "$TMP/kimi-orphan-argv.log"; then
+  printf 'orphaned kimi session was not replaced by a fresh launch\n' >&2
+  cat "$TMP/kimi-orphan-argv.log" >&2
+  exit 1
+fi
+grep -q "linked kimi session .* is missing from its native store" \
+  "$LOGS/edge-kimi-orphan.log"
+kimi_recovered_dir=$(find "$KIMI_FAKE_HOME/sessions" -mindepth 2 -maxdepth 2 -type d -print -quit)
+[ -n "$kimi_recovered_dir" ] || {
+  printf 'orphan recovery did not create a replacement kimi session\n' >&2
+  exit 1
+}
+kimi_recovered_id=$(basename "$kimi_recovered_dir")
+[ "$kimi_recovered_id" != "$kimi_session_id" ] || {
+  printf 'orphan recovery reused the deleted kimi session id\n' >&2
+  exit 1
+}
+kimi_current_id=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT native_session_id FROM workstream_native_sessions WHERE workstream_id = x'${kimi_ws_hex}' AND agent_kind = 'kimi-code' AND is_current = 1;")
+[ "$kimi_current_id" = "$kimi_recovered_id" ] || {
+  printf 'orphan recovery did not repoint the kimi workstream\n' >&2
+  exit 1
+}
+
+# Grok fake-mode fixture: the fake grok honors the wrapper's `--session-id`
+# (fresh) and `--resume <id>` (returning) selectors, writes the native store
+# layout ($GROK_HOME/sessions/<bucket>/<id>/summary.json plus
+# chat_history.jsonl), and appends the round sentinel. The returning launch
+# must also receive the undelivered workstream packet through `--rules`.
+GROK_FAKE_HOME="$CONFIG/grok-fake"
+mkdir -p "$GROK_FAKE_HOME"
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-first-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-ONE" \
+    "$BIN" --data-dir "$DATA" run --new edge-grok --executable "$FAKE" \
+      grok >"$LOGS/edge-grok-first.log" 2>&1
+)
+grep -qx -- '--session-id' "$TMP/grok-first-argv.log" || {
+  printf 'fresh grok launch did not receive a wrapper session id\n' >&2
+  cat "$TMP/grok-first-argv.log" >&2
+  exit 1
+}
+if grep -qx -- '--rules' "$TMP/grok-first-argv.log"; then
+  printf 'fresh grok launch on an empty workstream unexpectedly received --rules\n' >&2
+  exit 1
+fi
+grok_session_id=$(basename "$(find "$GROK_FAKE_HOME/sessions" -mindepth 2 -maxdepth 2 -type d -print -quit)")
+[ -n "$grok_session_id" ] || {
+  printf 'fake grok did not create a native session store\n' >&2
+  exit 1
+}
+grok_ws_hex=$(sqlite3 "$DATA/db/memory.sqlite" \
+  "SELECT lower(hex(id)) FROM workstreams WHERE name = 'edge-grok' ORDER BY selected_at DESC LIMIT 1;")
+[ "${#grok_ws_hex}" -eq 32 ] || {
+  printf 'could not resolve the edge-grok workstream id\n' >&2
+  exit 1
+}
+grok_ws_id="${grok_ws_hex:0:8}-${grok_ws_hex:8:4}-${grok_ws_hex:12:4}-${grok_ws_hex:16:4}-${grok_ws_hex:20:12}"
+grok_first_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$grok_ws_id" --limit 100 --json "AMWS-FAKE-GROK-ONE")
+jq -e --arg id "$grok_session_id" \
+  '[.[] | select(.agent == "grok" and .role == "assistant" and (.content | contains("AMWS-FAKE-GROK-ONE")) and .native_session_id == $id)] | length == 1' \
+  <<<"$grok_first_hits" >/dev/null || {
+  printf 'grok chat_history.jsonl sentinel was not imported\n' >&2
+  tail -80 "$LOGS/edge-grok-first.log" >&2
+  exit 1
+}
+# Returning to the same grok session must resume it (`--resume <id>`) and,
+# because that session already produced every workstream event, receive no
+# context packet.
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-second-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-TWO" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-grok --executable "$FAKE" \
+      grok-build >"$LOGS/edge-grok-second.log" 2>&1
+)
+grep -A1 -x -- '--resume' "$TMP/grok-second-argv.log" | grep -qx "$grok_session_id" || {
+  printf 'returning grok launch did not resume the linked session\n' >&2
+  cat "$TMP/grok-second-argv.log" >&2
+  exit 1
+}
+if grep -qx -- '--rules' "$TMP/grok-second-argv.log"; then
+  printf 'same-session grok resume unexpectedly received a context packet\n' >&2
+  exit 1
+fi
+grok_second_hits=$("$BIN" --data-dir "$DATA" workstream-search \
+  --workstream-id "$grok_ws_id" --limit 100 --json "AMWS-FAKE-GROK")
+jq -e \
+  '([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-GROK-ONE")))] | length == 1)
+   and ([.[] | select(.role == "assistant" and (.content | contains("AMWS-FAKE-GROK-TWO")))] | length == 1)' \
+  <<<"$grok_second_hits" >/dev/null || {
+  printf 'grok incremental import duplicated or missed a round sentinel\n' >&2
+  tail -80 "$LOGS/edge-grok-second.log" >&2
+  exit 1
+}
+
+# A fresh grok session joining the established edge-kimi workstream must
+# receive that workstream's history through `--rules`, with historical tool
+# activity labelled as completed evidence.
+grok_cross_before=$(latest_workstream_sequence "$kimi_ws_hex")
+grok_cross_delivery=$(current_delivery_cursor "$kimi_ws_hex" grok)
+(
+  cd "$REPO"
+  GROK_HOME="$GROK_FAKE_HOME" \
+  AI_MEMORY_ACCEPTANCE_FAKE_MODE=grok \
+  AI_MEMORY_ACCEPTANCE_ARGV_LOG="$TMP/grok-cross-argv.log" \
+  AI_MEMORY_ACCEPTANCE_SENTINEL="AMWS-FAKE-GROK-CROSS" \
+    "$BIN" --data-dir "$DATA" run --workstream edge-kimi --executable "$FAKE" \
+      grok >"$LOGS/edge-grok-cross.log" 2>&1
+)
+grep -qx -- '--session-id' "$TMP/grok-cross-argv.log" || {
+  printf 'grok joining an established workstream did not start a fresh session\n' >&2
+  cat "$TMP/grok-cross-argv.log" >&2
+  exit 1
+}
+grep -qx -- '--rules' "$TMP/grok-cross-argv.log" || {
+  printf 'grok joining an established workstream did not receive --rules context\n' >&2
+  cat "$TMP/grok-cross-argv.log" >&2
+  exit 1
+}
+grep -q 'AMWS-FAKE-KIMI' "$TMP/grok-cross-argv.log" || {
+  printf 'the grok --rules packet did not carry the prior harness history\n' >&2
+  exit 1
+}
+assert_managed_leg "$kimi_ws_hex" grok "$grok_cross_before" \
+  "$grok_cross_delivery" 1 \
+  "$LOGS/edge-grok-cross.log" >/dev/null
+
 # A blank first launch remains eligible for one-time native-session adoption.
 # Use a pseudo-terminal because redirected/scripted launches deliberately skip
 # the chooser.
@@ -484,6 +735,7 @@ harnesses=()
 for requested_harness in "${requested_harnesses[@]}"; do
   case "$requested_harness" in
     kimi-code | kimi-cli) harness=kimi ;;
+    grok-build) harness=grok ;;
     *) harness=$requested_harness ;;
   esac
   if command -v "$harness" >/dev/null 2>&1; then
@@ -509,10 +761,11 @@ OMP_EXTENSION="$CONFIG/omp/ai-memory.ts"
 OMP_AGENT_DIR="$CONFIG/omp/agent"
 CRUSH_DATA_DIR="$CONFIG/crush/data"
 KIMI_ACCEPTANCE_HOME="$CONFIG/kimi-home"
+GROK_ACCEPTANCE_HOME="$CONFIG/grok-home"
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")" "$(dirname "$CODEX_HOOKS")" \
   "$(dirname "$OPENCODE_PLUGIN")" "$(dirname "$PI_EXTENSION")" \
   "$(dirname "$OMP_EXTENSION")" "$OMP_AGENT_DIR" "$OPENCODE_DATA_HOME/opencode" \
-  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME"
+  "$CRUSH_DATA_DIR" "$KIMI_ACCEPTANCE_HOME" "$GROK_ACCEPTANCE_HOME"
 
 # Redirect native transcript stores into the fixture while reusing only the
 # minimum authentication material required for real model calls.
@@ -567,6 +820,15 @@ for relative in credentials/kimi-code.json oauth/kimi-code device_id; do
   fi
 done
 
+# Grok resolves everything below $GROK_HOME. Seed the isolated home with the
+# operator's login state and settings only; native sessions, logs, and caches
+# remain isolated.
+for relative in auth.json config.toml; do
+  if [ -f "$HOME/.grok/$relative" ]; then
+    cp "$HOME/.grok/$relative" "$GROK_ACCEPTANCE_HOME/$relative"
+  fi
+done
+
 install_hook() {
   local agent=$1
   local target=$2
@@ -591,21 +853,6 @@ install_hook pi "$PI_EXTENSION"
 install_hook omp "$OMP_EXTENSION"
 install_hook kimi-code "$KIMI_ACCEPTANCE_HOME/config.toml"
 
-uuid_from_hex() {
-  local hex=$1
-  printf '%s-%s-%s-%s-%s\n' \
-    "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
-}
-
-workstream_id() {
-  local name=$1
-  local hex
-  hex=$(sqlite3 "$DATA/db/memory.sqlite" \
-    "SELECT lower(hex(id)) FROM workstreams WHERE name = '$name' ORDER BY selected_at DESC LIMIT 1;")
-  [ "${#hex}" -eq 32 ] || return 1
-  uuid_from_hex "$hex"
-}
-
 agent_wire_name() {
   case "$1" in
     claude) printf 'claude-code\n' ;;
@@ -622,18 +869,22 @@ uppercase() {
 run_harness() {
   local harness=$1
   local current=$2
-  local previous=$3
-  local first_run=$4
+  local first_run=$3
+  local expect_context=$4
   local log="$LOGS/real-$harness-$current.log"
   local prompt
   local expected_agent
+  local before_sequence=0
+  local before_delivery=0
+  local existing_hex
   local -a wrapper_args native_args
   expected_agent=$(agent_wire_name "$harness")
-  if [ -z "$previous" ]; then
-    prompt="Do not use tools. Reply with exactly: $current"
-  else
-    prompt="Do not use tools. In the newest assistant event from the injected ai-memory managed-workstream context, find the final whitespace-delimited token beginning with AMWS-. Reply with exactly that token, one space, then $current."
+  existing_hex=$(workstream_hex "$WORKSTREAM_NAME")
+  if [ -n "$existing_hex" ]; then
+    before_sequence=$(latest_workstream_sequence "$existing_hex")
+    before_delivery=$(current_delivery_cursor "$existing_hex" "$expected_agent")
   fi
+  prompt="Reply with exactly: $current"
   if [ "$first_run" = 1 ]; then
     wrapper_args=(--new "$WORKSTREAM_NAME")
   else
@@ -669,6 +920,10 @@ run_harness() {
       native_args=(-p "$prompt")
       [ -z "${AI_MEMORY_ACCEPTANCE_KIMI_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_KIMI_MODEL" "$prompt")
       ;;
+    grok)
+      native_args=(-p "$prompt")
+      [ -z "${AI_MEMORY_ACCEPTANCE_GROK_MODEL:-}" ] || native_args=(-p -m "$AI_MEMORY_ACCEPTANCE_GROK_MODEL" "$prompt")
+      ;;
     *)
       printf 'unsupported acceptance harness: %s\n' "$harness" >&2
       return 1
@@ -698,53 +953,64 @@ run_harness() {
     (cd "$REPO" && KIMI_CODE_HOME="$KIMI_ACCEPTANCE_HOME" \
       "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
       >"$log" 2>&1
+  elif [ "$harness" = grok ]; then
+    (cd "$REPO" && GROK_HOME="$GROK_ACCEPTANCE_HOME" \
+      "$BIN" --data-dir "$DATA" run "${wrapper_args[@]}" "$harness" "${native_args[@]}") \
+      >"$log" 2>&1
   else
     (cd "$REPO" && "$BIN" --data-dir "$DATA" run \
       "${wrapper_args[@]}" "$harness" "${native_args[@]}") >"$log" 2>&1
   fi
 
-  local id results event native_id
-  id=$(workstream_id "$WORKSTREAM_NAME")
-  results=$("$BIN" --data-dir "$DATA" workstream-search \
-    --workstream-id "$id" --limit 100 --json "$current")
-  event=$(jq -c --arg agent "$expected_agent" --arg current "$current" \
-    '[.[] | select(.agent == $agent and .role == "assistant" and (.content | contains($current)))] | last // empty' \
-    <<<"$results")
-  [ -n "$event" ] || {
-    printf '%s did not persist an assistant event containing %s\n' "$harness" "$current" >&2
+  local hex native_id
+  hex=$(workstream_hex "$WORKSTREAM_NAME")
+  [ "${#hex}" -eq 32 ] || {
+    printf 'could not resolve workstream %s after the %s leg\n' \
+      "$WORKSTREAM_NAME" "$harness" >&2
     tail -120 "$log" >&2
     return 1
   }
-  if [ -n "$previous" ] && ! jq -e --arg previous "$previous" \
-    '.content | contains($previous)' <<<"$event" >/dev/null; then
-    printf '%s did not demonstrate receipt of prior sentinel %s\n' "$harness" "$previous" >&2
-    jq -r '.content' <<<"$event" >&2
+  if ! native_id=$(assert_managed_leg "$hex" "$expected_agent" \
+    "$before_sequence" "$before_delivery" "$expect_context" "$log"); then
     return 1
   fi
-  native_id=$(jq -r '.native_session_id' <<<"$event")
   printf '%s\n' "$native_id"
 }
 
 WORKSTREAM_NAME="native-acceptance-$(date +%s)-$$"
 RUN_TAG="$(date +%s)-$$"
-previous=""
 first_harness=${harnesses[0]}
+first_agent=$(agent_wire_name "$first_harness")
 first_native=""
+previous_agent=""
 index=0
 for harness in "${harnesses[@]}"; do
   current="AMWS-$RUN_TAG-$(uppercase "$harness")"
+  current_agent=$(agent_wire_name "$harness")
   first_run=0
+  expect_context=0
   [ "$index" -ne 0 ] || first_run=1
-  native_id=$(run_harness "$harness" "$current" "$previous" "$first_run")
+  if [ -n "$previous_agent" ] && [ "$current_agent" != "$previous_agent" ]; then
+    expect_context=1
+  fi
+  if ! native_id=$(run_harness "$harness" "$current" "$first_run" \
+    "$expect_context"); then
+    exit 1
+  fi
   if [ "$index" -eq 0 ]; then
     first_native=$native_id
   fi
-  previous=$current
+  previous_agent=$current_agent
   index=$((index + 1))
 done
 
 return_sentinel="AMWS-$RUN_TAG-$(uppercase "$first_harness")-RETURN"
-returned_native=$(run_harness "$first_harness" "$return_sentinel" "$previous" 0)
+return_expects_context=0
+[ "$first_agent" = "$previous_agent" ] || return_expects_context=1
+if ! returned_native=$(run_harness "$first_harness" "$return_sentinel" 0 \
+  "$return_expects_context"); then
+  exit 1
+fi
 [ "$returned_native" = "$first_native" ] || {
   printf '%s resumed native session %s, expected %s\n' \
     "$first_harness" "$returned_native" "$first_native" >&2

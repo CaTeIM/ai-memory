@@ -365,12 +365,18 @@ impl Consolidator {
 
         let ids = self.wiki.apply_batch(requests).await?;
         let rationale_short = batch.rationale.chars().take(60).collect::<String>();
-        let _ = self.wiki.commit_all(&format!(
-            "consolidate-batch(session {}): {} page(s) — {}",
-            short_id(&session_id.to_string()),
-            ids.len(),
-            rationale_short,
-        ));
+        let _ = self
+            .wiki
+            .commit_all(&format!(
+                "consolidate-batch(session {}): {} page(s) — {}",
+                short_id(&session_id.to_string()),
+                ids.len(),
+                rationale_short,
+            ))
+            .map_err(|e| {
+                tracing::warn!(error = %e, "consolidate-batch auto-commit failed");
+                e
+            });
 
         let outcomes = outcomes_preview
             .into_iter()
@@ -863,6 +869,24 @@ mod tests {
         assert!(BATCH_SYSTEM_PROMPT.contains(guidance));
         assert!(SYSTEM_PROMPT.contains("must not be presented as current fact"));
         assert!(BATCH_SYSTEM_PROMPT.contains("must not be presented as current fact"));
+    }
+
+    #[test]
+    fn consolidation_system_prompts_require_graph_links_and_input_language() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(prompt.contains("## WIKILINKS"), "{name} prompt");
+            assert!(prompt.contains("## OUTPUT LANGUAGE"), "{name} prompt");
+            assert!(prompt.contains("[[project:page-path]]"), "{name} prompt");
+            assert!(prompt.contains("[[_global:page-path]]"), "{name} prompt");
+            assert!(
+                prompt.contains("dominant natural language of the input"),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("JSON keys stay in English"),
+                "{name} prompt"
+            );
+        }
     }
 
     #[test]

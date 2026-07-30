@@ -1,8 +1,8 @@
 # Adding a managed harness
 
 Managed-workstream support is narrower than MCP or lifecycle-hook support. This
-release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP.
-Gemini CLI, Devin CLI, Cursor, Grok Build CLI, and the other integrations in
+release can manage Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and
+Grok Build CLI. Gemini CLI, Devin CLI, Cursor, and the other integrations in
 the README support matrix do not become managed merely because ai-memory can
 capture their hooks.
 
@@ -58,9 +58,10 @@ authoritative for an established workstream.
 
 Implement fresh, resume, and explicit-selector behavior in
 `crates/ai-memory-workstream/src/harness.rs`. Preserve every user argument and
-its order except the exact wrapper-owned `--yolo` token. An explicit native
-selector always wins over ai-memory's linked session. Help, version, login,
-doctor, export, and similar utility commands must not receive session flags.
+its order except the exact wrapper-owned `--yolo` and `--fresh` tokens. An
+explicit native selector always wins over ai-memory's linked session. Help,
+version, login, doctor, export, and similar utility commands must not receive
+session flags.
 
 Generate a session id only when the native CLI officially accepts a caller
 provided id. Otherwise let the harness create the session, then discover it by
@@ -68,6 +69,12 @@ exact checkout and launch time. Do not infer a session from "newest globally."
 
 Map `--yolo` only to a verified native option and avoid duplicates. If the
 harness has no equivalent, add no flag and document that fact.
+
+Support wrapper `--fresh` by checking the exact linked id in the native store
+before injecting a resume selector. A confirmed missing id starts fresh; an
+unreadable or malformed store remains an error rather than being treated as
+absence. Reject `--fresh` when the user also supplied a native resume, session,
+continue, or fork selector.
 
 ## 4. Discover and export read-only
 
@@ -128,8 +135,9 @@ precedence, directory renames, or conflicts.
 
 A managed-harness PR should include focused coverage for:
 
-- fresh launch, linked resume, explicit-selector precedence, argv order,
-  utility passthrough, path overrides, and `--yolo` mapping;
+- fresh launch, linked resume, missing-linked-session recovery,
+  explicit-selector precedence, argv order, utility passthrough, path
+  overrides, `--yolo` mapping, and wrapper `--fresh`;
 - candidate ordering, exact-checkout isolation, timestamp handling, read-only
   access, incremental cursors, stable ids, incomplete records, visible record
   inclusion, and private record exclusion;
@@ -138,9 +146,11 @@ A managed-harness PR should include focused coverage for:
 - the `AgentKind::ALL` schema invariant when a kind is added;
 - deterministic fake-process acceptance in
   `scripts/managed-workstream-acceptance.sh`; and
-- a manual real-harness pass that switches into the new harness, observes the
-  prior sentinel, persists its reply, and resumes its original native session
-  when revisited.
+- a manual real-harness pass that switches into the new harness, records
+  successful delivery of its assigned context delta, persists a new assistant
+  event, and resumes its original native session when revisited. Do not make
+  pass/fail depend on the model quoting packet text: some harnesses externalize
+  large hook results to a file, making recall depend on a model tool-use choice.
 
 The deterministic phase remains credential-free and suitable for frequent
 local runs. Real model calls stay opt-in and outside CI. Record the tested CLI

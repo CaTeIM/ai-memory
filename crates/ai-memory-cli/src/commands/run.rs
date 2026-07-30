@@ -16,13 +16,14 @@ use ai_memory_core::{
 use ai_memory_workstream::{
     ExportedTranscript, LaunchMode, LaunchPlan, ManagedHarness, NativeSessionCandidate,
     allows_native_session_adoption, apply_yolo, build_launch_plan, discover_native_session,
-    export_transcript, inspect_repository, list_native_sessions, wait_for_transcript_flush,
+    export_transcript, has_native_session_selector, inspect_repository, list_native_sessions,
+    native_session_exists, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use tokio::process::Command;
 
 use crate::cli::{RunArgs, RunHarnessChoice};
-use crate::commands::{path_util, resolve_project_name};
+use crate::commands::{path_util, resolve_scope};
 use crate::config::Config;
 use crate::http_client::{
     ServerEndpoint, ServerResponseError, get_json, post_empty, post_json, post_json_no_content,
@@ -57,6 +58,8 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
+    let trailing_fresh = remove_wrapper_fresh(&mut native_args);
+    let force_fresh = args.fresh || trailing_fresh;
     if automatic_harness && !native_args.is_empty() {
         return Err(anyhow!(
             "native harness arguments require an explicit harness; try `ai-memory run codex ...`"
@@ -84,11 +87,16 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     };
     let executable = args.executable.map(PathBuf::into_os_string);
     ensure_executable_available(provisional_harness, executable.as_deref())?;
-    let project = resolve_project_name(config, args.project.as_deref())?;
-    let may_adopt_native_session = args.new_workstream.is_none();
+    // Resolve BOTH halves here. `--workspace` used to default to a literal
+    // `default`, so a checkout whose marker declared another workspace put its
+    // managed workstream in one scope while its hook-captured sessions went to
+    // another — the same repository split in two.
+    let (workspace, project) =
+        resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let prepare = PrepareManagedRunRequest {
-        workspace: args.workspace,
+        workspace,
         project,
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint,
@@ -150,12 +158,30 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
         provisional_harness
     };
     acquired_try!(ensure_executable_available(harness, executable.as_deref()));
-    let mut plan = acquired_try!(build_launch_plan(
+    let native_grok_rules = user_supplied_grok_rules(&native_args);
+    let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
         harness,
         executable.clone(),
         native_args.clone(),
         prepared.native_session_id.as_deref(),
+        force_fresh,
+        &home,
+        &repository.cwd,
     ));
+    if let Some(orphaned_session) = orphaned_session {
+        eprintln!(
+            "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+            harness.as_str(),
+            display_session_id(&orphaned_session),
+            prepared.workstream_name
+        );
+    } else if force_fresh && plan.mode == LaunchMode::Session {
+        eprintln!(
+            "ai-memory: starting a fresh {} session in workstream '{}'",
+            harness.as_str(),
+            prepared.workstream_name
+        );
+    }
     if automatic_harness
         && prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
@@ -253,6 +279,25 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     } else {
         None
     };
+    let grok_context = if harness == ManagedHarness::Grok && plan.mode == LaunchMode::Session {
+        // `--rules` is single-use in Grok's argument parser, so a user-supplied
+        // rules flag wins and the packet stays undelivered (it is redelivered
+        // on the next managed run that can accept it).
+        if native_grok_rules {
+            eprintln!(
+                "ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"
+            );
+            None
+        } else {
+            acquired_try!(fetch_grok_context(&endpoint, &run_path).await)
+        }
+    } else {
+        None
+    };
+    if let Some(context) = &grok_context {
+        plan.args
+            .extend([OsString::from("--rules"), OsString::from(context)]);
+    }
     if interrupted_before_spawn.load(Ordering::SeqCst) {
         acquired_try!(Err(anyhow!(
             "managed run interrupted before the agent started"
@@ -307,15 +352,18 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
             ));
         }
     };
-    if harness == ManagedHarness::Crush
+    if (harness == ManagedHarness::Crush || grok_context.is_some())
         && let Err(error) = post_empty_with_retry(
             &endpoint,
             &format!("{run_path}/context/accept"),
-            "acknowledging Crush managed context",
+            "acknowledging managed context",
         )
         .await
     {
-        eprintln!("ai-memory: {error}; the context may be delivered again on the next Crush run");
+        eprintln!(
+            "ai-memory: {error}; the context may be delivered again on the next {} run",
+            harness.as_str()
+        );
     }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -511,6 +559,63 @@ fn remove_wrapper_yolo(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
+fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
+    let before = args.len();
+    args.retain(|arg| arg != OsStr::new("--fresh"));
+    args.len() != before
+}
+
+fn build_preflighted_launch_plan(
+    harness: ManagedHarness,
+    executable: Option<OsString>,
+    native_args: Vec<OsString>,
+    linked_session_id: Option<&str>,
+    force_fresh: bool,
+    home: &Path,
+    cwd: &Path,
+) -> Result<(LaunchPlan, Option<String>)> {
+    let explicit_selector = has_native_session_selector(harness, &native_args);
+    if force_fresh && explicit_selector {
+        return Err(anyhow!(
+            "--fresh cannot be combined with a native session, resume, continue, or fork selector"
+        ));
+    }
+    let linked_session_id = if force_fresh { None } else { linked_session_id };
+    let plan = build_launch_plan(
+        harness,
+        executable.clone(),
+        native_args.clone(),
+        linked_session_id,
+    )?;
+    let Some(linked_session_id) = linked_session_id else {
+        return Ok((plan, None));
+    };
+    if explicit_selector || plan.mode != LaunchMode::Session {
+        return Ok((plan, None));
+    }
+    match native_session_exists(
+        harness,
+        home,
+        cwd,
+        plan.session_dir.as_deref(),
+        linked_session_id,
+    ) {
+        Ok(true) => Ok((plan, None)),
+        Ok(false) => Ok((
+            build_launch_plan(harness, executable, native_args, None)?,
+            Some(linked_session_id.to_string()),
+        )),
+        Err(error) => {
+            eprintln!(
+                "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+                harness.as_str(),
+                display_session_id(linked_session_id)
+            );
+            Ok((plan, None))
+        }
+    }
+}
+
 fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsStr>) -> Result<()> {
     let program = executable.unwrap_or_else(|| OsStr::new(harness.executable()));
     if executable_available(program) {
@@ -568,6 +673,30 @@ fn executable_file(path: &Path) -> bool {
     {
         true
     }
+}
+
+fn user_supplied_grok_rules(native_args: &[OsString]) -> bool {
+    native_args.iter().any(|arg| {
+        arg.to_str().is_some_and(|value| {
+            ["--rules", "--append-system-prompt"]
+                .iter()
+                .any(|name| value == *name || value.starts_with(&format!("{name}=")))
+        })
+    })
+}
+
+/// Grok appends `--rules` text to its session system prompt, so the packet is
+/// delivered as an argument instead of a file. Acceptance happens only after
+/// the child spawns, matching the Crush contract.
+async fn fetch_grok_context(endpoint: &ServerEndpoint, run_path: &str) -> Result<Option<String>> {
+    let response: ManagedRunContextResponse = post_json(
+        endpoint,
+        &format!("{run_path}/context"),
+        &serde_json::json!({}),
+    )
+    .await
+    .context("loading the managed context for Grok; the agent was not started")?;
+    Ok(response.context)
 }
 
 async fn prepare_crush_context(
@@ -982,6 +1111,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Crush => ManagedHarness::Crush,
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
+        RunHarnessChoice::Grok => ManagedHarness::Grok,
     }
 }
 
@@ -993,6 +1123,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Pi => Some(ManagedHarness::Pi),
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
+        AgentKind::Grok => Some(ManagedHarness::Grok),
         _ => None,
     }
 }
@@ -1024,6 +1155,24 @@ mod tests {
                 updated_at: SystemTime::UNIX_EPOCH,
             },
         ]
+    }
+
+    #[test]
+    fn native_grok_rules_flags_suppress_context_injection() {
+        for args in [
+            vec![OsString::from("--rules"), OsString::from("be terse")],
+            vec![OsString::from("--rules=be terse")],
+            vec![
+                OsString::from("--append-system-prompt"),
+                OsString::from("x"),
+            ],
+        ] {
+            assert!(user_supplied_grok_rules(&args), "{args:?}");
+        }
+        assert!(!user_supplied_grok_rules(&[
+            OsString::from("--model"),
+            OsString::from("grok-4.5")
+        ]));
     }
 
     #[test]
@@ -1277,6 +1426,121 @@ mod tests {
             .to_vec();
         assert!(remove_wrapper_yolo(&mut args));
         assert_eq!(args, ["resume", "native-id"].map(OsString::from));
+    }
+
+    #[test]
+    fn wrapper_fresh_parses_before_or_after_the_harness() {
+        let cli = Cli::try_parse_from(["ai-memory", "run", "--fresh", "codex"]).unwrap();
+        let CliCommand::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(args.fresh);
+        assert!(args.native_args.is_empty());
+
+        let mut trailing = ["--fresh", "--model", "opus"].map(OsString::from).to_vec();
+        assert!(remove_wrapper_fresh(&mut trailing));
+        assert_eq!(trailing, ["--model", "opus"].map(OsString::from));
+    }
+
+    #[test]
+    fn missing_linked_session_starts_fresh_but_explicit_selectors_win() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let session_root = temp.path().join("pi-sessions");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&session_root).unwrap();
+        let transcript = session_root.join("linked.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session","id":"linked","cwd":cwd})
+            ),
+        )
+        .unwrap();
+        let native_args = [
+            OsString::from("--session-dir"),
+            session_root.as_os_str().to_os_string(),
+        ]
+        .to_vec();
+
+        let (resumed, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            native_args.clone(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert!(resumed.args.iter().any(|arg| arg == "--session"));
+        assert!(resumed.args.iter().any(|arg| arg == "linked"));
+
+        std::fs::remove_file(transcript).unwrap();
+        let (fresh, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            native_args.clone(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert_eq!(orphaned.as_deref(), Some("linked"));
+        assert!(fresh.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!fresh.args.iter().any(|arg| arg == "linked"));
+
+        let (explicit, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Pi,
+            None,
+            [
+                native_args,
+                [OsString::from("--session"), OsString::from("chosen")].to_vec(),
+            ]
+            .concat(),
+            Some("linked"),
+            false,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert_eq!(explicit.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    #[test]
+    fn force_fresh_bypasses_an_existing_link_and_rejects_native_selectors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (fresh, orphaned) = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            Vec::new(),
+            Some("linked"),
+            true,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap();
+        assert!(orphaned.is_none());
+        assert!(fresh.args.iter().any(|arg| arg == "--session-id"));
+        assert!(!fresh.args.iter().any(|arg| arg == "--resume"));
+
+        let error = build_preflighted_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            [OsString::from("--resume"), OsString::from("chosen")].to_vec(),
+            Some("linked"),
+            true,
+            temp.path(),
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--fresh cannot be combined"));
     }
 
     #[tokio::test]

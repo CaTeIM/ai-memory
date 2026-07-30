@@ -39,11 +39,34 @@ function Get-AiMemoryMarkerToml {
     param([string] $Cwd)
     if (-not $Cwd) { return $null }
     $dir = $Cwd
+    $home = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+    $boundary = $null
+    if ($home) {
+        $homePrefix = $home.TrimEnd([char[]]@('/', '\')) + [IO.Path]::DirectorySeparatorChar
+        $insideHome = ($dir -eq $home) -or $dir.StartsWith(
+            $homePrefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+        if ($insideHome) {
+            $boundary = $home
+        } else {
+            $probe = $dir
+            while ($probe -and (Test-Path $probe)) {
+                if (Test-Path (Join-Path $probe ".git")) {
+                    $boundary = $probe
+                    break
+                }
+                $parent = Split-Path $probe -Parent
+                if (-not $parent -or $parent -eq $probe) { break }
+                $probe = $parent
+            }
+            if (-not $boundary) { $boundary = $dir }
+        }
+    }
     while ($dir -and (Test-Path $dir)) {
         $candidate = Join-Path $dir ".ai-memory.toml"
         if (Test-Path $candidate -PathType Leaf) { return $candidate }
-        if ($env:HOME -and $dir -eq $env:HOME) { return $null }
-        if ($env:USERPROFILE -and $dir -eq $env:USERPROFILE) { return $null }
+        if ($boundary -and $dir -eq $boundary) { return $null }
         $parent = Split-Path $dir -Parent
         if (-not $parent -or $parent -eq $dir) { return $null }
         $dir = $parent
@@ -238,6 +261,19 @@ function Read-AiMemoryStdin {
     return ""
 }
 
+function Test-AiMemoryAntigravityInitialInvocation {
+    param([string] $Payload)
+    try {
+        $Parsed = $Payload | ConvertFrom-Json
+        $Property = $Parsed.PSObject.Properties["invocationNum"]
+        if ($null -eq $Property) { return $false }
+        $Value = $Property.Value
+        return (($Value -is [int] -or $Value -is [long]) -and [long]$Value -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function Invoke-AiMemoryHook {
     param(
         [Parameter(Mandatory = $true)] [string] $Event,
@@ -255,6 +291,10 @@ function Invoke-AiMemoryHook {
 
     $Server = if ($env:AI_MEMORY_HOOK_URL) { $env:AI_MEMORY_HOOK_URL } else { "http://127.0.0.1:49374" }
     $Payload = Read-AiMemoryStdin
+    if ($AntigravityPreInvocationOutput -and -not (Test-AiMemoryAntigravityInitialInvocation -Payload $Payload)) {
+        [Console]::Out.Write("{}")
+        return
+    }
     # Assistant/Stop capture (#196) is native-only. Scoped to claude-code + stop
     # so a PostToolUse whose tool output legitimately contains the literal string
     # is unaffected. If a Stop payload still carries the raw field, drop the whole

@@ -946,10 +946,10 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
 }
 
 /// True when an MCP server entry is ai-memory's: its url/httpUrl/serverUrl
-/// equals the endpoint, or it is a `mcp-remote` stdio shim whose args contain
-/// the endpoint. The key/name alone is intentionally not enough: users may
-/// have unrelated entries named `ai-memory`, and uninstall must not remove
-/// them unless the endpoint also matches.
+/// equals the endpoint, or it is an ai-memory-owned / `mcp-remote` stdio
+/// bridge whose args contain the endpoint. The key/name alone is intentionally
+/// not enough: users may have unrelated entries named `ai-memory`, and
+/// uninstall must not remove them unless the endpoint also matches.
 fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, url: &str) -> bool {
     if name.is_some_and(|name| key != name) {
         return false;
@@ -961,8 +961,10 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
     }
     if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
         let has_remote = args.iter().any(|a| a.as_str() == Some("mcp-remote"));
+        let has_session_bridge = entry.get("command").and_then(|v| v.as_str()) == Some("ai-memory")
+            && args.iter().any(|a| a.as_str() == Some("mcp-bridge"));
         let has_url = args.iter().any(|a| a.as_str() == Some(url));
-        if has_remote && has_url {
+        if (has_remote || has_session_bridge) && has_url {
             return true;
         }
     }
@@ -1712,6 +1714,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(removed, vec!["weird-name".to_string()]);
+    }
+
+    #[test]
+    fn strip_mcp_claude_code_session_aware_bridge() {
+        let content = r#"{"mcpServers":{"ai-memory":{"type":"stdio","command":"ai-memory","args":["mcp-bridge","--server-url","http://127.0.0.1:49374/mcp"]},"other":{"command":"other","args":["mcp-bridge","--server-url","http://127.0.0.1:49374/mcp"]}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::ClaudeCode,
+            None,
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(value["mcpServers"].get("ai-memory").is_none());
+        assert!(value["mcpServers"].get("other").is_some());
     }
 
     #[test]

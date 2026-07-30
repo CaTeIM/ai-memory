@@ -209,6 +209,136 @@ fn macos_wrapper_routes_urls_by_real_subcommand() {
     );
 }
 
+// Like run_wrapper_on_fake_macos's fake docker, but the wrapper is spawned with
+// stdin on a pipe: the shape every `cat page.md | ai-memory write-page --body -`
+// (and every CI/cron) invocation actually has.
+#[cfg(unix)]
+fn run_wrapper_with_piped_stdin(args: &[&str], stdin_payload: &str) -> String {
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let docker_args = tmp.path().join("docker-args.txt");
+    let docker = tmp.path().join("docker");
+    std::fs::write(
+        &docker,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\n",
+            shell_path(&docker_args)
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut child = shell_script_command(&repo_root().join("bin/ai-memory"))
+        .args(args)
+        .env("AI_MEMORY_DOCKER", shell_path(&docker))
+        .env("AI_MEMORY_NO_VERSION_CHECK", "1")
+        .env("AI_MEMORY_DATA_VOLUME", "test-ai-memory-data")
+        .env("HOME", shell_path(tmp.path()))
+        .env_remove("AI_MEMORY_SERVER_URL")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "wrapper failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(docker_args).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_keeps_stdin_attached_when_it_is_a_pipe() {
+    let args = run_wrapper_with_piped_stdin(
+        &["write-page", "--path", "notes/x.md", "--body", "-"],
+        "# body that must survive the container boundary\n",
+    );
+    let flags: Vec<&str> = args.lines().collect();
+
+    // Without `-i` docker gives the container a closed stdin, so `--body -`
+    // reads an empty string and the page is persisted with frontmatter only —
+    // silently, because the CLI still reports a successful write.
+    assert!(
+        flags.contains(&"-i"),
+        "piped stdin must stay attached for `--body -`; got {args}"
+    );
+    // A pipe is not a terminal: asking for a TTY here makes docker fail with
+    // "the input device is not a TTY".
+    assert!(
+        !flags.contains(&"-t") && !flags.contains(&"-it"),
+        "no TTY may be requested when stdin is a pipe; got {args}"
+    );
+    assert!(
+        flags
+            .iter()
+            .any(|arg| arg.starts_with("AI_MEMORY_SCOPE_CWD=/scope")),
+        "an outside-home checkout must expose its bounded marker path; got {args}"
+    );
+    assert!(
+        flags.iter().any(|arg| arg.ends_with(":/scope:ro")),
+        "the marker scope mount must be read-only; got {args}"
+    );
+}
+
+#[test]
+fn docker_wrappers_keep_stdin_attached_independently_of_tty_allocation() {
+    let posix = read_repo("bin/ai-memory");
+    assert!(
+        posix.contains("TTY_ARGS=(-i)"),
+        "POSIX wrapper must attach stdin before inspecting terminal state"
+    );
+    assert!(
+        posix.contains("TTY_ARGS+=(-t)"),
+        "POSIX wrapper must add TTY allocation separately"
+    );
+    assert!(
+        !posix.contains("TTY_ARGS=(-it)"),
+        "combined flags can drop stdin when only stdout is redirected"
+    );
+    assert!(
+        posix.contains("CLAUDE_CODE_SESSION_ID"),
+        "POSIX wrapper must forward Claude's session id into the bridge container"
+    );
+    assert!(posix.contains("git -C \"${PWD}\" rev-parse --show-toplevel"));
+    assert!(posix.contains("AI_MEMORY_SCOPE_CWD=/scope${SCOPE_REL}"));
+    assert!(posix.contains("${SCOPE_ROOT}:/scope:ro"));
+
+    let powershell = read_repo("bin/ai-memory.ps1");
+    assert!(
+        powershell.contains("$DockerArgs = @(\"run\", \"--rm\", \"-i\")"),
+        "PowerShell wrapper must attach stdin before inspecting console state"
+    );
+    assert!(
+        powershell.contains("$DockerArgs += \"-t\""),
+        "PowerShell wrapper must add TTY allocation separately"
+    );
+    assert!(
+        !powershell.contains("$DockerArgs += \"-it\""),
+        "PowerShell must not couple stdin attachment to TTY allocation"
+    );
+    assert!(
+        powershell.contains("\"CLAUDE_CODE_SESSION_ID\""),
+        "PowerShell wrapper must forward Claude's session id into the bridge container"
+    );
+    assert!(powershell.contains("AI_MEMORY_SCOPE_CWD=$ScopeCwd"));
+    assert!(powershell.contains("${ScopeRoot}:/scope:ro"));
+}
+
 #[cfg(unix)]
 #[test]
 fn managed_run_wrapper_uses_host_binary_path_and_remote_server_without_docker() {

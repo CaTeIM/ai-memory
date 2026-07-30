@@ -94,10 +94,10 @@ pub struct ProviderConfig {
     pub auth: ProviderAuth,
     /// Base URL override (required for OpenAI-compat).
     pub base_url: Option<String>,
-    /// Opt-in strict mode for the `openai-compat` provider: send
+    /// Strict mode for the `openai-compat` provider: send
     /// `response_format=json_schema` instead of the tolerant prose-JSON
-    /// parser. Ignored by every other provider. Sourced once from
-    /// `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
+    /// parser. Enabled by default and ignored by every other provider.
+    /// Sourced once from `AI_MEMORY_LLM_COMPAT_STRICT` by `Config::load`.
     pub compat_strict: bool,
 }
 

@@ -68,17 +68,29 @@ from hook paths.
    overlapping retry with the original processor. Downstream effects remain
    at-least-once until that completion marker, so a process crash during those
    effects may repeat an already applied effect rather than silently lose the
-   rest. `log.md` gets an appended
+   rest. For an interrupted already-ended SessionEnd, the replay converges the
+   wiki commit, durable provider job, and pending key without appending another
+   observation. `log.md` gets an appended
    `## [YYYY-MM-DDTHH:MM:SSZ] <event> | <title>` line.
 3. On true `SessionEnd` events, the server synthesises a
    `sessions/<id>.md` summary page (rule-based, no LLM) and opens a
-   `Handoff` row for the next agent. Auto-commits the wiki. Clients
+   `Handoff` row for the next agent. One SQLite transaction inserts that
+   automatic handoff, stamps the session ended, and records the covered
+   observation count, so recovery never sees only half of those DB effects. A
+   later SessionEnd re-runs the path only when that generation advances, so
+   resumed sessions are captured while duplicate delivery and clock skew
+   converge. Existing ended sessions are baselined at migration instead of
+   becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
-   Codex provides `ai-memory finalize-session`, while Antigravity CLI should
-   call `memory_handoff_begin` before quitting when a handoff is needed.
+   use `ai-memory finalize-session` for Codex, or
+   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
+   The command selects the latest matching open session and enters the same
+   canonical SessionEnd path as a native hook.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
-   multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
+   multi-page batch under `concepts/`, `decisions/`, `gotchas/`. Consolidation
+   prompts preserve the source material's dominant natural language and ask
+   the model to connect related pages with path-based wikilinks.
 5. When an LLM provider is configured, the auto-improvement scheduler reviews
    newly completed sessions across all projects outside hook latency. It records validated
    `concepts/`, `decisions/`, `gotchas/`, `procedures/`, and `_rules/` proposals
@@ -95,18 +107,29 @@ from hook paths.
    rejected candidates/rejection-buffer entries rather than wiki writes.
 6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
    embedder is configured, vector cosine over `page_embeddings` joins
-   the same RRF. If compiled wiki pages miss entirely in default,
+   the same RRF. Before final truncation, a bounded authority multiplier
+   adjusts the relevance score using the canonical page kind, tier,
+   `pinned`, and explicit positive/negative frontmatter tags. It favors
+   maintained rules, decisions, procedures, and gotchas in close contests
+   while keeping episodic, historical, lint, and test evidence searchable.
+   No query-intent regex or hard exclusion participates. If compiled wiki pages miss entirely in default,
    explicit project, or explicit `scopes` mode, bounded raw observation
    FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
    pages across projects only. Page hits bump `access_count` +
-   `last_accessed_at` - the M8 reinforcement term.
+   `last_accessed_at` - the M8 reinforcement term. That bump is throttled
+   to at most once per page per minute, so a burst of overlapping searches
+   does not flood the writer actor with redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
    access get purged. Semantic / pinned / freshly-touched pages survive.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
-   work, matching the auto-improvement scheduler's store-wide scope model.
+   work, matching the auto-improvement scheduler's store-wide scope model. A
+   separate daily cleanup removes week-old project rows only when they contain
+   no pages, sessions, observations, handoffs, managed workstreams, or
+   auto-improvement data; managed continuity history therefore keeps its
+   project scope alive even when no lifecycle-hook session has been captured.
 8. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
@@ -118,6 +141,17 @@ session, and marks lifecycle calls with an invocation-scoped run id.
 SessionStart injects an unseen bounded event range; Crush receives it through a
 temporary supported global-context path because it lacks SessionStart. The host
 imports the native transcript tail and a Git checkpoint when the child exits.
+Every injected packet starts with a versioned origin marker. The Claude
+transcript normalizer excludes a marked packet if Claude persists and reads it
+back, preventing delivered history from recursively re-entering the ledger.
+An explicitly pending handoff is delivered before the managed event range;
+their single-use delivery claims share one writer transaction after the
+complete startup response has been assembled. Manual handoffs take precedence;
+otherwise the newest cwd-eligible automatic handoff is delivered, and that
+same transaction expires older eligible automatic handoffs while preserving
+manual and sibling-directory work. Insertion also expires prior open automatic
+handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
+starts.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger
@@ -144,10 +178,16 @@ normalises them to exactly one of these `ObservationKind` values:
 | `pre-tool-use` | Agent is about to call a tool. |
 | `post-tool-use` | Agent finished a tool call. |
 | `pre-compact` | Agent is about to compact or compress its context. |
+| `post-compaction` | Agent compacted context and supplied a post-facto summary or checkpoint. |
 | `notification` | Agent emitted a notification-style event. |
 | `stop` | Agent finished an interactive turn or stopped naturally. |
 | `session-end` | Agent session ended; summary/handoff path may run. |
 | `other` | Unknown or unsupported hook event. |
+
+Antigravity CLI has no native SessionStart event. Its `PreInvocation` hook
+fires before every model call, so the bridge maps only the documented
+`invocationNum = 0` payload to `session-start`; later invocations are ignored
+before spool or network side effects.
 
 Unknown events do **not** expand the enum and, by default, leave no
 source-event metadata in storage; they collapse to `other`. Third-party
@@ -159,6 +199,15 @@ nullable observation metadata; `kind` stays canonical. This is an
 extension seam, not a runtime plugin system: external processors must use
 the existing HTTP/MCP APIs and cannot bypass the sanitizer, hook
 backpressure, or single-writer SQLite actor.
+
+Lifecycle bodies have content limits independent of the 10 MiB HTTP request
+limit. User prompts and post-compaction summaries are capped UTF-8-safely at
+16 KiB; notification and tool excerpts are capped at 2 KB. Native
+`ai-memory hook` commands apply the event-specific cap before local spooling
+and transport, and the server repeats it when parsing every request so direct
+and older clients cannot bypass it. The typed sanitizer boundary then applies a
+16 KiB backstop to every durable observation body after redaction. The
+separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 
 ## Storage architecture
 
@@ -185,7 +234,8 @@ backpressure, or single-writer SQLite actor.
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
-| `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. They are an operational audit trail, not a complete native transcript. |
+| `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
+| `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for opt-in SessionEnd LLM consolidation. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Optional lease state plus per-harness native source and delivery cursors for `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Append-only normalized visible transcript events and full-text search; immutable sanitized source batches also live under `raw/workstreams/`. |
@@ -263,7 +313,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
@@ -308,21 +358,32 @@ MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
 `q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
 cwd parameters use their canonical names.
 
+Claude Code's optional session-aware MCP registration is a transport adapter,
+not a second tool implementation. `ai-memory mcp-bridge` serves the upstream
+tool catalogue over local stdio, delegates tool calls to the configured HTTP
+server through rmcp's client transport, and injects the inherited
+`CLAUDE_CODE_SESSION_ID` as `X-Memory-Actor-Session-Id`. The server therefore
+keeps the same auth, scope resolver, and tool handlers as direct HTTP clients.
+The adapter fails closed without a Claude session id and is installed only by
+the explicit `install-mcp --client claude-code --session-aware` option.
+
 ## CLI subcommand surface
 
 ```
-init                 status               search
+init                 status               run
+workstream-search    audit-contamination  search
 read-page            write-page           delete-page
 serve                reset                backup
 restore              reindex              install-hooks
 hook                 install-mcp          commit
 checkpoints          restore-page         llm-test
-forget-sweep         lint                 auto-improve
-auto-improve-report  curator              pending-writes       embed
-generate-auth-token  setup-agent          bootstrap
-install-instructions install-skills        reorg
-rename-project       move-project         audit-contamination
-uninstall            auth                 user
+forget-sweep         lint                 curator
+auto-improve-report  auto-improve         finalize-session
+pending-writes       embed                generate-auth-token
+setup-agent          bootstrap            install-instructions
+install-skills       reorg                purge-project
+rename-project       move-project         uninstall
+auth                 user                 completions
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -427,6 +488,7 @@ AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini 
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override

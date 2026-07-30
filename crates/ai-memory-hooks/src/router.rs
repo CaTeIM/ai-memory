@@ -14,9 +14,10 @@ use std::sync::{Arc, Weak};
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, ManagedRunId, NewHandoff,
-    NewObservation, NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId,
-    WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff,
+    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, NewHandoff, NewObservation, NewSession,
+    ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent,
+    WorkstreamEventKind,
 };
 use ai_memory_store::{IngestObservationOutcome, WriterHandle};
 use ai_memory_wiki::Wiki;
@@ -452,6 +453,9 @@ pub struct HookState {
     /// session close stays cheap; the LLM checkpoint otherwise happens on
     /// PreCompact and via manual `memory_consolidate`.
     pub consolidate_on_session_end: bool,
+    /// Coalescing wake-up for the durable SessionEnd consolidation worker.
+    /// The database is the queue; notifications only reduce pickup latency.
+    pub session_consolidation_notify: Option<Arc<tokio::sync::Notify>>,
     /// Opt-in (`AI_MEMORY_CAPTURE_ASSISTANT`): when true, the server honors the
     /// client's `_ai_memory_assistant` protocol on a `Stop` event and persists
     /// the sanitized excerpt as the Stop body. Off by default; when off the
@@ -1016,9 +1020,10 @@ pub struct HandoffQuery {
     /// Identifier of the agent fetching the handoff. Used to mark the
     /// handoff as accepted-by; defaults to `Other` if unrecognised.
     pub agent: Option<String>,
-    /// Optional cwd filter. When provided, only handoffs whose stored
-    /// cwd matches this string are returned. Note: the cwd string is
-    /// not canonicalized; symlinked paths must match byte-for-byte.
+    /// Optional receiving cwd. Automatic handoffs whose stored cwd is this
+    /// directory or a path-boundary ancestor are eligible; manual handoffs are
+    /// project-wide. Paths are string-normalized, not filesystem-canonicalized,
+    /// so symlink aliases remain distinct.
     pub cwd: Option<String>,
     /// Workspace override (mirror of `HookQuery.workspace`). Lets the
     /// `session-start` hook fetch the handoff for the same `(workspace,
@@ -1083,48 +1088,14 @@ async fn fetch_and_accept_handoff(
     actor_user: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
-    if let Some(raw_run_id) = query.managed_run.as_deref() {
-        let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
-            warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
-            return Ok(None);
-        };
-        if let Some(native_session_id) = query
-            .session_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let _ = state
-                .writer
-                .link_managed_run_session(run_id, agent, native_session_id)
-                .await?;
-        }
-        let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
-            warn!(managed_run = %run_id, "managed SessionStart has no active run");
-            return Ok(None);
-        };
-        if context.agent != agent {
-            warn!(
-                managed_run = %run_id,
-                expected = %context.agent.as_str(),
-                actual = %agent.as_str(),
-                "managed SessionStart agent mismatch"
-            );
-            return Ok(None);
-        }
-        let brief_md =
-            resolve_requested_session_brief(state, &query, actor_user.as_deref()).await?;
-        if context.context_delivered {
-            return Ok(brief_md);
-        }
-        let rendered = render_managed_context(
-            &context.events,
-            &context.workstream_name,
-            context.workstream_id,
-            context.sync_after,
-        );
-        let _ = state.writer.accept_managed_run_context(run_id).await?;
-        return Ok(combine_handoff_and_brief(rendered, brief_md));
-    }
+    // A managed run's ledger is additive, not a replacement. Returning it here
+    // skipped `latest_open_handoff` below, so a session launched by
+    // `ai-memory run` never consumed the handoff a previous session left for
+    // it — the slot just stayed open, and the next managed session missed it
+    // too. The brief already reaches the managed path (it is recomposed per
+    // session, so resolving it twice was harmless); the handoff is single-use
+    // and had no second chance.
+    let managed = fetch_managed_context(state, &query, agent).await?;
     // `/handoff` has no session_id in the request — `per_session` mode
     // therefore falls back to the single slot (graceful degradation),
     // while `per_actor` keys by `user` alone.
@@ -1144,49 +1115,109 @@ async fn fetch_and_accept_handoff(
         false,
     )
     .await?;
-    let handoff_md = {
-        let handoff = state
-            .reader
-            .latest_open_handoff(ws, proj, query.cwd.clone())
-            .await?;
-        match handoff {
-            Some(h) => {
-                state.writer.accept_handoff(h.id, agent, None).await?;
-                Some(render_handoff_markdown(&h))
-            }
-            None => None,
-        }
-    };
+    let handoff = state
+        .reader
+        .latest_open_handoff(ws, proj, query.cwd.clone())
+        .await?;
+    let handoff_md = handoff.as_ref().map(render_handoff_markdown);
     // The brief is additive and non-destructive: unlike the handoff (a
-    // single-use slot consumed above), it is recomposed on every opted-in
+    // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
     let brief_md = render_requested_session_brief(state, &query, ws, proj).await?;
-    Ok(combine_handoff_and_brief(handoff_md, brief_md))
+    // Handoff first: it is a short curated pointer and must not be buried
+    // under a ledger that can run tens of KB. The existing ledger-then-brief
+    // order is preserved. Claim both single-use inputs only after every
+    // fallible read and render has succeeded, and in one transaction so a
+    // failed or racing managed claim cannot consume the handoff by itself.
+    let acceptance = if handoff.is_some() || managed.is_some() {
+        state
+            .writer
+            .accept_startup_context(
+                handoff.as_ref().map(|handoff| handoff.id),
+                agent,
+                None,
+                managed.as_ref().map(|managed| managed.run_id),
+                query.cwd.clone(),
+            )
+            .await?
+    } else {
+        ai_memory_store::StartupContextAcceptance::default()
+    };
+    let handoff_md = if acceptance.handoff_accepted {
+        handoff_md
+    } else {
+        None
+    };
+    let managed_md = if acceptance.managed_context_accepted {
+        managed.and_then(|managed| managed.markdown)
+    } else {
+        None
+    };
+    Ok(combine_handoff_and_brief(
+        handoff_md,
+        combine_handoff_and_brief(managed_md, brief_md),
+    ))
 }
 
-async fn resolve_requested_session_brief(
+struct PendingManagedContext {
+    run_id: ManagedRunId,
+    markdown: Option<String>,
+}
+
+/// Render the managed-run ledger for this SessionStart, if there is one.
+///
+/// Returns `None` — never an early exit for the caller — when the run is
+/// unusable (bad id, no active run, agent mismatch) or its context was
+/// already delivered. The pending handoff still has to reach the agent in
+/// every one of those cases.
+async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
-    actor_user: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    if !crate::payload::query_flag_truthy(query.briefing.as_deref()) {
+    agent: AgentKind,
+) -> anyhow::Result<Option<PendingManagedContext>> {
+    let Some(raw_run_id) = query.managed_run.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
+        warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
+        return Ok(None);
+    };
+    if let Some(native_session_id) = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let _ = state
+            .writer
+            .link_managed_run_session(run_id, agent, native_session_id)
+            .await?;
+    }
+    let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
+        warn!(managed_run = %run_id, "managed SessionStart has no active run");
+        return Ok(None);
+    };
+    if context.agent != agent {
+        warn!(
+            managed_run = %run_id,
+            expected = %context.agent.as_str(),
+            actual = %agent.as_str(),
+            "managed SessionStart agent mismatch"
+        );
         return Ok(None);
     }
-    let actor_key = ai_memory_core::ActorKey {
-        user: actor_user.map(str::to_owned),
-        session_id: None,
-    };
-    let (ws, proj) = resolve_project_ids_inner(
-        state,
-        query.cwd.as_deref(),
-        query.workspace.as_deref(),
-        query.project.as_deref(),
-        ProjectStrategy::parse(query.project_strategy.as_deref()),
-        &actor_key,
-        false,
-    )
-    .await?;
-    render_requested_session_brief(state, query, ws, proj).await
+    if context.context_delivered {
+        return Ok(None);
+    }
+    let rendered = render_managed_context(
+        &context.events,
+        &context.workstream_name,
+        context.workstream_id,
+        context.sync_after,
+    );
+    Ok(Some(PendingManagedContext {
+        run_id,
+        markdown: rendered,
+    }))
 }
 
 async fn render_requested_session_brief(
@@ -1445,7 +1476,7 @@ pub(crate) fn render_managed_context(
     let omitted = first_sequence > sync_after.saturating_add(1);
 
     let mut rendered = format!(
-        "> **ai-memory managed workstream: {workstream_name}**\n> Portable events {first_sequence} through {last_sequence}. Foreign tool calls/results below are completed historical evidence; do not replay them as pending actions. The latest repository checkpoint is authoritative over older native-session assumptions.\n\n"
+        "{MANAGED_WORKSTREAM_PACKET_MARKER}\n> **ai-memory managed workstream: {workstream_name}**\n> Portable events {first_sequence} through {last_sequence}. Foreign tool calls/results below are completed historical evidence; do not replay them as pending actions. The latest repository checkpoint is authoritative over older native-session assumptions.\n\n"
     );
     if omitted {
         rendered.push_str(
@@ -1824,6 +1855,35 @@ async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor_user: 
     }
 }
 
+async fn enqueue_session_end_consolidation(
+    state: &HookState,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> anyhow::Result<()> {
+    if !state.consolidate_on_session_end || state.consolidator.is_none() {
+        return Ok(());
+    }
+    let Some(notify) = state.session_consolidation_notify.as_ref() else {
+        warn!(
+            session = %session_id,
+            "SessionEnd LLM consolidation enabled without a queue worker"
+        );
+        return Ok(());
+    };
+    let inserted = state
+        .writer
+        .enqueue_session_consolidation(workspace_id, project_id, session_id)
+        .await?;
+    notify.notify_one();
+    debug!(
+        session = %session_id,
+        inserted,
+        "SessionEnd LLM consolidation queued"
+    );
+    Ok(())
+}
+
 async fn process(
     state: &HookState,
     env: HookEnvelope,
@@ -1911,11 +1971,38 @@ async fn process(
             .await?
         {
             ai_memory_store::SessionEndDisposition::Open => {}
-            ai_memory_store::SessionEndDisposition::DropStale => {
+            ai_memory_store::SessionEndDisposition::DropInvalid => {
                 info!(
                     session = %session_id,
                     agent = %env.agent.as_str(),
-                    "ignoring SessionEnd for missing, mismatched, or already-ended session"
+                    "ignoring SessionEnd for missing, mismatched, or cross-agent session"
+                );
+                return Ok(());
+            }
+            ai_memory_store::SessionEndDisposition::AlreadyEnded => {
+                // End stamping and the legacy handoff commit atomically. A
+                // first delivery can still be cancelled after that transaction
+                // but before the wiki commit, durable LLM enqueue, or ingest-key
+                // completion. Re-run those idempotent tail effects before
+                // acknowledging the already-ended session.
+                let commit_msg = format!("repair session {}", short_id(&session_id.to_string()),);
+                match state.wiki.commit_all(&commit_msg) {
+                    Ok(Some(oid)) => debug!(commit = %oid, "wiki recovery auto-commit"),
+                    Ok(None) => debug!("wiki clean during SessionEnd recovery"),
+                    Err(e) => warn!(error = %e, "SessionEnd recovery auto-commit failed"),
+                }
+                enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
+                if let Some(key) = env.ingest_key {
+                    let completed = state
+                        .writer
+                        .complete_observation_ingest_if_claimed(proj, key.clone())
+                        .await?;
+                    debug!(key, completed, "SessionEnd recovery ingest-key completion");
+                }
+                info!(
+                    session = %session_id,
+                    agent = %env.agent.as_str(),
+                    "recovered tail effects for already-ended SessionEnd"
                 );
                 return Ok(());
             }
@@ -2118,8 +2205,8 @@ async fn process(
                 actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
-        state.writer.end_session(session_id, Some(page_id)).await?;
         let handoff_id = if managed {
+            state.writer.end_session(session_id, Some(page_id)).await?;
             None
         } else {
             let handoff = build_auto_handoff(
@@ -2130,37 +2217,13 @@ async fn process(
                 env.cwd.clone(),
                 &observations,
             );
-            Some(state.writer.insert_handoff(handoff).await?)
+            Some(
+                state
+                    .writer
+                    .end_session_with_handoff(session_id, Some(page_id), handoff)
+                    .await?,
+            )
         };
-        // Opt-in (AI_MEMORY_CONSOLIDATE_ON_SESSION_END): additionally run LLM
-        // consolidation so the session's knowledge is compiled into topical
-        // pages, not just the heuristic session record. The heuristic page
-        // above is always written first, so an LLM failure here is non-fatal —
-        // warn and keep the deterministic result. Runs before the commit so
-        // the consolidated pages land in the same atomic snapshot.
-        if state.consolidate_on_session_end
-            && let Some(c) = state.consolidator.as_ref()
-        {
-            match c
-                .consolidate_session(
-                    session_id,
-                    false,
-                    ai_memory_core::ActorContext::anonymous(),
-                    None,
-                )
-                .await
-            {
-                Ok(outcome) => info!(
-                    session = %session_id,
-                    path = %outcome.path,
-                    "SessionEnd: LLM consolidation written (opt-in)",
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    "SessionEnd LLM consolidation failed; heuristic page already written",
-                ),
-            }
-        }
         // Auto-commit the wiki tree so the session/handoff/log.md
         // changes land in git in one atomic snapshot.
         let commit_msg = format!(
@@ -2173,6 +2236,11 @@ async fn process(
             Ok(None) => debug!("wiki clean; no auto-commit"),
             Err(e) => warn!(error = %e, "auto-commit failed"),
         }
+        // Persist the optional LLM work before acknowledging the hook, after
+        // deterministic wiki writes are committed so the worker cannot race
+        // their git snapshot. Stale redelivery above repairs cancellation in
+        // the narrow window after `end_session`.
+        enqueue_session_end_consolidation(state, session_id, ws, proj).await?;
         if let Some(handoff_id) = handoff_id {
             info!(
                 session = %session_id,
@@ -2324,11 +2392,17 @@ async fn consolidate_or_synth(
             "{}: LLM consolidation written",
             checkpoint_label
         );
-        let _ = state.wiki.commit_all(&format!(
-            "{}(session {}): checkpoint",
-            checkpoint_label,
-            short_id(&session_id.to_string()),
-        ));
+        let _ = state
+            .wiki
+            .commit_all(&format!(
+                "{}(session {}): checkpoint",
+                checkpoint_label,
+                short_id(&session_id.to_string()),
+            ))
+            .map_err(|e| {
+                tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
+                e
+            });
         return Ok(());
     }
     let observations = state.reader.observations_for_session(session_id).await?;
@@ -2352,11 +2426,17 @@ async fn consolidate_or_synth(
             actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await?;
-    let _ = state.wiki.commit_all(&format!(
-        "{}(session {}): checkpoint",
-        checkpoint_label,
-        short_id(&session_id.to_string()),
-    ));
+    let _ = state
+        .wiki
+        .commit_all(&format!(
+            "{}(session {}): checkpoint",
+            checkpoint_label,
+            short_id(&session_id.to_string()),
+        ))
+        .map_err(|e| {
+            tracing::warn!(error = %e, "{}: checkpoint auto-commit failed", checkpoint_label);
+            e
+        });
     debug!(session = %session_id, "{}: rule-based checkpoint written", checkpoint_label);
     Ok(())
 }
@@ -2448,6 +2528,7 @@ mod tests {
             project_cache: Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default())),
             active_project: ActiveProject::new(),
             consolidate_on_session_end: false,
+            session_consolidation_notify: None,
             capture_assistant_enabled: false,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -2474,6 +2555,7 @@ mod tests {
         let rendered =
             render_managed_context(&events, "default", ai_memory_core::WorkstreamId::new(), 0)
                 .unwrap();
+        assert!(rendered.starts_with(ai_memory_core::MANAGED_WORKSTREAM_PACKET_MARKER));
         assert!(rendered.contains("historical tool call (completed evidence)"));
         assert!(rendered.contains("Older unseen events did not fit"));
         assert!(rendered.contains("workstream-search"));
@@ -4729,7 +4811,7 @@ mod tests {
         //    points at it (exactly the purge-on-live-server scenario).
         state
             .writer
-            .purge_project(ws, proj, "default/heal-project", None)
+            .purge_project(ws, proj, "default/heal-project", None, false)
             .await
             .unwrap();
         assert!(
@@ -4912,7 +4994,7 @@ mod tests {
 
         state
             .writer
-            .purge_project(ws, proj, "default/repo-root-project", None)
+            .purge_project(ws, proj, "default/repo-root-project", None, false)
             .await
             .unwrap();
 
@@ -5134,7 +5216,18 @@ mod tests {
     #[tokio::test]
     async fn mismatched_session_end_does_not_create_summary_or_handoff() {
         let tmp = TempDir::new().unwrap();
-        let state = make_state(&tmp).await;
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
         let target = state
             .writer
             .get_or_create_project(state.workspace_id, "target", None)
@@ -5199,6 +5292,16 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "mismatched SessionEnd must not create a target handoff"
+        );
+        let now = Timestamp::now().as_microsecond();
+        assert!(
+            state
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "mismatched SessionEnd must not enter consolidation recovery"
         );
     }
 
@@ -5323,6 +5426,194 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_end_queues_llm_work_without_calling_provider() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm.clone(),
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "10101010-1010-1010-1010-101010101010";
+        let fire = |event: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit"), None)
+            .await
+            .unwrap();
+        process(&state, fire("session-end"), None).await.unwrap();
+
+        assert!(
+            llm.0.lock().unwrap().is_none(),
+            "the hook path must leave provider work to the queue worker"
+        );
+        let now = Timestamp::now().as_microsecond();
+        let job = state
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("SessionEnd persisted a consolidation job");
+        assert_eq!(job.session_id(), sid.parse().unwrap());
+        assert_eq!(job.generation(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_session_end_redelivery_converges_interrupted_tail_effects() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        let llm = Arc::new(RecordingLlm(Mutex::new(None)));
+        state.consolidator = Some(Arc::new(Consolidator::new(
+            state.reader.clone(),
+            state.writer.clone(),
+            state.wiki.clone(),
+            llm,
+            state.workspace_id,
+            state.project_id,
+        )));
+        state.consolidate_on_session_end = true;
+        state.session_consolidation_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        let sid = "20202020-2020-2020-2020-202020202020";
+        let session_id: SessionId = sid.parse().unwrap();
+        let fire = |event: &str, key: Option<&str>| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("codex".into()),
+                    ingest_key: key.map(str::to_string),
+                    ..Default::default()
+                },
+                serde_json::json!({ "session_id": sid, "prompt": "finish" }),
+            )
+        };
+        process(&state, fire("user-prompt-submit", None), None)
+            .await
+            .unwrap();
+        let (workspace_id, project_id, _) = state
+            .reader
+            .find_session_scope(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_observation = || {
+            Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::SessionEnd,
+                    extension: None,
+                    source_event: None,
+                    title: "session-end".into(),
+                    body: "finish".into(),
+                    importance: 7,
+                },
+                &state.sanitizer,
+            )
+        };
+        assert!(matches!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::Inserted(_)
+        ));
+
+        // Reproduce the durable boundary from #270: the summary file exists and
+        // the atomic end+handoff transaction committed, then the request was
+        // cancelled before the wiki commit, queue insert, or key completion.
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let page = synthesize_session_page(workspace_id, project_id, session_id, &observations);
+        let page_id = state
+            .wiki
+            .write_page(ai_memory_wiki::WritePageRequest {
+                workspace_id,
+                project_id,
+                path: page.path,
+                frontmatter: page.frontmatter_json,
+                body: page.body,
+                tier: page.tier,
+                pinned: page.pinned,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+        let handoff = build_auto_handoff(
+            workspace_id,
+            project_id,
+            AgentKind::Codex,
+            session_id,
+            None,
+            &observations,
+        );
+        state
+            .writer
+            .end_session_with_handoff(session_id, Some(page_id), handoff)
+            .await
+            .unwrap();
+
+        process(&state, fire("session-end", Some("entry-recovery")), None)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let job = state
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("stale redelivery must restore the missing durable job");
+        assert_eq!(job.session_id(), session_id);
+        assert_eq!(job.generation(), 2);
+        assert_eq!(
+            state
+                .writer
+                .insert_observation_ingest(pending_observation(), "entry-recovery".into())
+                .await
+                .unwrap(),
+            IngestObservationOutcome::AlreadyComplete,
+            "the recovered event must finish its pending ingest key"
+        );
+        let briefing = state
+            .reader
+            .briefing_for_project(workspace_id, project_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            briefing.pending_handoff_count, 1,
+            "recovery must preserve exactly one automatic handoff"
+        );
+        assert!(
+            state
+                .wiki
+                .commit_all("verify recovery clean")
+                .unwrap()
+                .is_none(),
+            "recovery must commit the summary file left by the interrupted request"
+        );
+    }
+
     // Issue #152: an agent that resumes an ended session under the same id
     // and keeps working must get its page re-compiled by the second
     // SessionEnd instead of that end being dropped as "already-ended".
@@ -5366,7 +5657,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
             "a freshly-ended session with no newer work must drop duplicate ends"
         );
         let page_after_first_end = state
@@ -5395,7 +5686,7 @@ mod tests {
         assert_eq!(
             disposition,
             ai_memory_store::SessionEndDisposition::ReEndWithNewWork,
-            "observations after ended_at must mark the session re-endable"
+            "a newer observation generation must mark the session re-endable"
         );
 
         process(&state, fire("session-end", None), None)
@@ -5425,8 +5716,9 @@ mod tests {
                 .is_some(),
             "the re-end must refresh the auto-handoff"
         );
-        // ended_at advanced past the resumed work: the next duplicate end is
-        // dropped again (pins the de1cef2 dedupe behaviour post-re-end).
+        // The persisted end generation now covers the resumed work, so the
+        // next duplicate end is dropped again (pins the de1cef2 dedupe
+        // behaviour post-re-end).
         let disposition = state
             .reader
             .session_end_disposition(
@@ -5439,8 +5731,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             disposition,
-            ai_memory_store::SessionEndDisposition::DropStale,
-            "after the re-end, ended_at must cover the resumed work again"
+            ai_memory_store::SessionEndDisposition::AlreadyEnded,
+            "after the re-end, the generation watermark must cover resumed work"
         );
     }
 
@@ -5646,6 +5938,204 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_passes_receiving_cwd_to_auto_handoff_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        async fn insert_auto(
+            state: &HookState,
+            cwd: &str,
+            summary: &str,
+        ) -> ai_memory_core::HandoffId {
+            let session_id = SessionId::new();
+            state
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                })
+                .await
+                .unwrap();
+            state
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: summary.into(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                })
+                .await
+                .unwrap()
+        }
+
+        let stale = insert_auto(&state, "/repo/api", "STALE-SPECIFIC").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newest = insert_auto(&state, "/repo", "NEWEST-PARENT").await;
+        let rendered = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/repo/api/src".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
+                managed_run: None,
+                session_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(rendered.contains("NEWEST-PARENT"));
+        assert!(!rendered.contains("STALE-SPECIFIC"));
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(stale)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ai_memory_core::HandoffState::Expired
+        );
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(newest)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ai_memory_core::HandoffState::Accepted
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_session_start_delivers_ledger_and_pending_handoff() {
+        use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
+        use ai_memory_store::{FinishWorkstreamRun, PrepareWorkstreamRun, WorkstreamSelection};
+
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let prepare = PrepareWorkstreamRun {
+            workspace_id: state.workspace_id,
+            project_id: state.project_id,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: cwd.clone(),
+            agent: AgentKind::Codex,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::Current,
+            lease_owner: "test:1".into(),
+        };
+        // First run: nothing to replay, but it leaves a portable event behind.
+        let first = state
+            .writer
+            .prepare_workstream_run(prepare.clone())
+            .await
+            .unwrap();
+        state
+            .writer
+            .finish_workstream_run(FinishWorkstreamRun {
+                run_id: first.run_id,
+                native_session_id: Some("native-1".into()),
+                source_cursor: Some("cursor-1".into()),
+                events: vec![NewWorkstreamEvent {
+                    event_id: "event-1".into(),
+                    agent: AgentKind::Codex,
+                    native_session_id: "native-1".into(),
+                    source_record_id: Some("record-1".into()),
+                    kind: WorkstreamEventKind::Message,
+                    role: Some("assistant".into()),
+                    content: "LEDGER-MARKER".into(),
+                    occurred_at: None,
+                    metadata: serde_json::json!({}),
+                }],
+                complete: true,
+                segment_path: Some("segment-1.jsonl".into()),
+                exit_code: Some(0),
+            })
+            .await
+            .unwrap();
+        // Second run: this is the SessionStart that has a ledger to deliver.
+        let run = state.writer.prepare_workstream_run(prepare).await.unwrap();
+
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: vec!["resume the curated thread".to_string()],
+                files_touched: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some(cwd),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            project_strategy: None,
+            briefing: None,
+            briefing_budget: None,
+            managed_run: Some(run.run_id.to_string()),
+            session_id: Some("native-2".into()),
+        };
+        let rendered = fetch_and_accept_handoff(&state, query.clone(), None)
+            .await
+            .unwrap();
+
+        let rendered = rendered.expect("managed SessionStart must return context");
+        assert!(
+            rendered.contains("LEDGER-MARKER"),
+            "managed SessionStart must still deliver the workstream ledger: {rendered}"
+        );
+        assert!(
+            rendered.contains("HANDOFF-MARKER"),
+            "the managed ledger must not swallow the pending handoff: {rendered}"
+        );
+        assert!(
+            state
+                .reader
+                .latest_open_handoff(state.workspace_id, state.project_id, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a handoff delivered on a managed SessionStart must be marked accepted"
+        );
+        assert!(
+            fetch_and_accept_handoff(&state, query, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the combined handoff and managed packet must be delivered only once"
         );
     }
 
@@ -7226,6 +7716,79 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_prompt_is_bounded_in_storage_and_fts() {
+        const TAIL_SENTINEL: &str = "PROMPT_TAIL_MUST_NOT_BE_INDEXED_249";
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session_id = "bounded-prompt";
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session_id,
+                    "cwd": "/repo",
+                    "prompt": format!(
+                        "PROMPT_HEAD_IS_INDEXED {} {TAIL_SENTINEL}",
+                        "x".repeat(crate::payload::USER_PROMPT_EXCERPT_MAX_BYTES)
+                    )
+                }),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let sid = resolve_session_id(&HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": session_id }),
+        ))
+        .unwrap();
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let prompt = observations
+            .iter()
+            .find(|observation| observation.kind == ObservationKind::UserPrompt)
+            .expect("prompt observation");
+        assert!(prompt.body.len() <= ai_memory_core::OBSERVATION_BODY_MAX_BYTES);
+        assert!(prompt.body.ends_with('…'));
+        assert!(!prompt.body.contains(TAIL_SENTINEL));
+        assert!(
+            state
+                .reader
+                .search_observations_for_project(
+                    prompt.workspace_id,
+                    prompt.project_id,
+                    TAIL_SENTINEL.into(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .reader
+                .search_observations_for_project(
+                    prompt.workspace_id,
+                    prompt.project_id,
+                    "PROMPT_HEAD_IS_INDEXED".into(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

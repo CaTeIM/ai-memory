@@ -22,7 +22,7 @@
 | macOS | Supported | Workspace tests run in CI; tagged releases publish native `ai-memory-macos-aarch64.tar.gz` and `ai-memory-macos-x86_64.tar.gz` binaries. The native binary is the recommended path on Apple Silicon. See [`docs/macos.md`](docs/macos.md). |
 | Windows via WSL2 | Supported | Use the Linux install path inside WSL2 when the agent runs there. |
 | Native Windows | Experimental | Tagged releases publish `ai-memory-windows-x86_64.zip` with `ai-memory.exe`; Docker Desktop wrapper and source builds are also available. Local supported profiles default to host-native hook commands; Claude Code may use its Windows exec form, while other agents use native single command strings matching their hook schema. PowerShell/Git Bash scripts are compatibility fallbacks. See [`docs/windows.md`](docs/windows.md). |
-| Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
+| Claude Code | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. `install-mcp --session-aware` optionally enables per-session auto-scope isolation through a local stdio bridge. Optionally captures the assistant's final turn on `Stop` when installed with `--capture-assistant` and the server enables `capture_assistant` (double opt-in, off by default). |
 | Codex | Supported | MCP config + lifecycle hooks; native commands enforce capture exclusions. No automatic true session-end hook, so run `ai-memory finalize-session` when you need a final summary/handoff. |
 | Devin CLI | Supported | MCP config + lifecycle hooks. Hooks use Devin's `PostCompaction` event, inject handoffs via `hookSpecificOutput.additionalContext`, and omit subagent events because Devin does not expose them. |
 | OpenCode | Supported | Remote MCP config + generated TypeScript plugin; generated plugin enforces capture exclusions. |
@@ -31,17 +31,17 @@
 | Oh My Pi / OMP | Supported | Use `--client omp` / `--agent omp` (or `oh-my-pi`) for native `.omp` MCP config + TypeScript extension; generated extension enforces capture exclusions. |
 | Pi | Supported | Generated `~/.pi/agent/extensions/ai-memory.ts` extension provides lifecycle capture and an HTTP MCP bridge; generated extension enforces capture exclusions. |
 | Crush | Managed-only | `ai-memory run crush` resumes its project-local session database and supplies portable context through a temporary supported global-context file; no lifecycle-hook installer is provided. |
-| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
+| Managed workstreams | Opt-in | `ai-memory run` provides transparent cross-harness continuity for Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI. Direct launches remain unchanged. See [`docs/managed-workstreams.md`](docs/managed-workstreams.md). |
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks; generated plugin enforces capture exclusions. |
-| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
-| Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
+| Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). Only `PreInvocation` with `invocationNum = 0` maps to SessionStart; later model calls cannot consume a next-session handoff. No automatic true session-end hook, so run `ai-memory finalize-session --agent antigravity-cli` after the final turn when you need a summary, handoff, and opt-in SessionEnd consolidation. |
+| Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
-| Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
+| Embedding providers | Supported | OpenAI, Voyage, Google Gemini, and keyless OpenAI-compatible endpoints such as Ollama, LM Studio, and vLLM. |
 
 ## What it is
 
@@ -63,15 +63,20 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Zero-friction lifecycle capture.** Hooks fire-and-forget bounded,
   sanitized prompt, tool-lifecycle, and session-boundary observations. Direct
   launches keep this lightweight path; it is not a complete native transcript.
+  User prompts and post-compaction summaries retain up to 16 KiB;
+  notifications and tool excerpts retain up to 2 KB, with a 16 KiB durable
+  backstop for every observation body.
 - **Opt-in managed workstreams.** `ai-memory run claude`, then `ai-memory run
   codex --yolo`, then `ai-memory run kimi`, transparently resumes one logical
   workstream with native per-harness sessions, a portable visible-event ledger,
-  and full-ledger search.
+  and full-ledger search. Delivered packets are origin-marked; Claude transcript
+  import rejects a packet that Claude persisted and read back through a tool.
   `ai-memory run` with no harness continues the newest usable Claude Code,
   Codex, OpenCode, Pi, Crush, or Kimi Code session for this checkout. On first
   explicit use, an interactive launcher can adopt a previous session from the
   same checkout; later switches cannot select unrelated native history. Native
-  arguments pass through unchanged except the wrapper-owned `--yolo`; direct
+  arguments pass through unchanged except the wrapper-owned `--yolo` and
+  `--fresh`; direct
   commands are unaffected. `kimi-code` and `kimi-cli` are accepted aliases for
   the installed `kimi` command.
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
@@ -100,9 +105,18 @@ priors are at the [bottom](#influences-and-prior-art).
   `global_scope_hits`, so preferences travel with you into new projects
   without naming a magic project or paying the all-projects
   `global=true` fan-out. Event capture never writes there.
+- **Authority-aware recall.** FTS5, graph-neighbor RRF, and optional vector RRF
+  still generate candidates by relevance. Before truncation, a bounded
+  adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
+  `gotchas/` pages over closely matching episodic session evidence. Tier,
+  `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
+  `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
+  contribute without becoming absolute filters, so targeted history searches
+  still find session pages.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
-  at session-end (or PreCompact; Codex can use `ai-memory finalize-session`
-  for a manual final close), not retrieved over raw logs.
+  at session-end (or PreCompact; clients without a true session-end event can
+  use `ai-memory finalize-session --agent <agent>` for a manual final close),
+  not retrieved over raw logs.
   Supersession chain + git-versioned markdown means you can
   time-travel with `ai-memory checkpoints`, `restore-page`, or raw `git log`.
 - **Built-in `/web` browser.** Read-only HTML UI for the wiki -
@@ -117,16 +131,18 @@ priors are at the [bottom](#influences-and-prior-art).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
-  session-aware current-project routing.
+  session-aware current-project routing; Claude Code has a built-in opt-in
+  bridge via `install-mcp --session-aware`.
 - **Thin-client CLI.** `ai-memory status`, `bootstrap`, `checkpoints`,
   `restore-page`, `purge-project`, `rename-project`, `move-project`,
   `audit-contamination`, `lint`, `curator`, `auto-improve`,
-  `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup` are
+  `auto-improve-report`, `pending-writes`, `embed`, `forget-sweep`, `backup`,
+  `finalize-session` are
   all HTTP clients of the running server - never touch SQLite or
   wiki files directly. `status` also reports passive LLM/embedding
   provider health from the last real provider call. Server is the
-  single source of truth. `finalize-session` is the exception: it reads the
-  local SQLite index only to find matching open sessions, then posts synthetic
+  single source of truth. `finalize-session` lists matching open
+  sessions through `GET /admin/open-sessions`, then posts synthetic
   `session-end` hooks back to the server.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
   rule-based summarisation. Add a provider when you want consolidated
@@ -147,6 +163,9 @@ priors are at the [bottom](#influences-and-prior-art).
 
   # Later, omit the name to resume the newest usable managed session here.
   ai-memory run
+
+  # Start a new Codex session in the same workstream, keeping portable history.
+  ai-memory run --fresh codex
   ```
 
   The first explicit run can offer an existing session from this exact checkout
@@ -154,9 +173,12 @@ priors are at the [bottom](#influences-and-prior-art).
   linked to the shared workstream, so an obsolete local session cannot replace
   newer cross-harness history. After a normal quit, the next launch waits
   briefly if the previous launcher is still finalizing; handled failures release
-  the workstream immediately. Managed mode currently covers Claude Code, Codex,
-  OpenCode, Pi, Crush, Kimi Code, and OMP; direct harness launches remain
-  unchanged. See [Managed cross-harness workstreams](docs/managed-workstreams.md).
+  the workstream immediately. If a linked native transcript was deleted,
+  ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
+  that recovery for one harness. Managed mode currently covers Claude Code,
+  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI; direct harness
+  launches remain unchanged. See
+  [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
   typed handoff with open questions, next steps, and a session summary. Grok
@@ -328,6 +350,26 @@ open in this project will see a handoff with where you left off.
 On macOS, the native release binary is also supported and recommended when you
 do not need Docker; see [`docs/macos.md`](docs/macos.md).
 
+If two Claude Code sessions use the same server concurrently, enable
+per-session routing on the server and replace only the `ai-memory` MCP entry
+with the optional bridge:
+
+```toml
+# <ai-memory data dir>/config.toml
+[auto_scope]
+mode = "per_session"
+```
+
+```bash
+ai-memory install-mcp --client claude-code --session-aware --apply
+```
+
+The bridge still connects to the configured local or remote HTTP server and
+forwards its bearer token, but also attaches Claude's lifecycle session id to
+every MCP request. Existing static HTTP installs remain the default. See
+[`docs/auto-scope.md`](docs/auto-scope.md) for Claude's `/clear` and
+implicit-resume limitations.
+
 The `install-mcp` / `install-hooks` commands use
 `AI_MEMORY_SERVER_URL` / `AI_MEMORY_AUTH_TOKEN` when set; otherwise
 they default to `http://127.0.0.1:49374` (matching the server above)
@@ -351,7 +393,9 @@ does not leave an older default-path ai-memory installation behind.
 If your agent often starts inside repository subdirectories or linked
 worktrees, add `--project-strategy repo-root` to `install-hooks` so captures
 collapse to the main git repo name; see [`docs/install.md`](docs/install.md)
-and [`docs/marker-file.md`](docs/marker-file.md) for details.
+and [`docs/marker-file.md`](docs/marker-file.md) for details. Later bare
+`--apply` refreshes, including `ai-memory upgrade`, preserve that choice;
+pass `--project-strategy basename` explicitly to remove it.
 
 The Docker wrapper also bridges thin-client commands such as
 `ai-memory status` and `ai-memory bootstrap` back to the host's
@@ -621,6 +665,19 @@ when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
 Session end always writes a rule-based summary page + handoff either way.
+When the session-end opt-in is enabled, provider work is durably queued after
+those deterministic writes and handled by one bounded server worker, so hook
+drain latency does not cancel it. Failed jobs retry with backoff and survive a
+server restart. A resumed native session is ended again only after its
+observation generation advances; the persisted generation watermark makes
+duplicate SessionEnd delivery and system clock skew converge without repeated
+provider work. The end watermark and automatic handoff commit atomically, and
+an interrupted keyed replay finishes the wiki commit, queue insert, and key
+completion without duplicating that handoff. On the next SessionStart, the
+newest cwd-eligible automatic handoff wins; accepting it expires older eligible
+automatic handoffs without consuming manual or sibling-directory work. A new
+automatic handoff also expires prior open automatic handoffs from its exact
+cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
 
 Recommended defaults:
 
@@ -662,13 +719,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > high-effort thinking models for your coding agent.
 
 > [!TIP]
-> **On a local engine (Ollama, vLLM, LM Studio, llama.cpp) with
-> `openai-compat`, if consolidation fails on large sessions** with
-> `did not contain a JSON object` or `serde: unknown variant`, set
-> `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
-> (strict) so capable engines constrain output to the schema. If the strict
-> raw call fails, ai-memory falls back to the default tolerant parser. Off by
-> default.
+> **OpenAI-compatible structured output is schema-constrained by default.**
+> ai-memory sends each operation's JSON Schema through
+> `response_format=json_schema`, which recent Ollama, vLLM, LM Studio, and
+> llama.cpp releases honour. It falls back to the tolerant parser when an
+> endpoint explicitly rejects that field or returns a malformed shape. Set
+> `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
@@ -676,7 +732,9 @@ Embeddings are optional and separate from the LLM provider. Set
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
-`AI_MEMORY_EMBEDDING_DIM`.
+`AI_MEMORY_EMBEDDING_DIM`. Both the FTS-only and hybrid paths apply the same
+bounded page-authority adjustment after candidate generation; embeddings
+improve relevance recall but do not decide which source is canonical.
 
 See [`docs/install.md#llm-provider-tiers`](docs/install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud examples, and
@@ -699,7 +757,8 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
 pages, and serves retrieval through FTS5, graph-neighbor RRF, optional
-vector RRF, and bounded raw-observation fallback for non-global searches.
+vector RRF, bounded source-authority adjustment, and bounded raw-observation
+fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.
@@ -710,7 +769,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, and OMP: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |

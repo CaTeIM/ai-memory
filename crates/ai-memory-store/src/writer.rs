@@ -26,10 +26,20 @@ use crate::ops::{
     self, DeleteWorkspaceSummary, EmbeddingWrite, IngestObservationOutcome, MoveSummary,
     PurgeSummary, ReorgSummary,
 };
+use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::workstream::{
     FinishWorkstreamRun, FinishedWorkstreamRun, PrepareWorkstreamRun, PreparedWorkstreamRun,
 };
+
+/// Result of atomically claiming the startup context assembled for one hook.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartupContextAcceptance {
+    /// The requested single-use handoff changed from open to accepted.
+    pub handoff_accepted: bool,
+    /// The requested managed synchronization packet changed to delivered.
+    pub managed_context_accepted: bool,
+}
 
 /// Commands accepted by the writer thread.
 pub(crate) enum WriteCmd {
@@ -86,6 +96,12 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    EndSessionWithHandoff {
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
     SweepHollowProjects {
         min_age_days: u32,
         reply: oneshot::Sender<StoreResult<Vec<String>>>,
@@ -104,6 +120,36 @@ pub(crate) enum WriteCmd {
         ingest_key: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    CompleteObservationIngestIfClaimed {
+        project_id: ProjectId,
+        ingest_key: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    EnqueueSessionConsolidation {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    ClaimSessionConsolidation {
+        now: i64,
+        stale_before: i64,
+        reply: oneshot::Sender<StoreResult<Option<SessionConsolidationJob>>>,
+    },
+    CompleteSessionConsolidation {
+        job: SessionConsolidationJob,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    FailSessionConsolidation {
+        job: SessionConsolidationJob,
+        error: String,
+        retry_at: Option<i64>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    ReleaseSessionConsolidation {
+        job: SessionConsolidationJob,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -112,6 +158,7 @@ pub(crate) enum WriteCmd {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     CancelHandoff {
@@ -174,6 +221,8 @@ pub(crate) enum WriteCmd {
         /// Authenticated operator recorded in the `audit_log` row (NULL when
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
+        /// Purge even when a managed workstream still holds a live run lease.
+        force: bool,
         reply: oneshot::Sender<StoreResult<PurgeSummary>>,
     },
     /// Delete a workspace row (its `workspace_id` FKs cascade projects/pages/
@@ -293,6 +342,14 @@ pub(crate) enum WriteCmd {
     AcceptManagedRunContext {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    AcceptStartupContext {
+        handoff_id: Option<HandoffId>,
+        accepting_agent: AgentKind,
+        accepting_session: Option<SessionId>,
+        managed_run_id: Option<ManagedRunId>,
+        receiving_cwd: Option<String>,
+        reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
         input: FinishWorkstreamRun,
@@ -447,7 +504,8 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Mark a session ended, optionally linking its summary page.
+    /// Mark a session ended, optionally linking its summary page, and persist
+    /// the observation generation covered by this end.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
@@ -460,6 +518,27 @@ impl WriterHandle {
         self.send(WriteCmd::EndSession {
             session_id,
             summary_page_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically end a session and insert its automatic handoff.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL/state errors.
+    pub async fn end_session_with_handoff(
+        &self,
+        session_id: SessionId,
+        summary_page_id: Option<PageId>,
+        handoff: NewHandoff,
+    ) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EndSessionWithHandoff {
+            session_id,
+            summary_page_id,
+            handoff,
             reply: tx,
         })
         .await?;
@@ -547,6 +626,99 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Mark a keyed hook event complete if its observation claim exists.
+    ///
+    /// Returns `false` for an unkeyed or unrelated duplicate recovery attempt.
+    pub async fn complete_observation_ingest_if_claimed(
+        &self,
+        project_id: ProjectId,
+        ingest_key: String,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteObservationIngestIfClaimed {
+            project_id,
+            ingest_key,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist one opt-in SessionEnd consolidation job for the current
+    /// observation generation. Duplicate generations are idempotent.
+    pub async fn enqueue_session_consolidation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::EnqueueSessionConsolidation {
+            workspace_id,
+            project_id,
+            session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Atomically claim the oldest due SessionEnd consolidation job.
+    pub async fn claim_session_consolidation(
+        &self,
+        now: i64,
+        stale_before: i64,
+    ) -> StoreResult<Option<SessionConsolidationJob>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ClaimSessionConsolidation {
+            now,
+            stale_before,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Mark a claimed SessionEnd consolidation job complete.
+    pub async fn complete_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteSessionConsolidation { job, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a failed SessionEnd consolidation attempt.
+    pub async fn fail_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+        error: String,
+        retry_at: Option<i64>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::FailSessionConsolidation {
+            job,
+            error,
+            retry_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Return an in-flight SessionEnd consolidation job to the durable queue.
+    pub async fn release_session_consolidation(
+        &self,
+        job: SessionConsolidationJob,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReleaseSessionConsolidation { job, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new handoff in `open` state.
     ///
     /// # Errors
@@ -567,12 +739,14 @@ impl WriterHandle {
         handoff_id: HandoffId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
+        receiving_cwd: Option<String>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             handoff_id,
             accepting_agent,
             accepting_session,
+            receiving_cwd,
             reply: tx,
         })
         .await?;
@@ -735,6 +909,7 @@ impl WriterHandle {
         project_id: ProjectId,
         label: impl Into<String>,
         author_id: Option<ai_memory_core::UserId>,
+        force: bool,
     ) -> StoreResult<PurgeSummary> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PurgeProject {
@@ -742,6 +917,7 @@ impl WriterHandle {
             project_id,
             label: label.into(),
             author_id,
+            force,
             reply: tx,
         })
         .await?;
@@ -1175,6 +1351,32 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically claim the handoff and managed ledger selected for one
+    /// SessionStart response.
+    ///
+    /// When a managed run was requested but is no longer claimable, the
+    /// handoff remains open and both result fields are false.
+    pub async fn accept_startup_context(
+        &self,
+        handoff_id: Option<HandoffId>,
+        accepting_agent: AgentKind,
+        accepting_session: Option<SessionId>,
+        managed_run_id: Option<ManagedRunId>,
+        receiving_cwd: Option<String>,
+    ) -> StoreResult<StartupContextAcceptance> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AcceptStartupContext {
+            handoff_id,
+            accepting_agent,
+            accepting_session,
+            managed_run_id,
+            receiving_cwd,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Index an immutable transcript segment and release the run lease.
     pub async fn finish_workstream_run(
         &self,
@@ -1300,6 +1502,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::end_session(&mut conn, &session_id, summary_page_id.as_ref());
                 send_or_warn(reply, result, "end_session");
             }
+            WriteCmd::EndSessionWithHandoff {
+                session_id,
+                summary_page_id,
+                handoff,
+                reply,
+            } => {
+                let result = ops::end_session_with_handoff(
+                    &mut conn,
+                    &session_id,
+                    summary_page_id.as_ref(),
+                    &handoff,
+                );
+                send_or_warn(reply, result, "end_session_with_handoff");
+            }
             WriteCmd::SweepHollowProjects {
                 min_age_days,
                 reply,
@@ -1327,6 +1543,57 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::complete_observation_ingest(&mut conn, &project_id, &ingest_key);
                 send_or_warn(reply, result, "complete_observation_ingest");
             }
+            WriteCmd::CompleteObservationIngestIfClaimed {
+                project_id,
+                ingest_key,
+                reply,
+            } => {
+                let result = ops::complete_observation_ingest_if_claimed(
+                    &mut conn,
+                    &project_id,
+                    &ingest_key,
+                );
+                send_or_warn(reply, result, "complete_observation_ingest_if_claimed");
+            }
+            WriteCmd::EnqueueSessionConsolidation {
+                workspace_id,
+                project_id,
+                session_id,
+                reply,
+            } => {
+                let result = crate::session_consolidation::enqueue(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                );
+                send_or_warn(reply, result, "enqueue_session_consolidation");
+            }
+            WriteCmd::ClaimSessionConsolidation {
+                now,
+                stale_before,
+                reply,
+            } => {
+                let result = crate::session_consolidation::claim_next(&mut conn, now, stale_before);
+                send_or_warn(reply, result, "claim_session_consolidation");
+            }
+            WriteCmd::CompleteSessionConsolidation { job, reply } => {
+                let result = crate::session_consolidation::complete(&mut conn, &job);
+                send_or_warn(reply, result, "complete_session_consolidation");
+            }
+            WriteCmd::FailSessionConsolidation {
+                job,
+                error,
+                retry_at,
+                reply,
+            } => {
+                let result = crate::session_consolidation::fail(&mut conn, &job, &error, retry_at);
+                send_or_warn(reply, result, "fail_session_consolidation");
+            }
+            WriteCmd::ReleaseSessionConsolidation { job, reply } => {
+                let result = crate::session_consolidation::release(&mut conn, &job);
+                send_or_warn(reply, result, "release_session_consolidation");
+            }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
@@ -1335,6 +1602,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 handoff_id,
                 accepting_agent,
                 accepting_session,
+                receiving_cwd,
                 reply,
             } => {
                 let result = ops::accept_handoff(
@@ -1342,6 +1610,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &handoff_id,
                     accepting_agent,
                     accepting_session.as_ref(),
+                    receiving_cwd.as_deref(),
                 );
                 send_or_warn(reply, result, "accept_handoff");
             }
@@ -1421,10 +1690,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 project_id,
                 label,
                 author_id,
+                force,
                 reply,
             } => {
-                let result =
-                    ops::purge_project(&mut conn, &workspace_id, &project_id, &label, author_id);
+                let result = ops::purge_project(
+                    &mut conn,
+                    &workspace_id,
+                    &project_id,
+                    &label,
+                    author_id,
+                    force,
+                );
                 send_or_warn(reply, result, "purge_project");
             }
             WriteCmd::DeleteWorkspace {
@@ -1587,6 +1863,43 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::workstream::accept_context(&mut conn, run_id);
                 send_or_warn(reply, result, "accept_managed_run_context");
             }
+            WriteCmd::AcceptStartupContext {
+                handoff_id,
+                accepting_agent,
+                accepting_session,
+                managed_run_id,
+                receiving_cwd,
+                reply,
+            } => {
+                let result = (|| {
+                    let tx = conn.transaction()?;
+                    let managed_context_accepted = match managed_run_id {
+                        Some(run_id) => {
+                            crate::workstream::claim_context_in_transaction(&tx, run_id)?
+                        }
+                        None => false,
+                    };
+                    if managed_run_id.is_some() && !managed_context_accepted {
+                        return Ok(StartupContextAcceptance::default());
+                    }
+                    let handoff_accepted = match handoff_id {
+                        Some(handoff_id) => ops::accept_handoff_in_transaction(
+                            &tx,
+                            &handoff_id,
+                            accepting_agent,
+                            accepting_session.as_ref(),
+                            receiving_cwd.as_deref(),
+                        )?,
+                        None => false,
+                    };
+                    tx.commit()?;
+                    Ok(StartupContextAcceptance {
+                        handoff_accepted,
+                        managed_context_accepted,
+                    })
+                })();
+                send_or_warn(reply, result, "accept_startup_context");
+            }
             WriteCmd::FinishWorkstreamRun { input, reply } => {
                 let result = crate::workstream::finish_run(&mut conn, &input);
                 send_or_warn(reply, result, "finish_workstream_run");
@@ -1594,4 +1907,230 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
         }
     }
     tracing::debug!("writer thread exiting cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+    use ai_memory_core::{NewPage, PagePath, Tier};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
+        NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: "test".into(),
+            body: body.into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+        }
+    }
+
+    /// Enqueue a workspace creation without awaiting the reply, returning
+    /// the oneshot receiver so the caller decides when to collect it.
+    async fn enqueue_workspace(
+        writer: &WriterHandle,
+        name: &str,
+    ) -> oneshot::Receiver<StoreResult<WorkspaceId>> {
+        let (tx, rx) = oneshot::channel();
+        writer
+            .inner
+            .tx
+            .send(WriteCmd::GetOrCreateWorkspace {
+                name: name.to_owned(),
+                reply: tx,
+            })
+            .await
+            .expect("writer channel closed while enqueueing");
+        rx
+    }
+
+    /// Commands enqueued on the bounded channel run on the writer thread in
+    /// FIFO order: insertion rowids must match enqueue order exactly.
+    #[tokio::test]
+    async fn executes_commands_in_fifo_order() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        let mut pending = Vec::new();
+        for i in 0..8 {
+            pending.push(enqueue_workspace(&store.writer, &format!("fifo-{i:02}")).await);
+        }
+        for rx in pending {
+            rx.await.unwrap().unwrap();
+        }
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM workspaces WHERE name LIKE 'fifo-%' ORDER BY rowid")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let expected: Vec<String> = (0..8).map(|i| format!("fifo-{i:02}")).collect();
+        assert_eq!(
+            names, expected,
+            "single writer thread must apply commands in enqueue order"
+        );
+    }
+
+    /// A command whose SQL fails returns the error on *its* oneshot only;
+    /// the actor keeps processing — the next command succeeds.
+    #[tokio::test]
+    async fn sql_error_reaches_caller_without_killing_actor() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        // FK violation: no project row exists for this id.
+        let err = store
+            .writer
+            .upsert_page(sample_page(ws, ProjectId::new(), "notes/bogus.md", "x"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected the raw SQL failure to reach the caller, got {err:?}"
+        );
+
+        // The actor survived: a well-formed write lands afterwards.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/fine.md", "ok"))
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the post-error write may be present");
+    }
+
+    /// A batch command is one transaction: a failure part-way through rolls
+    /// back the pages that already succeeded inside the same batch.
+    #[tokio::test]
+    async fn batch_upsert_rolls_back_on_mid_batch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+
+        let pages = vec![
+            sample_page(ws, proj, "notes/good.md", "good"),
+            // Second page references a project that does not exist.
+            sample_page(ws, ProjectId::new(), "notes/bad.md", "bad"),
+        ];
+        let err = store.writer.upsert_pages_batch(pages).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "expected FK failure from the batch, got {err:?}"
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "mid-batch failure must roll back the earlier page too"
+        );
+
+        // Actor is still alive after the rolled-back batch.
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "notes/after.md", "after"))
+            .await
+            .unwrap();
+    }
+
+    /// Dropping the last handle queues `Shutdown` behind the pending
+    /// commands and joins the thread: every already-enqueued command is
+    /// answered, and the join returning proves the thread exited (no hang).
+    #[tokio::test]
+    async fn drop_completes_pending_commands_and_joins_thread() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let writer = store.writer.clone();
+        let db_path = store.db_path().to_owned();
+        drop(store);
+
+        let mut pending = Vec::new();
+        for i in 0..8 {
+            pending.push(enqueue_workspace(&writer, &format!("drain-{i:02}")).await);
+        }
+        // Joins the writer thread inside `Drop for WriterInner`; returns
+        // only after the queue (including Shutdown) was drained.
+        drop(writer);
+
+        for rx in pending {
+            let id = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .expect("pending command was not answered before the writer stopped")
+                .expect("reply oneshot dropped")
+                .unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM workspaces WHERE id = ?1",
+                    [id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "pending command must have committed");
+        }
+    }
+
+    /// Once the actor has stopped, calls fail fast with
+    /// [`StoreError::WriterClosed`] instead of hanging on a dead channel.
+    #[tokio::test]
+    async fn commands_after_shutdown_return_writer_closed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let writer = store.writer.clone();
+        drop(store);
+
+        writer
+            .inner
+            .tx
+            .send(WriteCmd::Shutdown)
+            .await
+            .expect("writer channel closed before Shutdown");
+
+        // FIFO guarantees Shutdown is processed first; whether the send
+        // itself fails or the reply oneshot is dropped, the caller sees
+        // WriterClosed either way.
+        let err = writer
+            .get_or_create_workspace("too-late")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::WriterClosed),
+            "expected WriterClosed, got {err:?}"
+        );
+    }
 }
