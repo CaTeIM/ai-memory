@@ -1020,9 +1020,10 @@ pub struct HandoffQuery {
     /// Identifier of the agent fetching the handoff. Used to mark the
     /// handoff as accepted-by; defaults to `Other` if unrecognised.
     pub agent: Option<String>,
-    /// Optional cwd filter. When provided, only handoffs whose stored
-    /// cwd matches this string are returned. Note: the cwd string is
-    /// not canonicalized; symlinked paths must match byte-for-byte.
+    /// Optional receiving cwd. Automatic handoffs whose stored cwd is this
+    /// directory or a path-boundary ancestor are eligible; manual handoffs are
+    /// project-wide. Paths are string-normalized, not filesystem-canonicalized,
+    /// so symlink aliases remain distinct.
     pub cwd: Option<String>,
     /// Workspace override (mirror of `HookQuery.workspace`). Lets the
     /// `session-start` hook fetch the handoff for the same `(workspace,
@@ -1136,6 +1137,7 @@ async fn fetch_and_accept_handoff(
                 agent,
                 None,
                 managed.as_ref().map(|managed| managed.run_id),
+                query.cwd.clone(),
             )
             .await?
     } else {
@@ -5936,6 +5938,92 @@ mod tests {
         assert!(
             rendered.as_deref().is_some_and(|s| s.contains("continue")),
             "workspace-only marker handoff lookup must resolve workspace + basename(cwd)"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_passes_receiving_cwd_to_auto_handoff_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        async fn insert_auto(
+            state: &HookState,
+            cwd: &str,
+            summary: &str,
+        ) -> ai_memory_core::HandoffId {
+            let session_id = SessionId::new();
+            state
+                .writer
+                .begin_session(NewSession {
+                    id: session_id,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(cwd.into()),
+                })
+                .await
+                .unwrap();
+            state
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    from_session_id: Some(session_id),
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: Some(cwd.into()),
+                    summary: summary.into(),
+                    open_questions: Vec::new(),
+                    next_steps: Vec::new(),
+                    files_touched: Vec::new(),
+                })
+                .await
+                .unwrap()
+        }
+
+        let stale = insert_auto(&state, "/repo/api", "STALE-SPECIFIC").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let newest = insert_auto(&state, "/repo", "NEWEST-PARENT").await;
+        let rendered = fetch_and_accept_handoff(
+            &state,
+            HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/repo/api/src".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                project_strategy: None,
+                briefing: None,
+                briefing_budget: None,
+                managed_run: None,
+                session_id: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(rendered.contains("NEWEST-PARENT"));
+        assert!(!rendered.contains("STALE-SPECIFIC"));
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(stale)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ai_memory_core::HandoffState::Expired
+        );
+        assert_eq!(
+            state
+                .reader
+                .handoff_by_id(newest)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ai_memory_core::HandoffState::Accepted
         );
     }
 

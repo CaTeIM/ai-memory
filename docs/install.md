@@ -1187,17 +1187,20 @@ through the generic compatibility credential:
 Replace the model with another current Atlas model id when needed. ai-memory
 does not select a default for hosted compatibility endpoints.
 
-Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints may honour
-OpenAI-style `response_format=json_schema`. If the tolerant default parser fails
-with errors such as `did not contain a JSON object` or `serde: unknown variant`,
-try strict compat mode:
+OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
 -e AI_MEMORY_LLM_COMPAT_STRICT=true
 ```
 
-Strict mode is opt-in. ai-memory sends the schema-constrained request first and
-falls back to the tolerant parser only when that raw strict call fails.
+Modern Ollama, vLLM, LM Studio, llama.cpp, and gateway endpoints honour this
+OpenAI-style `response_format=json_schema` request. ai-memory retries with its
+tolerant parser when an endpoint explicitly rejects the structured-output field
+or returns a malformed response shape. For an incompatible endpoint, opt out:
+
+```bash
+-e AI_MEMORY_LLM_COMPAT_STRICT=false
+```
 
 ---
 

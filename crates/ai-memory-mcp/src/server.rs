@@ -597,7 +597,8 @@ struct HandoffBeginArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffAcceptArgs {
-    /// Restrict the search to handoffs created for a specific cwd.
+    /// Set the receiving cwd so automatic handoffs from that directory or a
+    /// path-boundary ancestor are eligible.
     /// **Omit unless the user explicitly asks about a handoff from a
     /// *different* directory** — by default this scopes to the current
     /// project (the SessionStart hook usually pre-fetches it into context).
@@ -2217,16 +2218,17 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        let receiving_cwd = args.cwd;
         let handoff = self
             .reader
-            .latest_open_handoff(ws, proj, args.cwd)
+            .latest_open_handoff(ws, proj, receiving_cwd.clone())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match handoff {
             None => ok_json(&serde_json::json!({ "handoff": null })),
             Some(h) => {
                 self.writer
-                    .accept_handoff(h.id, AgentKind::Other, None)
+                    .accept_handoff(h.id, AgentKind::Other, None, receiving_cwd)
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 ok_json(&serde_json::json!({ "handoff": h }))

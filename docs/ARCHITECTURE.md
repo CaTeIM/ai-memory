@@ -146,7 +146,12 @@ transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
 An explicitly pending handoff is delivered before the managed event range;
 their single-use delivery claims share one writer transaction after the
-complete startup response has been assembled.
+complete startup response has been assembled. Manual handoffs take precedence;
+otherwise the newest cwd-eligible automatic handoff is delivered, and that
+same transaction expires older eligible automatic handoffs while preserving
+manual and sibling-directory work. Insertion also expires prior open automatic
+handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
+starts.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger
@@ -478,6 +483,7 @@ AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini 
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override

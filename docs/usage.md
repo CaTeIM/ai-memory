@@ -17,7 +17,13 @@ general prompt/output DLP filter.
 
 You normally do not create handoffs by hand. With lifecycle hooks
 installed, session-end capture writes the handoff and the next
-session-start hook fetches it.
+session-start hook fetches it. Manual handoffs are project-wide and take
+precedence over automatic SessionEnd handoffs. Among automatic handoffs that
+match the receiving directory by path boundary, the newest is delivered;
+creating a new automatic handoff expires prior open automatic handoffs from
+that exact directory, and acceptance expires older matching automatic
+handoffs without disturbing manual handoffs or pending work from sibling
+directories.
 
 ```text
 $ claude

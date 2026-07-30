@@ -673,7 +673,11 @@ observation generation advances; the persisted generation watermark makes
 duplicate SessionEnd delivery and system clock skew converge without repeated
 provider work. The end watermark and automatic handoff commit atomically, and
 an interrupted keyed replay finishes the wiki commit, queue insert, and key
-completion without duplicating that handoff.
+completion without duplicating that handoff. On the next SessionStart, the
+newest cwd-eligible automatic handoff wins; accepting it expires older eligible
+automatic handoffs without consuming manual or sibling-directory work. A new
+automatic handoff also expires prior open automatic handoffs from its exact
+cwd, so repeated SessionEnds cannot accumulate there before a receiver starts.
 
 Recommended defaults:
 
@@ -715,13 +719,12 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > high-effort thinking models for your coding agent.
 
 > [!TIP]
-> **On a local engine (Ollama, vLLM, LM Studio, llama.cpp) with
-> `openai-compat`, if consolidation fails on large sessions** with
-> `did not contain a JSON object` or `serde: unknown variant`, set
-> `AI_MEMORY_LLM_COMPAT_STRICT=true`. It sends `response_format=json_schema`
-> (strict) so capable engines constrain output to the schema. If the strict
-> raw call fails, ai-memory falls back to the default tolerant parser. Off by
-> default.
+> **OpenAI-compatible structured output is schema-constrained by default.**
+> ai-memory sends each operation's JSON Schema through
+> `response_format=json_schema`, which recent Ollama, vLLM, LM Studio, and
+> llama.cpp releases honour. It falls back to the tolerant parser when an
+> endpoint explicitly rejects that field or returns a malformed shape. Set
+> `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`, or `gemini` when
