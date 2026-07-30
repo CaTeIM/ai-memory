@@ -268,24 +268,21 @@ fn session_id_query_suffix(
     format!("&session_id={}", url_encode(&session_id))
 }
 
-fn cwd_query_suffix_with(
+fn resolve_hook_cwd_with(
     agent: &str,
     raw: &serde_json::Value,
-    default_strategy: Option<&str>,
     env_lookup: impl FnMut(&str) -> Option<String>,
     current_dir: impl FnOnce() -> Option<PathBuf>,
-) -> String {
+) -> Option<String> {
     let agent_kind = AgentKind::from_wire(agent);
     let (canonical_cwd, _) = canonical_context(raw);
-    let cwd = if canonical_cwd.is_some() {
+    if canonical_cwd.is_some() {
         canonical_cwd
     } else if agent_kind == AgentKind::Devin {
         resolve_cwd_with_fallbacks(raw, env_lookup, current_dir)
     } else {
         extract_cwd(raw).filter(|s| !s.trim().is_empty())
-    };
-    cwd.map(|cwd| marker_query_suffix(&cwd, default_strategy))
-        .unwrap_or_default()
+    }
 }
 
 fn cwd_query_suffix(
@@ -293,9 +290,9 @@ fn cwd_query_suffix(
     raw: &serde_json::Value,
     default_strategy: Option<&str>,
 ) -> String {
-    cwd_query_suffix_with(agent, raw, default_strategy, env_lookup, || {
-        std::env::current_dir().ok()
-    })
+    resolve_hook_cwd_with(agent, raw, env_lookup, || std::env::current_dir().ok())
+        .map(|cwd| marker_query_suffix(&cwd, default_strategy))
+        .unwrap_or_default()
 }
 
 fn after_background_drain_event_enqueue(
@@ -1091,15 +1088,14 @@ mod tests {
             "source": "startup"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=env-project");
+        assert_eq!(cwd.as_deref(), Some("env-project"));
     }
 
     #[test]
@@ -1109,15 +1105,14 @@ mod tests {
             "tool_name": "exec"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |_| None,
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=process-project");
+        assert_eq!(cwd.as_deref(), Some("process-project"));
     }
 
     #[test]
@@ -1127,23 +1122,21 @@ mod tests {
             "tool_name": "exec"
         });
 
-        let from_env = cwd_query_suffix_with(
+        let from_env = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
-        let from_process = cwd_query_suffix_with(
+        let from_process = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |_| None,
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(from_env, "&cwd=env-project");
-        assert_eq!(from_process, "&cwd=process-project");
+        assert_eq!(from_env.as_deref(), Some("env-project"));
+        assert_eq!(from_process.as_deref(), Some("process-project"));
     }
 
     #[test]
@@ -1153,30 +1146,28 @@ mod tests {
             "cwd": "payload-project"
         });
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "devin",
             &raw,
-            None,
             |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=payload-project");
+        assert_eq!(cwd.as_deref(), Some("payload-project"));
     }
 
     #[test]
     fn missing_cwd_process_fallback_is_devin_only() {
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
-        let suffix = cwd_query_suffix_with(
+        let cwd = resolve_hook_cwd_with(
             "claude-code",
             &raw,
-            None,
             |_| Some("env-project".into()),
             || Some(PathBuf::from("process-project")),
         );
 
-        assert!(suffix.is_empty());
+        assert!(cwd.is_none());
     }
 
     #[tokio::test]
