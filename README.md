@@ -307,9 +307,21 @@ expose the server on the LAN; see [Security](#security) below.
 #    runs the binary inside docker with your $HOME mounted). This is
 #    the only thing that needs to live on the host filesystem.
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \
-    -o ~/.local/bin/ai-memory
-chmod +x ~/.local/bin/ai-memory
+wrapper_tmp="$(mktemp -d)"
+trap 'rm -rf "$wrapper_tmp"' EXIT
+wrapper_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-wrapper
+curl -fsSL "$wrapper_base" -o "$wrapper_tmp/ai-memory-wrapper"
+curl -fsSL "$wrapper_base.sha256" -o "$wrapper_tmp/ai-memory-wrapper.sha256"
+expected="$(awk 'NR == 1 { print $1 }' "$wrapper_tmp/ai-memory-wrapper.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$wrapper_tmp/ai-memory-wrapper" | awk '{ print $1 }')"
+else
+    actual="$(shasum -a 256 "$wrapper_tmp/ai-memory-wrapper" | awk '{ print $1 }')"
+fi
+[ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "wrapper checksum mismatch" >&2; exit 1; }
+install -m 0755 "$wrapper_tmp/ai-memory-wrapper" ~/.local/bin/ai-memory
+rm -rf "$wrapper_tmp"
+trap - EXIT
 # Most distros put ~/.local/bin on PATH automatically. If `which
 # ai-memory` comes up empty, add this to ~/.bashrc / ~/.zshrc:
 #     export PATH="$HOME/.local/bin:$PATH"

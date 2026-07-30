@@ -1907,7 +1907,7 @@ mod tests {
                 "notes/leaky-proposal.md",
                 "body has ANTHROPIC_API_KEY=sk-ant-leak-1234567890abcdef",
                 "rationale has postgres://admin:hunter2@db.internal/prod",
-                serde_json::json!([{ "secret": "GH_TOKEN=ghp_1234567890abcdef1234567890abcdef1234" }]),
+                serde_json::json!([{ "secret": "GH_TOKEN=ghp_FAKEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }]),
             ),
         )
         .await;

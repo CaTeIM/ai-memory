@@ -11,8 +11,10 @@ we will aim to release a patch within 30 days and credit you in the changelog
 
 ## Threat model
 
-ai-memory is a **single-user, homelab tool**. The following describes what
-the project is and is not designed to defend against.
+ai-memory is a **single-tenant workstation/homelab service**. It supports
+multiple attributed users, but every authenticated user belongs to the same
+trust domain and can read the same project memory. The following describes
+what the project is and is not designed to defend against.
 
 ### In scope
 
@@ -39,6 +41,11 @@ the project is and is not designed to defend against.
 - **Request body size.** Inbound HTTP bodies are capped at 10 MB to prevent
   trivial memory exhaustion.
 
+- **Authentication and administrative authorization.** A static root bearer
+  token, database-user tokens, and optional OIDC hook-edge tokens form the
+  documented auth ladder. The first database user makes every `/admin/*`
+  route root-only; DB-user tokens provide attribution but never admin access.
+
 - **Per-project isolation.** Wiki files and SQLite rows are namespaced by
   `(workspace_id, project_id)`. A purge operation for project A cannot
   delete files that also belong to project B.
@@ -64,23 +71,33 @@ the project is and is not designed to defend against.
     sees; the `Sanitizer` is a best-effort credential strip, not a guarantee
     (see the injection note below).
 
+- **Stored-content prompt injection.** Handoffs, project briefs, managed
+  workstream packets, MCP routing, and LLM maintenance prompts explicitly mark
+  stored material as untrusted historical data. Sanitization and structured
+  output schemas remain defense in depth, not proof that a model cannot be
+  manipulated; operators and agents must verify security-sensitive claims
+  against current instructions and the checkout.
+
+- **Published executable integrity.** Docker wrapper and standalone hook
+  installs use GitHub Release assets with SHA-256 companions. GitHub Actions
+  are pinned to reviewed commits and release jobs default to read-only token
+  permissions except the GitHub Release publisher.
+
 ### Out of scope for v1
 
-- **Multi-tenant authentication and authorisation.** There is one bearer
-  token (or none). There are no per-user roles or per-project ACLs.
+- **Tenant isolation and per-user ACLs.** Database users provide attribution,
+  not private memory. There are no per-user or per-project ACLs; run separate
+  servers/data directories for users who must not see one another's data.
 - **Encryption at rest.** The data directory is a plain filesystem tree.
 - **Remote sync security.** If you push the wiki git repository to a remote,
   securing that channel is your responsibility (SSH keys, GitHub access
   controls, etc.).
-- **MCP tool-call injection via agent output.** The privacy strip
-  (`Sanitizer`) removes obvious credential patterns from hook payloads, but
-  it is not a comprehensive injection fence. This applies to the opt-in
-  assistant/Stop excerpt too: it is untrusted text (it can echo whatever a
-  tool put in the assistant's response) that, once captured, flows into the
-  consolidation/reviewer prompts. Enabling `capture_assistant` widens this
-  surface — leave it off unless you accept that trade-off.
-- **Denial of service.** The server is not hardened against a malicious local
-  actor hammering it with requests.
+- **Perfect semantic prompt-injection prevention.** The privacy strip removes
+  obvious credentials and the prompt surfaces preserve a trust boundary, but
+  no text filter can prove that an LLM will ignore every adversarial passage.
+- **Hostile-Internet denial of service.** Hook queues, request bodies, rate
+  limits, and concurrency are bounded, but the service is not designed for
+  direct untrusted-Internet exposure. Put it behind normal network controls.
 
 ## Supported versions
 
