@@ -30,6 +30,7 @@ use crate::http_client::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PREPARE_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const PREPARE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const IMPORT_BATCH_EVENTS: usize = 400;
@@ -48,6 +49,25 @@ const AUTO_HARNESSES: [ManagedHarness; 6] = [
 struct AutoSessionCandidate {
     harness: ManagedHarness,
     session: NativeSessionCandidate,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatHealth {
+    consecutive_failures: u64,
+}
+
+impl HeartbeatHealth {
+    fn record_failure(&mut self) -> bool {
+        let first = self.consecutive_failures == 0;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        first
+    }
+
+    fn record_success(&mut self) -> bool {
+        let recovered = self.consecutive_failures > 0;
+        self.consecutive_failures = 0;
+        recovered
+    }
 }
 
 /// Run one native harness and return its exact process exit code.
@@ -369,13 +389,16 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut heartbeat_health = HeartbeatHealth::default();
     let status = loop {
         tokio::select! {
             result = child.wait() => break acquired_try!(result.context("waiting for managed harness")),
             _ = heartbeat.tick() => {
-                if let Err(error) = post_empty(&endpoint, &format!("{run_path}/heartbeat")).await {
-                    eprintln!("ai-memory: managed workstream heartbeat failed: {error}");
-                }
+                let _ = send_managed_heartbeat(
+                    &endpoint,
+                    &run_path,
+                    &mut heartbeat_health,
+                ).await;
             }
         }
     };
@@ -452,6 +475,43 @@ async fn capture_interrupts(interrupted: Arc<AtomicBool>) {
     while tokio::signal::ctrl_c().await.is_ok() {
         interrupted.store(true, Ordering::SeqCst);
     }
+}
+
+async fn send_managed_heartbeat(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    health: &mut HeartbeatHealth,
+) -> Result<()> {
+    send_managed_heartbeat_with_timeout(endpoint, run_path, health, HEARTBEAT_REQUEST_TIMEOUT).await
+}
+
+async fn send_managed_heartbeat_with_timeout(
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+    health: &mut HeartbeatHealth,
+    request_timeout: Duration,
+) -> Result<()> {
+    let path = format!("{run_path}/heartbeat");
+    let result = tokio::time::timeout(request_timeout, post_empty(endpoint, &path))
+        .await
+        .map_err(|_| anyhow!("request timed out after {request_timeout:?}"))
+        .and_then(|result| result);
+    match &result {
+        Ok(()) if health.record_success() => {
+            eprintln!(
+                "ai-memory: server connection restored; managed workstream heartbeat resumed"
+            );
+        }
+        Ok(()) => {}
+        Err(error) if health.record_failure() => {
+            tracing::debug!(error = %error, "managed workstream heartbeat became unavailable");
+            eprintln!(
+                "ai-memory: server unavailable; managed workstream heartbeat will retry quietly"
+            );
+        }
+        Err(_) => {}
+    }
+    result
 }
 
 async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &str) {
@@ -816,19 +876,18 @@ async fn choose_native_session_interactive(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut heartbeat_health = HeartbeatHealth::default();
     let selection = loop {
         tokio::select! {
             result = &mut chooser => {
                 break result.context("waiting for the native session choice")?;
             }
             _ = heartbeat.tick() => {
-                if let Err(error) = post_empty(endpoint, &format!("{run_path}/heartbeat")).await {
-                    eprintln!("ai-memory: managed workstream heartbeat failed: {error}");
-                }
+                let _ = send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health).await;
             }
         }
     };
-    post_empty(endpoint, &format!("{run_path}/heartbeat"))
+    send_managed_heartbeat(endpoint, run_path, &mut heartbeat_health)
         .await
         .context(
             "renewing the managed workstream after session selection; the agent was not started",
@@ -1179,6 +1238,64 @@ mod tests {
     fn lease_owner_uses_the_resolved_host_and_process() {
         assert_eq!(lease_owner_label(Some("workstation"), 42), "workstation:42");
         assert_eq!(lease_owner_label(None, 42), "localhost:42");
+    }
+
+    #[test]
+    fn heartbeat_health_reports_each_outage_and_recovery_once() {
+        let mut health = HeartbeatHealth::default();
+
+        assert!(health.record_failure());
+        assert!(!health.record_failure());
+        assert!(!health.record_failure());
+        assert!(health.record_success());
+        assert!(!health.record_success());
+        assert!(health.record_failure());
+    }
+
+    #[tokio::test]
+    async fn managed_heartbeat_times_out_and_recovers() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs/{run_id}/heartbeat",
+            post(move || {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let mut health = HeartbeatHealth::default();
+
+        assert!(
+            send_managed_heartbeat_with_timeout(
+                &endpoint,
+                "/workstream/runs/test",
+                &mut health,
+                Duration::from_millis(10),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(health.consecutive_failures, 1);
+        send_managed_heartbeat_with_timeout(
+            &endpoint,
+            "/workstream/runs/test",
+            &mut health,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+
+        server.abort();
     }
 
     #[tokio::test]

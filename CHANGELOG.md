@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Managed workstream heartbeats now bound each server request and condense an
+  outage into one short notice plus one recovery notice. Active launchers keep
+  the lease-safe 30-second retry cadence without printing the same timeout on
+  every attempt, and may renew their original run after a longer outage unless
+  another launcher has already claimed the workstream. (#311)
+
 ## [1.20.1] - 2026-07-30
 
 ### Fixed
