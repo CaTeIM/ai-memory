@@ -92,14 +92,34 @@ pub const MAX_ENTITIES_PER_PAGE: usize = 10;
 
 /// Normalise one entity name for storage and matching: trim, collapse
 /// internal whitespace, lowercase. Returns `None` when the result is
-/// empty or longer than [`MAX_ENTITY_LEN`].
+/// empty, contains control characters, or is longer than
+/// [`MAX_ENTITY_LEN`]. Processing stops as soon as the input crosses the
+/// bound, so an oversized untrusted value cannot cause a proportional
+/// allocation.
 ///
 /// Lowercasing is what makes query-time matching lexical rather than a
 /// second LLM call: `Postgres`, `postgres`, and `POSTGRES` all index and
 /// match as one entity.
 #[must_use]
 pub fn normalize_entity(raw: &str) -> Option<String> {
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut collapsed = String::new();
+    let mut chars = 0;
+    for word in raw.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+            chars += 1;
+        }
+        for ch in word.chars() {
+            if ch.is_control() {
+                return None;
+            }
+            chars += 1;
+            if chars > MAX_ENTITY_LEN {
+                return None;
+            }
+            collapsed.push(ch);
+        }
+    }
     let normalized = collapsed.to_lowercase();
     if normalized.is_empty() || normalized.chars().count() > MAX_ENTITY_LEN {
         return None;
@@ -359,6 +379,8 @@ mod tests {
             Some("x".repeat(MAX_ENTITY_LEN).as_str()),
         );
         assert_eq!(normalize_entity(&"x".repeat(MAX_ENTITY_LEN + 1)), None);
+        assert_eq!(normalize_entity("writer\0actor"), None);
+        assert_eq!(normalize_entity(&"x".repeat(1_000_000)), None);
     }
 
     #[test]

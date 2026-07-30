@@ -1194,6 +1194,41 @@ mod tests {
     }
 
     #[test]
+    fn build_update_persists_only_normalized_bounded_entities() {
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "notes/entities.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Entities".into(),
+            body_markdown: "body".into(),
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: vec![
+                " SQLite ".into(),
+                "sqlite".into(),
+                "Writer\nActor".into(),
+                "x".repeat(ai_memory_core::MAX_ENTITY_LEN + 1),
+                "bad\0entity".into(),
+            ],
+        };
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            false,
+            &ai_memory_core::ActorContext::anonymous(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.frontmatter["entities"],
+            serde_json::json!(["sqlite", "writer actor"]),
+            "LLM output must cross the same bounded normalization boundary as manual pages"
+        );
+    }
+
+    #[test]
     fn slot_update_preserves_explicit_invariant_frontmatter() {
         let update = crate::types::ConsolidatedPageUpdate {
             path: "_slots/project_context.md".into(),

@@ -156,7 +156,7 @@ effect alone is small.
 Three scheduled MCP operations:
 
 - **`memory_ingest`** (auto-called by hooks): one observation → write-fan-out to ~5–15 wiki pages. New page if no match; supersede + version if the page already exists. No-LLM fallback: append to a per-day digest page if no provider configured.
-- **`memory_query`** (called by agent on demand): hierarchical - search `index.md` first, then page-level FTS+vector, then optional graph-walk expansion. RRF-fused. Agentmemory hit 95.2% R@5 with this pattern.
+- **`memory_query`** (called by agent on demand): project-scoped FTS + lexical entity + graph retrieval, with optional vectors, RRF-fused before bounded authority and optional LLM reranking. Agentmemory's earlier triple-stream result motivated the fusion shape.
 - **`memory_lint`** (scheduled hourly + on session-end): scans for contradictions, orphan pages, broken links, stale claims, low-confidence + zero-reinforcement entries. Pure LLM with strict JSON output.
 
 Decay/forget runs as a separate `memory_forget_sweep` job: applies the retention formula; soft-deletes via `is_latest=false` + `superseded_at`; hard-deletes only after 180 days *and* zero accesses. Never silently destroys anything user-pinned.
@@ -207,7 +207,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 
 | Tool | Purpose | Annotation |
 |---|---|---|
-| `memory_query` | Search + retrieve, FTS5 + optional hybrid RRF | read-only |
+| `memory_query` | Search + retrieve, FTS5 + entity + graph + optional vector RRF | read-only |
 | `memory_recent` | Most-recently-updated `is_latest=1` pages for the project | read-only |
 | `memory_status` | Health, counts, last-consolidation-at | read-only |
 | `memory_briefing` | Structured zero-LLM snapshot: 7d/30d windows, pending handoffs, recent pages, `_rules/` | read-only |

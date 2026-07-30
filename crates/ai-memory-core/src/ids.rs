@@ -82,6 +82,7 @@ id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
+id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
 id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
 id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");

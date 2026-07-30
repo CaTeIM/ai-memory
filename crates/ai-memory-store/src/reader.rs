@@ -239,13 +239,13 @@ pub struct FeedbackFinding {
 /// A page matched by the entity stream, with the inverse-frequency
 /// weight that ranked it and the entity names that matched.
 #[derive(Debug, Clone)]
-pub struct EntityHit {
+pub(crate) struct EntityHit {
     /// The matched page.
-    pub hit: PageHit,
+    pub(crate) hit: PageHit,
     /// Sum of `1 / pages_carrying_entity` over the matched entities.
-    pub weight: f64,
+    pub(crate) weight: f64,
     /// Entity names that matched the query.
-    pub matched: Vec<String>,
+    pub(crate) matched: Vec<String>,
 }
 
 /// Escape a literal for use inside a SQL `LIKE` pattern with
@@ -275,27 +275,29 @@ fn entity_query_tokens(query: &str) -> Vec<String> {
     const MIN_TOKEN_CHARS: usize = 3;
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    let mut push = |token: String| -> bool {
-        if token.chars().count() < MIN_TOKEN_CHARS {
+    let mut push = |raw: &str| -> bool {
+        let char_count = raw.chars().count();
+        if !(MIN_TOKEN_CHARS..=ai_memory_core::MAX_ENTITY_LEN).contains(&char_count) {
             return true;
         }
+        let token = raw.to_lowercase();
         if seen.insert(token.clone()) {
             out.push(token);
         }
         out.len() < MAX_TOKENS
     };
     'outer: for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
-        let token = raw.trim_matches(['-', '_']).to_lowercase();
+        let token = raw.trim_matches(['-', '_']);
         if token.is_empty() {
             continue;
         }
         let compound = token.contains(['-', '_']);
-        if !push(token.clone()) {
+        if !push(token) {
             break;
         }
         if compound {
             for part in token.split(['-', '_']) {
-                if !push(part.to_string()) {
+                if !push(part) {
                     break 'outer;
                 }
             }
@@ -2198,16 +2200,16 @@ impl ReaderPool {
     /// query token matching an entity that appears on 2 pages is a much
     /// stronger signal than one matching an entity on 200.
     ///
-    /// Matching is lexical (exact name, or entity starting with the
-    /// token) so this stays a plain SQL stream with no LLM call. Empty
-    /// result when the project has no entities indexed, which is the
-    /// zero-LLM default: entities only exist where consolidation ran.
+    /// Matching is lexical (exact name, name prefix, or a compound-word
+    /// prefix) so this stays a plain SQL stream with no LLM call. It returns
+    /// no candidates when the project has no entities indexed, as in the
+    /// common zero-LLM case without hand-edited entity frontmatter.
     ///
     /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
-    pub async fn entity_hits_for_project(
+    pub(crate) async fn entity_hits_for_project(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -2221,36 +2223,37 @@ impl ReaderPool {
         }
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
-            let mut placeholders = String::with_capacity(tokens.len() * 48);
-            let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 3 + 4);
+            let mut placeholders = String::with_capacity(tokens.len() * 96);
+            let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
             for (idx, token) in tokens.iter().enumerate() {
                 if idx > 0 {
                     placeholders.push_str(" OR ");
                 }
-                // Three ways a token can match an entity name, in
-                // increasing looseness: exact; the name starts with the
-                // token (`postgres` → `postgresql`); or a *word* inside a
-                // multi-word name starts with the token (`jetstream` →
-                // `nats jetstream`). The last one is why this is a scan
-                // rather than a pure index seek — acceptable because the
-                // table is bounded at 10 entities per page.
+                // Match exact names, name prefixes, and word prefixes after
+                // any accepted entity separator. The latter lets `actor`
+                // find `writer actor`, `writer-actor`, and `writer_actor`.
                 //
                 // `?` is positional-by-order, same as the graph query.
                 placeholders.push_str(
                     "(e.name = ? \
                       OR e.name LIKE ? || '%' ESCAPE '\\' \
-                      OR e.name LIKE '% ' || ? || '%' ESCAPE '\\')",
+                      OR e.name LIKE '% ' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%-' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%\\_' || ? || '%' ESCAPE '\\')",
                 );
                 sql_params.push(Value::Text(token.clone()));
                 let escaped = like_escape(token);
-                sql_params.push(Value::Text(escaped.clone()));
-                sql_params.push(Value::Text(escaped));
+                for _ in 0..4 {
+                    sql_params.push(Value::Text(escaped.clone()));
+                }
             }
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(cutoff));
-            #[allow(clippy::cast_possible_wrap)]
-            sql_params.push(Value::Integer(limit as i64));
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
 
             let mut sql = String::with_capacity(placeholders.len() + 1_200);
             write!(
@@ -2261,18 +2264,20 @@ impl ReaderPool {
                    SELECT e.id AS entity_id, e.name AS name \
                    FROM entities e \
                    WHERE ({placeholders}) \
+                     AND e.workspace_id = ? AND e.project_id = ? \
                  ), \
                  freq AS ( \
                    SELECT m.entity_id, m.name, COUNT(*) AS pages \
                    FROM matched m \
                    JOIN entity_page_links l ON l.entity_id = m.entity_id \
                    JOIN pages p ON p.id = l.page_id AND p.is_latest = 1 \
+                   WHERE 1 = 1{freq_not_expired} \
                    GROUP BY m.entity_id, m.name \
                  ) \
                  SELECT pg.id, pg.path, pg.title, substr(pg.body, 1, 240) AS snippet, \
                         SUM(1.0 / f.pages) AS weight, \
                         COUNT(*) AS matches, \
-                        group_concat(f.name, ', ') AS names \
+                        json_group_array(f.name) AS names \
                  FROM freq f \
                  JOIN entity_page_links l ON l.entity_id = f.entity_id \
                  JOIN pages pg ON pg.id = l.page_id \
@@ -2281,6 +2286,7 @@ impl ReaderPool {
                  ORDER BY weight DESC, matches DESC, pg.path ASC \
                  LIMIT ?",
                 not_expired = not_expired("pg", "?"),
+                freq_not_expired = not_expired("p", "?"),
             )
             .expect("writing SQL into String cannot fail");
 
@@ -2291,12 +2297,15 @@ impl ReaderPool {
                 let title: String = row.get(2)?;
                 let snippet: String = row.get(3)?;
                 let weight: f64 = row.get(4)?;
-                let names: Option<String> = row.get(6)?;
-                Ok((id_bytes, path, title, snippet, weight, names))
+                let names_json: String = row.get(6)?;
+                Ok((id_bytes, path, title, snippet, weight, names_json))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id_bytes, path, title, snippet, weight, names) = row?;
+                let (id_bytes, path, title, snippet, weight, names_json) = row?;
+                let mut matched: Vec<String> = serde_json::from_str(&names_json)?;
+                matched.sort_unstable();
+                matched.dedup();
                 out.push(EntityHit {
                     hit: PageHit {
                         id: PageId::from_slice(&id_bytes)?,
@@ -2306,9 +2315,7 @@ impl ReaderPool {
                         rank: 0.0,
                     },
                     weight,
-                    matched: names
-                        .map(|n| n.split(", ").map(str::to_string).collect())
-                        .unwrap_or_default(),
+                    matched,
                 });
             }
             Ok(out)
@@ -2674,11 +2681,17 @@ impl ReaderPool {
         // window was too narrow at small limits for a canonical page to enter
         // the fused pool and receive its bounded promotion.
         let candidate_limit = authority_candidate_limit(limit);
-        // The FTS candidate call consumes the query; the entity stream
-        // tokenizes the same text separately.
-        let entity_query = query.clone();
-
-        // Fetch FTS5 hits first.
+        // Tokenize the borrowed query before the FTS candidate call consumes
+        // it. This avoids cloning a caller-controlled query on the hot path.
+        let entity_hits = self
+            .entity_hits_for_project(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                Some(cutoff),
+            )
+            .await?;
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -2696,15 +2709,6 @@ impl ReaderPool {
             .into_iter()
             .map(|(hit, _authority)| hit)
             .collect();
-        let entity_hits = self
-            .entity_hits_for_project(
-                workspace_id,
-                project_id,
-                &entity_query,
-                candidate_limit,
-                Some(cutoff),
-            )
-            .await?;
         let mut vec_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
         if let Some(qv) = query_vec {
             vec_hits = self
@@ -6803,6 +6807,15 @@ mod tests {
             "tokens de-duplicate",
         );
         assert!(entity_query_tokens(&"word ".repeat(50)).len() <= 12);
+        assert!(
+            entity_query_tokens(&"x".repeat(1_000_000)).is_empty(),
+            "an oversized untrusted token must be rejected before lowercase allocation"
+        );
+        assert_eq!(
+            entity_query_tokens(&format!("{} usable", "x".repeat(1_000_000))),
+            vec!["usable".to_string()],
+            "a rejected compound must not hide later bounded tokens"
+        );
     }
 
     #[test]

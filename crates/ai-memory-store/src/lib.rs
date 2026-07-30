@@ -5428,6 +5428,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+        store
+            .writer
+            .upsert_page(with_entities(
+                "delimiters.md",
+                "more unrelated prose",
+                vec!["writer-actor", "queue_worker", "comma, entity"],
+            ))
+            .await
+            .unwrap();
 
         // A query naming the entity finds the page whose body lacks the term.
         let hits = store
@@ -5438,6 +5447,25 @@ mod tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].hit.path.as_str(), "rare.md");
         assert_eq!(hits[0].matched, vec!["turbopuffer".to_string()]);
+
+        let delimiter_hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "actor worker comma", 10, None)
+            .await
+            .unwrap();
+        let delimiter_hit = delimiter_hits
+            .iter()
+            .find(|hit| hit.hit.path.as_str() == "delimiters.md")
+            .expect("word prefixes after hyphen and underscore must match");
+        assert_eq!(
+            delimiter_hit.matched,
+            vec![
+                "comma, entity".to_string(),
+                "queue_worker".to_string(),
+                "writer-actor".to_string(),
+            ],
+            "explain names must preserve commas and sort deterministically",
+        );
 
         // Inverse frequency: the page carrying the rare entity outranks
         // pages carrying only the common one.
@@ -5510,7 +5538,7 @@ mod tests {
         let authority = explain.authority.unwrap_or(1.0);
         assert!((hit.rank + explain.fused * authority).abs() < 1e-12);
 
-        // Rewriting the page replaces its entity set.
+        // Rewriting the page replaces the latest version's entity set.
         store
             .writer
             .upsert_page(with_entities("rare.md", "rewritten body", vec!["lancedb"]))
@@ -5535,6 +5563,20 @@ mod tests {
             1,
         );
 
+        let mut expired = with_entities("expired.md", "historical prose", vec!["lancedb"]);
+        expired.expires_at = Some("2000-01-01T00:00:00Z".parse().unwrap());
+        store.writer.upsert_page(expired).await.unwrap();
+        let current_only = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", usize::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(current_only.len(), 1, "expired entity pages stay hidden");
+        assert_eq!(
+            current_only[0].weight, 1.0,
+            "expired pages must not dilute inverse-frequency weighting"
+        );
+
         // A project with no declared entities contributes nothing.
         let bare = store
             .writer
@@ -5554,6 +5596,46 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "no entities declared → the stream stays silent",
+        );
+
+        let decoy = store
+            .writer
+            .get_or_create_project(ws, "decoy", None)
+            .await
+            .unwrap();
+        let mut decoy_page = sample_page(ws, decoy, "private.md", "unrelated");
+        decoy_page.entities = vec!["lancedb".into()];
+        store.writer.upsert_page(decoy_page).await.unwrap();
+        let scoped = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            scoped
+                .iter()
+                .all(|hit| hit.hit.path.as_str() != "private.md"),
+            "entity retrieval must not leak a sibling project's pages"
+        );
+
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("delimiters.md").unwrap(), None)
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let deleted_entities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND name IN ('writer-actor', 'queue_worker', 'comma, entity')",
+                params![ws.as_bytes(), proj.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            deleted_entities, 0,
+            "deleting every page version must remove unlinked derived entities"
         );
     }
 }

@@ -3508,7 +3508,7 @@ mod tests {
                 proj,
                 "notes/a.md",
                 "alpha uniquetoken",
-                serde_json::json!({}),
+                serde_json::json!({"entities": ["NATS JetStream"]}),
             ),
             req(
                 ws,
@@ -3553,6 +3553,27 @@ mod tests {
             1,
             "reindexed page is searchable in the fresh store"
         );
+        let entity_hits = s2
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                "jetstream".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_hits.len(),
+            1,
+            "reindex must rebuild the entity stream from canonical frontmatter"
+        );
+        assert_eq!(entity_hits[0].path.as_str(), "notes/a.md");
         drop(s2);
     }
 

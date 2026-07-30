@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
+    AgentKind, EntityId, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
     ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
@@ -588,7 +588,7 @@ pub(crate) fn upsert_page_in_tx(
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
-        replace_entities_in_tx(tx, &new_id, page)?;
+        attach_entities_in_tx(tx, &new_id, page)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
@@ -627,7 +627,7 @@ pub(crate) fn upsert_page_in_tx(
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
-    replace_entities_in_tx(tx, &new_id, page)?;
+    attach_entities_in_tx(tx, &new_id, page)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
@@ -643,20 +643,14 @@ pub(crate) fn upsert_page_in_tx(
     Ok(new_id)
 }
 
-/// Re-point a page version's entity set (V38). Entity *rows* are shared
-/// per project and intentionally survive: a page dropping its last
-/// mention of `postgres` should not invalidate every other page's link
-/// to the same noun, and the orphan row costs one short string. The
-/// links are what get replaced.
-fn replace_entities_in_tx(
+/// Attach the normalized entity set to a new page version (V38). Entity
+/// rows are shared within one project; links stay attached to immutable
+/// page versions and latest-page filtering controls retrieval.
+fn attach_entities_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page_id: &PageId,
     page: &NewPage,
 ) -> StoreResult<()> {
-    tx.execute(
-        "DELETE FROM entity_page_links WHERE page_id = ?1",
-        params![page_id.as_bytes()],
-    )?;
     if page.entities.is_empty() {
         return Ok(());
     }
@@ -664,25 +658,17 @@ fn replace_entities_in_tx(
     // Defence in depth: the wiki layer normalises on the way in, but the
     // store is the last gate before the UNIQUE(name) constraint.
     for name in ai_memory_core::normalize_entities(&page.entities) {
-        tx.execute(
+        let entity_id: Vec<u8> = tx.query_row(
             "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT (workspace_id, project_id, name) DO NOTHING",
+             ON CONFLICT (workspace_id, project_id, name) DO UPDATE SET name = excluded.name \
+             RETURNING id",
             params![
-                ai_memory_core::PageId::new().as_bytes(),
+                EntityId::new().as_bytes(),
                 page.workspace_id.as_bytes(),
                 page.project_id.as_bytes(),
                 name,
                 now,
-            ],
-        )?;
-        let entity_id: Vec<u8> = tx.query_row(
-            "SELECT id FROM entities \
-             WHERE workspace_id = ?1 AND project_id = ?2 AND name = ?3",
-            params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
-                name
             ],
             |row| row.get(0),
         )?;
@@ -1315,6 +1301,16 @@ fn delete_page_inner(
             path.as_str()
         ],
     )?;
+    if rows > 0 {
+        tx.execute(
+            "DELETE FROM entities \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
+               )",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+    }
     // Only audit a real deletion — a no-op delete (0 rows) writes nothing, so
     // the trail isn't polluted with idempotent misses.
     if rows > 0 {

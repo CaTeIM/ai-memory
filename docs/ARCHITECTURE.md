@@ -17,8 +17,8 @@ The artifact you accrete is a **Karpathy-style LLM wiki**: a
 git-versioned tree of markdown pages on disk that gets *compiled* over
 time, appended-to. Pages are versioned in place via
 supersession, semantic concepts compound, episodic logs decay. A
-companion SQLite index gives FTS5 + optional vector retrieval; the
-markdown stays the source of truth.
+companion SQLite index gives FTS5 + lexical entity + link-neighbor retrieval,
+with optional vectors; the markdown stays the source of truth.
 
 ## Data flow
 
@@ -258,7 +258,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
-| `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target page versions and are replaced transactionally on rewrite. Powers the fourth RRF retrieval stream. |
+| `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
 **Memory tiers (M8 policy):**
@@ -330,7 +330,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, raw FTS/cosine scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
+| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |

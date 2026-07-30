@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived tables from markdown. Project-scoped query tokens match exact names,
   name prefixes, or word prefixes inside compound names and are weighted by
   inverse entity frequency before RRF fusion and the existing authority and
-  optional LLM reranking stages. Empty entity indexes add no query-time work or
-  score, and entity matching makes no LLM call. `explain: true` reports the
+  optional LLM reranking stages. Empty entity indexes contribute no candidates
+  or score, and entity matching makes no LLM call. `explain: true` reports the
   entity stream's rank, contribution, and matched names. (#320)
 - Optional post-RRF reranking for project and explicit-scope
   `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires

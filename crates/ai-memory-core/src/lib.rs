@@ -41,8 +41,9 @@ pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ManagedRunId, ObservationId,
-    PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId, WorkstreamId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
+    ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
+    WorkstreamId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{

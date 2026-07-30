@@ -189,7 +189,7 @@ The data dir is whatever you mounted in `docker-compose.prod.yml`
 data/
 ├── wiki/    # markdown — back up with rsync or git push to a remote
 ├── raw/    # immutable session log archive
-├── db/     # memory.sqlite (FTS5 + page_embeddings)
+├── db/     # memory.sqlite (FTS5 + entities + page_embeddings)
 ├── logs/   # daily rolling tracing
 └── models/ # reserved for future local embedders
 ```
