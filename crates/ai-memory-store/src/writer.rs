@@ -87,6 +87,13 @@ pub(crate) enum WriteCmd {
         author_id: Option<ai_memory_core::UserId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    DeletePageIfLatest {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     BeginSession {
         session: NewSession,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -1116,6 +1123,32 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Delete every version of `path` only if `expected_latest_id` is still
+    /// the latest version. Returns `false` without mutation when the page was
+    /// refreshed or removed after the caller selected it.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
+    /// SQL error from the conditional delete.
+    pub async fn delete_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        expected_latest_id: PageId,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::DeletePageIfLatest {
+            workspace_id,
+            project_id,
+            path,
+            expected_latest_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Insert a new user. `new_user` MUST already have been validated by
     /// [`NewUser::validate`](ai_memory_core::NewUser::validate); the
     /// caller (CLI or admin handler) generates the plaintext token,
@@ -1485,6 +1518,23 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result =
                     ops::delete_page(&mut conn, workspace_id, project_id, &path, author_id);
                 send_or_warn(reply, result, "delete_page");
+            }
+            WriteCmd::DeletePageIfLatest {
+                workspace_id,
+                project_id,
+                path,
+                expected_latest_id,
+                reply,
+            } => {
+                let result = ops::delete_page_if_latest(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    expected_latest_id,
+                    None,
+                );
+                send_or_warn(reply, result, "delete_page_if_latest");
             }
             WriteCmd::UpsertPageBatch { pages, reply } => {
                 let result = ops::upsert_pages_batch(&mut conn, &pages);

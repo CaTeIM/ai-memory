@@ -1125,6 +1125,38 @@ pub fn delete_page(
     path: &PagePath,
     author_id: Option<ai_memory_core::UserId>,
 ) -> StoreResult<()> {
+    delete_page_inner(conn, workspace_id, project_id, path, None, author_id).map(|_| ())
+}
+
+/// Delete every version of `path` only when `expected_latest_id` is still its
+/// latest version. The comparison and deletion share one transaction so a
+/// stale retention candidate cannot remove a page that was refreshed later.
+pub fn delete_page_if_latest(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    expected_latest_id: PageId,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<bool> {
+    delete_page_inner(
+        conn,
+        workspace_id,
+        project_id,
+        path,
+        Some(expected_latest_id),
+        author_id,
+    )
+}
+
+fn delete_page_inner(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    expected_latest_id: Option<PageId>,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<bool> {
     let tx = conn.transaction()?;
     // Capture the latest page id BEFORE the delete so the audit row can point
     // at it. None when the page is absent (delete is an idempotent no-op).
@@ -1141,6 +1173,12 @@ pub fn delete_page(
         )
         .optional()?
         .and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok());
+    if expected_latest_id
+        .as_ref()
+        .is_some_and(|expected| page_id.as_ref() != Some(expected.as_bytes()))
+    {
+        return Ok(false);
+    }
     let rows = tx.execute(
         "DELETE FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
         params![
@@ -1163,7 +1201,7 @@ pub fn delete_page(
         )?;
     }
     tx.commit()?;
-    Ok(())
+    Ok(rows > 0)
 }
 
 /// Hard-delete rows that were soft-deleted by an earlier sweep at

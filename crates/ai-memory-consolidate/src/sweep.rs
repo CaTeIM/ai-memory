@@ -89,7 +89,9 @@ const US_PER_DAY: f64 = 86_400_000_000.0;
 /// `wiki` routes TTL deletions through the wiki layer so the markdown
 /// file is removed together with the rows (deleting only store rows
 /// would let the watcher re-index the file). Callers without a wiki
-/// handle (bare-store tests) pass `None` and get a store-only delete.
+/// handle (bare-store tests) pass `None`; expired pages are then reported
+/// but left intact. A store-only delete would leave the authoritative file
+/// behind for the watcher to re-index.
 ///
 /// # Errors
 /// Propagates any store error encountered while reading candidates or
@@ -152,14 +154,18 @@ pub async fn run_sweep(
                 Err(_) => continue,
             };
             let result = match wiki {
-                Some(w) => w
-                    .delete_page(workspace_id, project_id, &path, None, None)
+                Some(w) => match w
+                    .delete_page_if_latest(workspace_id, project_id, &path, page.id, None)
                     .await
-                    .map_err(|e| e.to_string()),
-                None => writer
-                    .delete_page(workspace_id, project_id, path.clone(), None)
-                    .await
-                    .map_err(|e| e.to_string()),
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        Err("page changed after expiry selection; refusing stale delete"
+                            .to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+                None => Err("wiki unavailable; refusing store-only TTL delete".to_string()),
             };
             match result {
                 Ok(()) => page.deleted = true,

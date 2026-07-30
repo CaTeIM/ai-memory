@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use ai_memory_consolidate::{run_lint, run_sweep};
-use ai_memory_core::{PageId, PagePath, Tier};
+use ai_memory_core::{PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use rusqlite::params;
@@ -178,7 +178,9 @@ async fn m8_retention_lifecycle_end_to_end() {
         .get_or_create_project(ws, "lifecycle-test", None)
         .await
         .expect("proj");
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
 
     // ── Phase 2 — seed the 8 fixtures through the normal write path ─
     let mut ids: Vec<(&'static str, PageId)> = Vec::new();
@@ -443,7 +445,9 @@ async fn ttl_expiry_lifecycle_end_to_end() {
         .get_or_create_project(ws, "ttl-test", None)
         .await
         .expect("proj");
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
 
     let write = |path: &str, body: &str, expires_at: Option<&str>, pinned: bool| {
         let mut frontmatter = serde_json::Map::new();
@@ -500,6 +504,42 @@ async fn ttl_expiry_lifecycle_end_to_end() {
     )
     .await
     .expect("write forever page");
+
+    let stale_expired_id = write(
+        "notes/refreshed.md",
+        "# Refreshed\nttlmarker stale expired version",
+        Some("2020-01-01"),
+        false,
+    )
+    .await
+    .expect("write stale expired version");
+    let refreshed_id = write(
+        "notes/refreshed.md",
+        "# Refreshed\nttlmarker current non-expiring version",
+        None,
+        false,
+    )
+    .await
+    .expect("refresh expired page");
+    assert_ne!(stale_expired_id, refreshed_id);
+    assert!(
+        !wiki
+            .delete_page_if_latest(
+                ws,
+                proj,
+                &PagePath::new("notes/refreshed.md").unwrap(),
+                stale_expired_id,
+                None
+            )
+            .await
+            .expect("stale conditional delete"),
+        "a stale expiry candidate must not delete a refreshed page"
+    );
+    assert!(
+        ws_dir_for(&tmp, ws, proj)
+            .join("notes/refreshed.md")
+            .exists()
+    );
 
     // Invalid expires_at fails closed instead of meaning "never".
     let invalid = write("notes/bad.md", "# Bad\nbody", Some("soonish"), false).await;
@@ -566,6 +606,24 @@ async fn ttl_expiry_lifecycle_end_to_end() {
         .join(proj.to_string());
     assert!(ws_dir.join("notes/expired.md").exists());
 
+    // A caller without the canonical wiki handle must fail closed. Deleting
+    // only the SQLite rows would let the watcher resurrect the file.
+    let no_wiki = run_sweep(&store.reader, &store.writer, None, ws, proj, &params, false)
+        .await
+        .expect("sweep without wiki");
+    assert!(no_wiki.expired.iter().all(|e| !e.deleted));
+    assert!(ws_dir.join("notes/expired.md").exists());
+    let still_indexed = store
+        .reader
+        .search_pages_for_project(ws, proj, "ttlmarker".into(), 10, Some(i64::MIN))
+        .await
+        .expect("search after refused store-only delete");
+    assert!(
+        still_indexed
+            .iter()
+            .any(|h| h.path.as_str() == "notes/expired.md")
+    );
+
     // Real sweep hard-deletes them through the wiki layer.
     let real = run_sweep(
         &store.reader,
@@ -588,6 +646,7 @@ async fn ttl_expiry_lifecycle_end_to_end() {
         "explicit expiry beats pin",
     );
     assert!(ws_dir.join("notes/future.md").exists());
+    assert!(ws_dir.join("notes/refreshed.md").exists());
 
     // Rows are gone too — even an include-everything search misses them.
     let after = store
@@ -599,4 +658,12 @@ async fn ttl_expiry_lifecycle_end_to_end() {
     assert!(!after_paths.contains(&"notes/expired.md"));
     assert!(after_paths.contains(&"notes/future.md"));
     assert!(after_paths.contains(&"notes/forever.md"));
+    assert!(after_paths.contains(&"notes/refreshed.md"));
+}
+
+fn ws_dir_for(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {
+    tmp.path()
+        .join("wiki")
+        .join(ws.to_string())
+        .join(proj.to_string())
 }

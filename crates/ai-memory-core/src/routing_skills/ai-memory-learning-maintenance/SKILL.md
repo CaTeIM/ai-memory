@@ -13,7 +13,7 @@ Use this skill for compilation, learning review, wiki linting, and cleanup of ai
 - `memory_consolidate` compiles raw session observations into topical wiki pages on demand.
 - `memory_auto_improve` reviews a completed session for durable lessons and project-rule proposals.
 - `memory_lint` audits the wiki for contradictions, stale guidance, and candidate rule placement.
-- `memory_forget_sweep` prunes or proposes removal of old pages when the user asks for memory cleanup.
+- `memory_forget_sweep` prunes cold pages and deletes TTL-expired pages when the user asks for memory cleanup.
 
 ## Consolidation and learning review
 

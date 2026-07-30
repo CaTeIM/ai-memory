@@ -983,11 +983,13 @@ impl ReaderPool {
         &self,
         query: String,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHitWithMeta>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -1007,7 +1009,7 @@ impl ReaderPool {
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64, now_us()],
+                params![fts_query, authority_candidate_limit(limit) as i64, cutoff],
                 |row| {
                     let workspace_name: String = row.get(0)?;
                     let project_name: String = row.get(1)?;
@@ -3806,6 +3808,31 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// Return the latest page version id for one fully scoped path.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_page_id_by_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: String,
+    ) -> StoreResult<Option<PageId>> {
+        self.with_conn(move |conn| {
+            let id: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                       AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(id.map(|bytes| PageId::from_slice(&bytes)).transpose()?)
         })
         .await
     }
