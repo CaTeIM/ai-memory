@@ -1263,6 +1263,10 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
+    // Validate the reranker setting before the provider early-return, so
+    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
+    // looking enabled while every query runs plain RRF.
+    let want_reranker = config.reranker_choice()?;
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
     // the hook router (for PreCompact checkpointing), and the admin
@@ -1272,6 +1276,13 @@ fn configure_consolidator(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
         );
+        if want_reranker {
+            anyhow::bail!(
+                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
+                 judges candidates with the configured LLM provider. Set a provider or \
+                 unset AI_MEMORY_RERANKER."
+            );
+        }
         return Ok(ConsolidatorSetup {
             server,
             consolidator: None,
@@ -1297,6 +1308,18 @@ fn configure_consolidator(
         project_id,
     ));
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
+    // Optional post-RRF reranking rides on the same provider, so it is
+    // only reachable once an LLM is configured at all. Off unless the
+    // operator asked for it: it puts an LLM call on the memory_query
+    // hot path.
+    if want_reranker {
+        info!(
+            provider = llm.name(),
+            model = llm.model(),
+            "memory_query reranking enabled (adds LLM latency to every search)",
+        );
+        server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
+    }
     Ok(ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),

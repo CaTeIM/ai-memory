@@ -770,6 +770,13 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+Reranking is optional and off by default. With an LLM provider
+configured, `AI_MEMORY_RERANKER=llm` makes `memory_query` over-fetch
+candidates from the hybrid stage and have the LLM score each one against
+the query, which recovers the "the right page ranked 7th" case. It adds
+an LLM call to every search, so it's a latency-for-recall trade; on
+timeout or error the query silently falls back to the normal ranking.
+
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
 `openai-compat` when you want vector reranking in addition to FTS5 +

@@ -308,6 +308,12 @@ pub struct SearchExplain {
     /// means it was considered and left alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<f64>,
+    /// Relevance in `[0, 1]` assigned by the optional post-RRF
+    /// reranker. `None` when no reranker is configured, when it
+    /// degraded, or when it skipped this candidate — in which case the
+    /// hit kept its authority-adjusted position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
 }
 
 /// One hit returned by [`ReaderPool::search_pages`].

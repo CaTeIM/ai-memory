@@ -360,6 +360,9 @@ pub struct AiMemoryServer {
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Optional post-RRF reranker. When `None`, `memory_query` returns
+    /// fused RRF order and stays on the zero-LLM path.
+    reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
     /// Privacy strip. Applied to agent-supplied handoff fields in
     /// `memory_handoff_begin` (handoffs bypass `Wiki::write_page` so
     /// the wiki-level scrub doesn't cover them).
@@ -534,6 +537,17 @@ struct MemoryRecentResponse {
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
 }
+
+/// How many extra candidates to fetch for the reranker to reorder. The
+/// point of reranking is promoting a hit RRF put below the cut, so the
+/// candidate pool has to be deeper than the caller's limit.
+const RERANK_OVERFETCH: usize = 3;
+/// Hard cap on rerank candidates, whatever `limit * RERANK_OVERFETCH`
+/// works out to — bounds both prompt size and latency.
+const RERANK_MAX_CANDIDATES: usize = 30;
+/// Wall-clock budget for one rerank call. Past this, `memory_query`
+/// answers from RRF order instead of waiting.
+const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Cap on the free-text `reason` stored with a feedback signal.
 const MAX_FEEDBACK_REASON_CHARS: usize = 500;
@@ -911,6 +925,7 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             embedder: None,
+            reranker: None,
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
@@ -1159,6 +1174,14 @@ impl AiMemoryServer {
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
         let expiry_cutoff = options.include_expired.then_some(i64::MIN);
+        // With a reranker configured the fused stage has to reach below
+        // the caller's cut, since promoting one of those hits is the
+        // entire point of reranking.
+        let fetch_limit = if self.reranker.is_some() {
+            (options.limit * RERANK_OVERFETCH).min(RERANK_MAX_CANDIDATES)
+        } else {
+            options.limit
+        };
         // Provider/model/dim only select which stored vectors are
         // eligible; with no query vector the vector stream never runs,
         // so the empty triple is inert rather than a fake identity.
@@ -1166,9 +1189,8 @@ impl AiMemoryServer {
             (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
             _ => (String::new(), String::new(), 0),
         };
-        if options.explain {
-            return Ok(self
-                .reader
+        let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
+            self.reader
                 .hybrid_search_explained(
                     workspace_id,
                     project_id,
@@ -1177,31 +1199,135 @@ impl AiMemoryServer {
                     provider,
                     model,
                     dim,
-                    options.limit,
+                    fetch_limit,
                     expiry_cutoff,
                 )
                 .await?
                 .into_iter()
                 .map(|(hit, details)| (hit, Some(details)))
-                .collect());
+                .collect()
+        } else {
+            self.reader
+                .hybrid_search(
+                    workspace_id,
+                    project_id,
+                    options.query.to_owned(),
+                    options.query_vec.map(<[f32]>::to_vec),
+                    provider,
+                    model,
+                    dim,
+                    fetch_limit,
+                    expiry_cutoff,
+                )
+                .await?
+                .into_iter()
+                .map(|hit| (hit, None))
+                .collect()
+        };
+        Ok(self.rerank_hits(options.query, fused, options.limit).await)
+    }
+
+    async fn rerank_hits(
+        &self,
+        query: &str,
+        mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        let Some(reranker) = &self.reranker else {
+            hits.truncate(limit);
+            return hits;
+        };
+        if hits.len() < 2 {
+            hits.truncate(limit);
+            return hits;
         }
-        Ok(self
-            .reader
-            .hybrid_search(
-                workspace_id,
-                project_id,
-                options.query.to_owned(),
-                options.query_vec.map(<[f32]>::to_vec),
-                provider,
-                model,
-                dim,
-                options.limit,
-                expiry_cutoff,
-            )
-            .await?
+        let candidates: Vec<ai_memory_llm::RerankCandidate> = hits
+            .iter()
+            .map(|(hit, _)| ai_memory_llm::RerankCandidate {
+                id: hit.path.as_str().to_string(),
+                title: hit.title.clone(),
+                snippet: hit.snippet.clone(),
+            })
+            .collect();
+        let scored =
+            match tokio::time::timeout(RERANK_TIMEOUT, reranker.rerank(query, &candidates)).await {
+                Ok(Ok(scores)) => scores,
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        reranker = reranker.name(),
+                        model = reranker.model(),
+                        error = %e,
+                        "reranker failed; keeping RRF order"
+                    );
+                    hits.truncate(limit);
+                    return hits;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        reranker = reranker.name(),
+                        model = reranker.model(),
+                        timeout_secs = RERANK_TIMEOUT.as_secs(),
+                        "reranker timed out; keeping RRF order"
+                    );
+                    hits.truncate(limit);
+                    return hits;
+                }
+            };
+        let by_path: HashMap<&str, f32> = scored
+            .iter()
+            .map(|s| (s.id.as_str(), s.relevance))
+            .collect();
+        // A response that judged only a handful of candidates is a broken
+        // response (the prompt and schema require all of them), and acting
+        // on it would promote a few possibly-low scores above every
+        // unjudged candidate. Treat thin coverage as a degradation.
+        if by_path.len() * 2 < candidates.len() {
+            tracing::warn!(
+                reranker = reranker.name(),
+                model = reranker.model(),
+                scored = by_path.len(),
+                candidates = candidates.len(),
+                "reranker scored too few candidates; keeping RRF order"
+            );
+            hits.truncate(limit);
+            return hits;
+        }
+        // Stable sort keyed on relevance descending: unscored hits sort
+        // last as a group and keep their relative RRF order.
+        let mut indexed: Vec<(usize, (PageHit, Option<ai_memory_store::SearchExplain>))> =
+            hits.into_iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            let sa = by_path.get(a.1.0.path.as_str());
+            let sb = by_path.get(b.1.0.path.as_str());
+            match (sa, sb) {
+                (Some(x), Some(y)) => y
+                    .partial_cmp(x)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0),
+            }
+        });
+        let mut out: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = indexed
             .into_iter()
-            .map(|hit| (hit, None))
-            .collect())
+            .map(|(_, mut entry)| {
+                if let Some(explain) = entry.1.as_mut() {
+                    explain.rerank_score = by_path.get(entry.0.path.as_str()).copied();
+                }
+                entry
+            })
+            .collect();
+        out.truncate(limit);
+        out
+    }
+
+    /// Attach a reranker. Without one, `memory_query` keeps its
+    /// RRF-only, zero-LLM behaviour.
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Override the retention-sweep parameters (typically populated

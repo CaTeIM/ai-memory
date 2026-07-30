@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional post-RRF reranking for `memory_query`, off by default. Set
+  `AI_MEMORY_RERANKER=llm` (requires `AI_MEMORY_LLM_PROVIDER`) and the
+  query over-fetches `limit * 3` candidates (capped at 30) from the RRF
+  stage, then has the configured LLM provider score each one against the
+  query through JSON-schema structured output — no new provider dialect,
+  and it works across all eight existing providers. Scored candidates
+  sort by relevance and any the model skipped follow in RRF order.
+  Degrades rather than fails: a 20-second timeout, a provider error, or a
+  response covering fewer than half the candidates all fall back to plain
+  RRF order, matching the embedder's contract. With `explain: true` each
+  hit's `score_details` carries its `rerank_score`. An unknown
+  `AI_MEMORY_RERANKER` value, or `llm` without a provider, fails at
+  startup instead of silently disabling the feature.
+- New MCP tool `memory_feedback` (17th tool) — the "finer-grained
+  reinforcement beyond access counts" P2 item. Record how useful a
+  recalled page actually was by exact path: `helpful` / `not_helpful`
+  step the page's new `pages.salience` column (V37, bounded to
+  `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
+  time term instead of a single global `salience_default`; `stale` /
+  `wrong` floor the salience AND surface the page as a
 - New MCP tool `memory_feedback` (17th tool) — the "finer-grained
   reinforcement beyond access counts" P2 item. Record how useful a
   recalled page actually was by exact path: `helpful` / `not_helpful`
