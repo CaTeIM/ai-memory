@@ -1263,6 +1263,10 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
+    // Validate the reranker setting before the provider early-return, so
+    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
+    // looking enabled while eligible queries keep their normal ranking.
+    let want_reranker = config.reranker_choice()?;
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
     // the hook router (for PreCompact checkpointing), and the admin
@@ -1272,6 +1276,13 @@ fn configure_consolidator(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
         );
+        if want_reranker {
+            anyhow::bail!(
+                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
+                 judges candidates with the configured LLM provider. Set a provider or \
+                 unset AI_MEMORY_RERANKER."
+            );
+        }
         return Ok(ConsolidatorSetup {
             server,
             consolidator: None,
@@ -1297,6 +1308,18 @@ fn configure_consolidator(
         project_id,
     ));
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
+    // Optional post-RRF reranking rides on the same provider, so it is
+    // only reachable once an LLM is configured at all. Off unless the
+    // operator asked for it: it puts an LLM call on the memory_query
+    // hot path.
+    if want_reranker {
+        info!(
+            provider = llm.name(),
+            model = llm.model(),
+            "project/scopes memory_query reranking enabled (adds LLM latency)",
+        );
+        server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
+    }
     Ok(ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
@@ -2396,6 +2419,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reranker_without_llm_provider_fails_server_setup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let config = Config {
+            reranker: Some("llm".into()),
+            ..Config::default()
+        };
+
+        let result = configure_consolidator(
+            &config,
+            server,
+            &store,
+            &wiki,
+            ws,
+            proj,
+            &ProviderHealth::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("provider-less reranking must fail server setup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

@@ -117,8 +117,14 @@ from hook paths.
    `pinned`, and explicit positive/negative frontmatter tags. It favors
    maintained rules, decisions, procedures, and gotchas in close contests
    while keeping episodic, historical, lint, and test evidence searchable.
-   No query-intent regex or hard exclusion participates. If compiled wiki pages miss entirely in default,
-   explicit project, or explicit `scopes` mode, bounded raw observation
+   No query-intent regex or hard exclusion participates. An optional
+   `AI_MEMORY_RERANKER=llm` pass sends a bounded query plus up to 30 bounded
+   titles/snippets to the configured provider after project/scope fusion; it is
+   limited to one call per query and four calls in flight, and any invalid,
+   failed, timed-out, or saturated attempt preserves the local order. Global
+   and supplemental global-preference results do not take this path. If
+   compiled wiki pages miss entirely in default, explicit project, or explicit
+   `scopes` mode, bounded raw observation
    FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
    pages across projects only. Page hits bump `access_count` +
    `last_accessed_at` - the M8 reinforcement term. That bump is throttled
@@ -321,7 +327,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). `explain=true` attaches per-hit `score_details` (per-stream ranks, raw FTS/cosine scores, RRF contributions, graph provenance, and the authority multiplier applied after fusion) to project/scopes hits plus a top-level `streams_active` list. The distinct global FTS-only ranker reports its active stream without per-hit RRF details. `include_expired=true` also returns TTL-expired pages. |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, raw FTS/cosine scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
@@ -498,11 +504,13 @@ min_session_age_secs = 600
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini | openai-compat
+AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | copilot |
+                           gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
+AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override

@@ -102,6 +102,14 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
+    /// supported: LLM-as-judge over the configured LLM provider, so it
+    /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
+    /// an LLM call on the search hot path, trading latency for recall
+    /// at the top of the ranking. On any error or timeout the query
+    /// preserves the fused, authority-adjusted order. Set with
+    /// `AI_MEMORY_RERANKER=llm`.
+    pub reranker: Option<String>,
     /// Optional embedding provider (`openai`, `voyage`, `google` / `gemini`,
     /// or `openai-compat`).
     pub embedding_provider: Option<String>,
@@ -414,6 +422,7 @@ impl Default for Config {
             llm_compat_strict: true,
             consolidate_on_session_end: false,
             capture_assistant: false,
+            reranker: None,
             embedding_provider: None,
             embedding_model: None,
             embedding_dim: None,
@@ -770,6 +779,26 @@ impl Config {
         Err(LlmError::NotConfigured("OPENAI_API_KEY".into()))
     }
 
+    /// Whether the operator opted into post-RRF reranking.
+    ///
+    /// Unknown values are rejected loudly at *startup* rather than
+    /// silently disabling the feature — a typo'd `AI_MEMORY_RERANKER`
+    /// should not look like "reranking is on" in the operator's head
+    /// while eligible queries keep their normal ranking.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for any value other than
+    /// `llm` (case-insensitive) or empty.
+    pub fn reranker_choice(&self) -> LlmResult<bool> {
+        match non_empty(self.reranker.as_deref()).map(str::to_ascii_lowercase) {
+            None => Ok(false),
+            Some(v) if v == "llm" => Ok(true),
+            Some(other) => Err(LlmError::NotConfigured(format!(
+                "AI_MEMORY_RERANKER={other} is not supported (only `llm`)"
+            ))),
+        }
+    }
+
     /// Build the configured embedder settings, if hybrid search is enabled.
     ///
     /// # Errors
@@ -1111,6 +1140,30 @@ mod tests {
         // root-collapsing prefix key.
         assert_eq!(normalize_home_dir("/"), None);
         assert_eq!(normalize_home_dir(""), None);
+    }
+
+    #[test]
+    fn reranker_choice_is_explicit_case_insensitive_and_fail_closed() {
+        for value in [None, Some(""), Some("  ")] {
+            let cfg = Config {
+                reranker: value.map(str::to_string),
+                ..Config::default()
+            };
+            assert!(!cfg.reranker_choice().unwrap());
+        }
+        for value in ["llm", "LLM", " LlM "] {
+            let cfg = Config {
+                reranker: Some(value.into()),
+                ..Config::default()
+            };
+            assert!(cfg.reranker_choice().unwrap());
+        }
+        let cfg = Config {
+            reranker: Some("cross-encoder".into()),
+            ..Config::default()
+        };
+        let err = cfg.reranker_choice().unwrap_err();
+        assert!(err.to_string().contains("AI_MEMORY_RERANKER=cross-encoder"));
     }
 
     #[test]

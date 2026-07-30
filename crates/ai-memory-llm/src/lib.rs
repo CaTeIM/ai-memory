@@ -41,6 +41,7 @@ pub mod openai_compat;
 pub mod openai_oauth;
 pub mod opencode;
 pub mod provider;
+pub mod reranker;
 pub mod types;
 
 mod auth_file;
@@ -82,5 +83,6 @@ pub use openai_oauth::{
 };
 pub use opencode::{OPENCODE_DEFAULT_MODEL, OPENCODE_ZEN_BASE_URL, OpenCodeProvider};
 pub use provider::{LlmProvider, complete_structured};
+pub use reranker::{LlmReranker, RerankCandidate, RerankScore, Reranker};
 pub use stored_token::StoredOAuthToken;
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, Usage};

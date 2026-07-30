@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional post-RRF reranking for project and explicit-scope
+  `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires
+  `AI_MEMORY_LLM_PROVIDER`) to over-fetch candidates, fuse scopes, and
+  make at most one structured-output call through any existing LLM
+  provider. The prompt JSON-encodes untrusted input and sends the query
+  (up to 1,000 bytes) plus at most 30 page titles (200 bytes each) and
+  snippets (600 bytes each) to that provider. The requested result limit
+  is preserved even above 30; only the first 30 candidates are judged.
+  A partial/duplicate/unknown id set, invalid score, timeout, provider error,
+  or four-call concurrency saturation preserves the pre-rerank order.
+  `global=true` and supplemental
+  global-preference hits keep their existing non-RRF ranking. With
+  `explain: true`, judged hits include `rerank_score`. Unknown reranker
+  values and `llm` without a provider fail at startup. (#319)
 - New MCP tool `memory_feedback` (17th tool) — the "finer-grained
   reinforcement beyond access counts" P2 item. Record how useful a
   recalled page actually was by exact path: `helpful` / `not_helpful`

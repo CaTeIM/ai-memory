@@ -771,9 +771,21 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
+Reranking is optional and off by default. With an LLM provider configured,
+`AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
+calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
+call to reorder the best candidates. This can promote a relevant page that
+RRF ranked below the requested cut, at the cost of LLM latency and usage. The
+request sends the query plus at most 30 bounded page titles and search snippets
+to the configured provider; all values are JSON-encoded and treated as
+untrusted data. A timeout, provider error, or incomplete/invalid score set
+preserves the normal order. `global=true` and supplemental global-preference
+hits keep their existing non-RRF ranking. Concurrent provider calls are capped
+at four; saturated queries keep their local ranking without waiting.
+
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector reranking in addition to FTS5 +
+`openai-compat` when you want vector retrieval in addition to FTS5 +
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and

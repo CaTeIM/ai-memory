@@ -362,6 +362,12 @@ pub struct AiMemoryServer {
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
+    /// Optional post-RRF reranker. When `None`, `memory_query` returns
+    /// fused, authority-adjusted order and stays on the zero-LLM path.
+    reranker: Option<Arc<dyn ai_memory_llm::Reranker>>,
+    /// Shared across cloned request handlers so concurrent searches cannot
+    /// create an unbounded number of billable provider calls.
+    rerank_gate: Arc<tokio::sync::Semaphore>,
     /// Privacy strip. Applied to agent-supplied handoff fields in
     /// `memory_handoff_begin` (handoffs bypass `Wiki::write_page` so
     /// the wiki-level scrub doesn't cover them).
@@ -536,6 +542,20 @@ struct MemoryRecentResponse {
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
 }
+
+/// How many extra candidates to fetch for the reranker to reorder. The
+/// point of reranking is promoting a hit RRF put below the cut, so the
+/// candidate pool has to be deeper than the caller's limit.
+const RERANK_OVERFETCH: usize = 3;
+/// Hard cap on rerank candidates, whatever `limit * RERANK_OVERFETCH`
+/// works out to — bounds both prompt size and latency.
+const RERANK_MAX_CANDIDATES: usize = 30;
+/// Maximum number of provider-backed rerank calls executing concurrently.
+/// Saturated requests keep the locally computed order without waiting.
+const RERANK_MAX_IN_FLIGHT: usize = 4;
+/// Wall-clock budget for one rerank call. Past this, `memory_query`
+/// answers from the adjusted pre-rerank order instead of waiting.
+const RERANK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Cap on the free-text `reason` stored with a feedback signal.
 const MAX_FEEDBACK_REASON_CHARS: usize = 500;
@@ -931,6 +951,8 @@ impl AiMemoryServer {
             wiki: None,
             decay_params: DecayParams::default(),
             embedder: None,
+            reranker: None,
+            rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
             sanitizer: ai_memory_core::Sanitizer::builtin(),
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
@@ -1186,9 +1208,8 @@ impl AiMemoryServer {
             (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
             _ => (String::new(), String::new(), 0),
         };
-        if options.explain {
-            return Ok(self
-                .reader
+        let fused: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = if options.explain {
+            self.reader
                 .hybrid_search_explained(
                     workspace_id,
                     project_id,
@@ -1203,25 +1224,171 @@ impl AiMemoryServer {
                 .await?
                 .into_iter()
                 .map(|(hit, details)| (hit, Some(details)))
-                .collect());
+                .collect()
+        } else {
+            self.reader
+                .hybrid_search(
+                    workspace_id,
+                    project_id,
+                    options.query.to_owned(),
+                    options.query_vec.map(<[f32]>::to_vec),
+                    provider,
+                    model,
+                    dim,
+                    options.limit,
+                    expiry_cutoff,
+                )
+                .await?
+                .into_iter()
+                .map(|hit| (hit, None))
+                .collect()
+        };
+        Ok(fused)
+    }
+
+    fn rerank_fetch_limit(&self, limit: usize) -> usize {
+        if self.reranker.is_none() {
+            return limit;
         }
-        Ok(self
-            .reader
-            .hybrid_search(
-                workspace_id,
-                project_id,
-                options.query.to_owned(),
-                options.query_vec.map(<[f32]>::to_vec),
-                provider,
-                model,
-                dim,
-                options.limit,
-                expiry_cutoff,
-            )
-            .await?
+        limit.max(
+            limit
+                .saturating_mul(RERANK_OVERFETCH)
+                .min(RERANK_MAX_CANDIDATES),
+        )
+    }
+
+    async fn rerank_hits(
+        &self,
+        query: &str,
+        hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        self.rerank_hits_with_timeout(query, hits, limit, RERANK_TIMEOUT)
+            .await
+    }
+
+    async fn rerank_hits_with_timeout(
+        &self,
+        query: &str,
+        mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        let Some(reranker) = &self.reranker else {
+            hits.truncate(limit);
+            return hits;
+        };
+        let candidate_count = hits.len().min(RERANK_MAX_CANDIDATES);
+        if candidate_count < 2 {
+            hits.truncate(limit);
+            return hits;
+        }
+        let Ok(_permit) = self.rerank_gate.clone().try_acquire_owned() else {
+            tracing::debug!(
+                reranker = reranker.name(),
+                model = reranker.model(),
+                max_in_flight = RERANK_MAX_IN_FLIGHT,
+                "reranker concurrency limit reached; keeping pre-rerank order"
+            );
+            hits.truncate(limit);
+            return hits;
+        };
+        let candidates: Vec<ai_memory_llm::RerankCandidate> = hits
+            .iter()
+            .take(candidate_count)
+            .map(|(hit, _)| ai_memory_llm::RerankCandidate {
+                id: hit.id.to_string(),
+                title: hit.title.clone(),
+                snippet: hit.snippet.clone(),
+            })
+            .collect();
+        let scored = match tokio::time::timeout(timeout, reranker.rerank(query, &candidates)).await
+        {
+            Ok(Ok(scores)) => scores,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    reranker = reranker.name(),
+                    model = reranker.model(),
+                    error = %e,
+                    "reranker failed; keeping pre-rerank order"
+                );
+                hits.truncate(limit);
+                return hits;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    reranker = reranker.name(),
+                    model = reranker.model(),
+                    timeout_secs = timeout.as_secs_f64(),
+                    "reranker timed out; keeping pre-rerank order"
+                );
+                hits.truncate(limit);
+                return hits;
+            }
+        };
+        let candidate_index: HashMap<&str, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| (candidate.id.as_str(), idx))
+            .collect();
+        let mut relevance = vec![None; candidates.len()];
+        let mut invalid = scored.len() != candidates.len();
+        for score in &scored {
+            let Some(&idx) = candidate_index.get(score.id.as_str()) else {
+                invalid = true;
+                continue;
+            };
+            if !score.relevance.is_finite()
+                || !(0.0..=1.0).contains(&score.relevance)
+                || relevance[idx].replace(score.relevance).is_some()
+            {
+                invalid = true;
+            }
+        }
+        if invalid || relevance.iter().any(Option::is_none) {
+            tracing::warn!(
+                reranker = reranker.name(),
+                model = reranker.model(),
+                scored = scored.len(),
+                candidates = candidates.len(),
+                "reranker returned incomplete or invalid scores; keeping pre-rerank order"
+            );
+            hits.truncate(limit);
+            return hits;
+        }
+        let relevance: Vec<f32> = relevance
             .into_iter()
-            .map(|hit| (hit, None))
-            .collect())
+            .map(Option::unwrap_or_default)
+            .collect();
+
+        let tail = hits.split_off(candidate_count);
+        let mut indexed: Vec<(usize, (PageHit, Option<ai_memory_store::SearchExplain>))> =
+            hits.into_iter().enumerate().collect();
+        indexed.sort_by(|a, b| {
+            relevance[b.0]
+                .total_cmp(&relevance[a.0])
+                .then(a.0.cmp(&b.0))
+        });
+        let mut out: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> = indexed
+            .into_iter()
+            .map(|(idx, mut entry)| {
+                if let Some(explain) = entry.1.as_mut() {
+                    explain.rerank_score = Some(relevance[idx]);
+                }
+                entry
+            })
+            .collect();
+        out.extend(tail);
+        out.truncate(limit);
+        out
+    }
+
+    /// Attach a reranker. Without one, `memory_query` keeps its
+    /// RRF-only, zero-LLM behaviour.
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn ai_memory_llm::Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -1358,6 +1525,7 @@ impl AiMemoryServer {
 
         let query = args.query.clone();
         let query_vec = self.embed_query(&args.query).await;
+        let candidate_limit = self.rerank_fetch_limit(limit);
         let resolved_scopes = if args.scopes.is_empty() {
             None
         } else {
@@ -1374,7 +1542,7 @@ impl AiMemoryServer {
                         ProjectSearchOptions {
                             query: &args.query,
                             query_vec: query_vec.as_deref(),
-                            limit,
+                            limit: candidate_limit,
                             include_expired,
                             explain,
                         },
@@ -1399,8 +1567,9 @@ impl AiMemoryServer {
                     .partial_cmp(&b.0.rank)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
+                    .then_with(|| a.0.id.as_bytes().cmp(b.0.id.as_bytes()))
             });
-            hits.truncate(limit);
+            hits.truncate(candidate_limit);
             Ok(hits)
         } else {
             let (ws, proj) = self
@@ -1416,7 +1585,7 @@ impl AiMemoryServer {
                 ProjectSearchOptions {
                     query: &args.query,
                     query_vec: query_vec.as_deref(),
-                    limit,
+                    limit: candidate_limit,
                     include_expired,
                     explain,
                 },
@@ -1424,6 +1593,7 @@ impl AiMemoryServer {
             .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let hits = self.rerank_hits(&args.query, hits, limit).await;
         self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
@@ -3299,6 +3469,327 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or_else(|| panic!("expected text content"));
         serde_json::from_str(text).unwrap_or_else(|e| panic!("invalid JSON response: {e}\n{text}"))
+    }
+
+    enum StubRerankOutcome {
+        Scores(Vec<ai_memory_llm::RerankScore>),
+        Reverse,
+        Fail,
+    }
+
+    struct StubReranker {
+        outcome: StubRerankOutcome,
+        delay: Duration,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        candidate_counts: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::Reranker for StubReranker {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn model(&self) -> &str {
+            "stub-model"
+        }
+
+        async fn rerank(
+            &self,
+            _query: &str,
+            candidates: &[ai_memory_llm::RerankCandidate],
+        ) -> ai_memory_llm::LlmResult<Vec<ai_memory_llm::RerankScore>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.candidate_counts.lock().unwrap().push(candidates.len());
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            match &self.outcome {
+                StubRerankOutcome::Scores(scores) => Ok(scores.clone()),
+                StubRerankOutcome::Reverse => {
+                    let denominator = candidates.len().saturating_sub(1).max(1) as f32;
+                    Ok(candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, candidate)| ai_memory_llm::RerankScore {
+                            id: candidate.id.clone(),
+                            relevance: idx as f32 / denominator,
+                        })
+                        .collect())
+                }
+                StubRerankOutcome::Fail => Err(ai_memory_llm::LlmError::UnexpectedShape(
+                    "stub failure".into(),
+                )),
+            }
+        }
+    }
+
+    fn stub_reranker(
+        outcome: StubRerankOutcome,
+        delay: Duration,
+    ) -> (
+        Arc<StubReranker>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let candidate_counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(StubReranker {
+                outcome,
+                delay,
+                calls: calls.clone(),
+                candidate_counts: candidate_counts.clone(),
+            }),
+            calls,
+            candidate_counts,
+        )
+    }
+
+    fn rerank_test_hits(count: usize) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        (0..count)
+            .map(|idx| {
+                (
+                    PageHit {
+                        id: PageId::new(),
+                        path: PagePath::new(format!("notes/{idx:03}.md")).unwrap(),
+                        title: format!("Page {idx}"),
+                        snippet: format!("candidate {idx}"),
+                        rank: idx as f64,
+                    },
+                    Some(ai_memory_store::SearchExplain::default()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reranker_reorders_one_bounded_prefix_without_shrinking_large_limits() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let (reranker, calls, candidate_counts) =
+            stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+        let hits = rerank_test_hits(40);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+
+        assert_eq!(server.rerank_fetch_limit(5), 15);
+        assert_eq!(server.rerank_fetch_limit(20), 30);
+        assert_eq!(server.rerank_fetch_limit(35), 35);
+        let reranked = server.rerank_hits("query", hits, 35).await;
+
+        assert_eq!(reranked.len(), 35);
+        assert_eq!(reranked[0].0.id, original_ids[29]);
+        assert_eq!(reranked[29].0.id, original_ids[0]);
+        assert_eq!(
+            reranked[30..]
+                .iter()
+                .map(|(hit, _)| hit.id)
+                .collect::<Vec<_>>(),
+            original_ids[30..35]
+        );
+        assert!(
+            reranked[..30].iter().all(|(_, explain)| explain
+                .as_ref()
+                .unwrap()
+                .rerank_score
+                .is_some())
+        );
+        assert!(
+            reranked[30..].iter().all(|(_, explain)| explain
+                .as_ref()
+                .unwrap()
+                .rerank_score
+                .is_none())
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*candidate_counts.lock().unwrap(), vec![30]);
+    }
+
+    #[tokio::test]
+    async fn reranker_degrades_on_partial_malformed_error_and_timeout() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let hits = rerank_test_hits(4);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+        let partial = hits[..2]
+            .iter()
+            .map(|(hit, _)| ai_memory_llm::RerankScore {
+                id: hit.id.to_string(),
+                relevance: 1.0,
+            })
+            .collect();
+        let (reranker, _, _) = stub_reranker(StubRerankOutcome::Scores(partial), Duration::ZERO);
+        let result = server
+            .clone()
+            .with_reranker(reranker)
+            .rerank_hits("query", hits.clone(), 4)
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+
+        let malformed = vec![
+            ai_memory_llm::RerankScore {
+                id: hits[0].0.id.to_string(),
+                relevance: 0.0,
+            },
+            ai_memory_llm::RerankScore {
+                id: hits[0].0.id.to_string(),
+                relevance: 1.0,
+            },
+            ai_memory_llm::RerankScore {
+                id: "unknown-page-version".into(),
+                relevance: 1.0,
+            },
+            ai_memory_llm::RerankScore {
+                id: hits[3].0.id.to_string(),
+                relevance: f32::NAN,
+            },
+        ];
+        let (reranker, _, _) = stub_reranker(StubRerankOutcome::Scores(malformed), Duration::ZERO);
+        let result = server
+            .clone()
+            .with_reranker(reranker)
+            .rerank_hits("query", hits.clone(), 4)
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+
+        let (reranker, _, _) = stub_reranker(StubRerankOutcome::Fail, Duration::ZERO);
+        let result = server
+            .clone()
+            .with_reranker(reranker)
+            .rerank_hits("query", hits.clone(), 4)
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+
+        let (reranker, calls, _) =
+            stub_reranker(StubRerankOutcome::Reverse, Duration::from_millis(50));
+        let result = server
+            .with_reranker(reranker)
+            .rerank_hits_with_timeout("query", hits, 4, Duration::from_millis(1))
+            .await;
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reranker_degrades_without_calling_provider_when_saturated() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+        let _permits: Vec<_> = (0..RERANK_MAX_IN_FLIGHT)
+            .map(|_| server.rerank_gate.clone().try_acquire_owned().unwrap())
+            .collect();
+        let hits = rerank_test_hits(4);
+        let original_ids: Vec<PageId> = hits.iter().map(|(hit, _)| hit.id).collect();
+
+        let result = server.rerank_hits("query", hits, 4).await;
+
+        assert_eq!(
+            result.iter().map(|(hit, _)| hit.id).collect::<Vec<_>>(),
+            original_ids
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_scope_query_invokes_the_reranker_once_after_fusion() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: other,
+                path: PagePath::new("foo.md").unwrap(),
+                title: "Other".into(),
+                body: "Karpathy also says compile durable context.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let (reranker, calls, candidate_counts) =
+            stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+
+        let response = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "Karpathy".into(),
+                        limit: Some(10),
+                        project: None,
+                        workspace: None,
+                        scopes: vec![
+                            MemoryScopeArg {
+                                workspace: "default".into(),
+                                project: "scratch".into(),
+                            },
+                            MemoryScopeArg {
+                                workspace: "default".into(),
+                                project: "other".into(),
+                            },
+                        ],
+                        global: None,
+                        include_expired: None,
+                        explain: Some(true),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(response["hits"].as_array().unwrap().len(), 2);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*candidate_counts.lock().unwrap(), vec![2]);
+        assert_ne!(proj, other);
+    }
+
+    #[tokio::test]
+    async fn global_query_does_not_invoke_the_project_reranker() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let (reranker, calls, _) = stub_reranker(StubRerankOutcome::Reverse, Duration::ZERO);
+        let server = server.with_reranker(reranker);
+
+        let response = call_tool_json(
+            server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: "Karpathy".into(),
+                        limit: Some(10),
+                        project: None,
+                        workspace: None,
+                        scopes: Vec::new(),
+                        global: Some(true),
+                        include_expired: None,
+                        explain: None,
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(response["global_hits"].as_array().unwrap().len(), 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     async fn insert_test_observation(
