@@ -161,6 +161,23 @@ fn docker_source_build_uses_vendored_tailwind() {
 }
 
 #[test]
+fn docker_context_excludes_operator_deployment_files() {
+    let dockerignore = read_repo(".dockerignore");
+    let protected_suffix = concat!(
+        "# Operator-specific deployment files. Keep this block last so a later negation\n",
+        "# cannot re-include credentials or host configuration in the build context.\n",
+        "/bin/deploy.env\n",
+        "/docker/.env.production\n",
+        "/docker/docker-compose.prod.yml\n",
+    );
+
+    assert!(
+        dockerignore.ends_with(protected_suffix),
+        "operator deployment exclusions must remain the final Docker ignore rules"
+    );
+}
+
+#[test]
 fn docker_publish_jobs_use_prebuilt_binaries() {
     let dockerfile = read_repo("docker/Dockerfile");
     assert!(dockerfile.contains("FROM runtime-base AS runtime-prebuilt-amd64"));

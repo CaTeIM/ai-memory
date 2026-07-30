@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.20.2] - 2026-07-30
 
 ### Fixed
+- Docker build contexts now exclude the gitignored operator deployment files,
+  preventing local server configuration and production environment secrets
+  from being sent to the Docker builder. A packaging regression test keeps the
+  exclusions as the final ignore rules so later negations cannot re-include
+  them. (#314)
 - Managed workstream heartbeats now bound each server request and condense an
   outage into one short notice plus one recovery notice. Active launchers keep
   the lease-safe 30-second retry cadence without printing the same timeout on
