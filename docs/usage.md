@@ -40,6 +40,13 @@ If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
 consume that handoff automatically.
 
+Handoffs are next-session transfer, not a live message bus between agents that
+are still running. In particular, Antigravity CLI exposes `PreInvocation`
+before every model call; ai-memory fetches a handoff only on invocation zero,
+which is the hook contract's startup boundary. A handoff created later in that
+conversation stays open instead of being consumed by its creator's next model
+call.
+
 If an agent creates a handoff by mistake, cancel it immediately with
 `memory_handoff_cancel` and the `handoff_id` returned by
 `memory_handoff_begin`. Cancelling marks the handoff expired, so the next

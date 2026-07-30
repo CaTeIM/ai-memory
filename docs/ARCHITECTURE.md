@@ -184,6 +184,11 @@ normalises them to exactly one of these `ObservationKind` values:
 | `session-end` | Agent session ended; summary/handoff path may run. |
 | `other` | Unknown or unsupported hook event. |
 
+Antigravity CLI has no native SessionStart event. Its `PreInvocation` hook
+fires before every model call, so the bridge maps only the documented
+`invocationNum = 0` payload to `session-start`; later invocations are ignored
+before spool or network side effects.
+
 Unknown events do **not** expand the enum and, by default, leave no
 source-event metadata in storage; they collapse to `other`. Third-party
 integrations that need their own vocabulary can opt in by sending

@@ -360,6 +360,30 @@ fn parse_minutes(raw: Option<String>, default: Duration) -> Duration {
     }
 }
 
+fn should_process_hook_event(agent: AgentKind, event: HookEvent, raw: &serde_json::Value) -> bool {
+    if agent == AgentKind::AntigravityCli && event == HookEvent::SessionStart {
+        return raw.get("invocationNum").and_then(serde_json::Value::as_u64) == Some(0);
+    }
+    true
+}
+
+fn session_start_handoff_envelope(agent: AgentKind, handoff: String) -> serde_json::Value {
+    if agent == AgentKind::AntigravityCli {
+        serde_json::json!({
+            "injectSteps": [{
+                "ephemeralMessage": handoff,
+            }]
+        })
+    } else {
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": handoff,
+            }
+        })
+    }
+}
+
 /// Run a single hook end-to-end. Always returns Ok and always writes a JSON
 /// object to stdout — a hook must never fail the agent.
 ///
@@ -400,6 +424,16 @@ where
             return Ok(());
         }
     };
+    let agent_kind = AgentKind::from_wire(&args.agent);
+    let hook_event = HookEvent::parse(&args.event);
+    // Antigravity exposes PreInvocation rather than a true SessionStart. It
+    // fires before every model call; invocation zero is the only startup
+    // boundary. Fail closed when the documented counter is absent so a later
+    // invocation can never consume a handoff intended for the next session.
+    if !should_process_hook_event(agent_kind, hook_event, &json) {
+        writeln!(stdout, "{{}}")?;
+        return Ok(());
+    }
     // Assistant/Stop capture (#196). On an opted-in install
     // (`install-hooks --capture-assistant`), extract the assistant message,
     // sanitize + cap it, and splice the versioned `_ai_memory_assistant` marker
@@ -408,11 +442,7 @@ where
     // Reserialize only when the JSON actually changed, so unrelated events keep
     // byte-exact spool bodies (see `native_hook_accepts_plain_and_bom_prefixed_json`).
     let capture_assistant = if args.capture_assistant {
-        let transform = ai_memory_hooks::transform_for_client(
-            &mut json,
-            AgentKind::from_wire(&args.agent),
-            ai_memory_hooks::HookEvent::parse(&args.event),
-        );
+        let transform = ai_memory_hooks::transform_for_client(&mut json, agent_kind, hook_event);
         if transform.changed {
             payload = serde_json::to_string(&json)?;
         }
@@ -423,10 +453,7 @@ where
         }
         false
     };
-    if ai_memory_hooks::cap_lifecycle_body_for_client(
-        &mut json,
-        ai_memory_hooks::HookEvent::parse(&args.event),
-    ) {
+    if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
         payload = serde_json::to_string(&json)?;
     }
     let (policy_cwd, canonical_session_id) = hook_context(&args.agent, &json);
@@ -571,7 +598,7 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if AgentKind::from_wire(&args.agent).session_start_injects_handoff() {
+        if agent_kind.session_start_injects_handoff() {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, args.auth_token.as_deref()).await;
             let native_session_qs = canonical_session_id
@@ -586,12 +613,7 @@ where
             if let Some(handoff) =
                 get_handoff(&client, &handoff_url, bearer.as_deref(), handoff_timeout()).await
             {
-                let envelope = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": handoff,
-                    }
-                });
+                let envelope = session_start_handoff_envelope(agent_kind, handoff);
                 writeln!(stdout, "{envelope}")?;
                 return Ok(());
             }
@@ -828,6 +850,33 @@ mod tests {
         assert!(!should_spawn_background_drainer("post-tool-use"));
         assert!(!should_spawn_background_drainer("pre-tool-use"));
         assert!(!should_spawn_background_drainer("user-prompt"));
+    }
+
+    #[test]
+    fn antigravity_preinvocation_only_maps_invocation_zero_to_session_start() {
+        for (raw, expected) in [
+            (serde_json::json!({"invocationNum": 0}), true),
+            (serde_json::json!({"invocationNum": 1}), false),
+            (serde_json::json!({"invocationNum": 0.5}), false),
+            (serde_json::json!({"invocationNum": "0"}), false),
+            (serde_json::json!({}), false),
+        ] {
+            assert_eq!(
+                should_process_hook_event(AgentKind::AntigravityCli, HookEvent::SessionStart, &raw,),
+                expected,
+                "{raw}"
+            );
+        }
+        assert!(should_process_hook_event(
+            AgentKind::ClaudeCode,
+            HookEvent::SessionStart,
+            &serde_json::json!({})
+        ));
+        assert!(should_process_hook_event(
+            AgentKind::AntigravityCli,
+            HookEvent::PostToolUse,
+            &serde_json::json!({})
+        ));
     }
 
     #[test]
@@ -1641,6 +1690,18 @@ mod tests {
         }
     }
 
+    fn antigravity_hook_args(server_url: &str) -> HookArgs {
+        HookArgs {
+            event: "session-start".into(),
+            agent: "antigravity-cli".into(),
+            server_url: server_url.into(),
+            auth_token: None,
+            project_strategy: None,
+            check_capture: false,
+            capture_assistant: false,
+        }
+    }
+
     /// Recording HTTP stub: replies to every request with `status`/`body` and
     /// streams each request head back so tests can assert which endpoints the
     /// hook touched (session-start also drains the spool, so POSTs to `/hook`
@@ -1679,6 +1740,80 @@ mod tests {
             .await
             .ok()
             .flatten()
+    }
+
+    #[tokio::test]
+    async fn antigravity_initial_invocation_fetches_with_native_output_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "AGY-HANDOFF").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(tmp.path().join("data")),
+            antigravity_hook_args(&base),
+            serde_json::json!({
+                "invocationNum": 0,
+                "initialNumSteps": 0,
+                "conversationId": "agy-conversation",
+                "workspacePaths": [tmp.path()]
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let output: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "injectSteps": [{"ephemeralMessage": "AGY-HANDOFF"}]
+            })
+        );
+        let mut recorded = Vec::new();
+        while let Some(request) = first_request(&mut requests).await {
+            recorded.push(request);
+        }
+        assert!(
+            recorded
+                .iter()
+                .any(|request| request.starts_with("POST /hook")),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|request| {
+                request.starts_with("GET /handoff?")
+                    && request.contains("session_id=agy-conversation")
+            }),
+            "{recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn antigravity_later_invocation_has_no_capture_or_handoff_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let (base, mut requests) = serve_requests("200 OK", "MUST-NOT-BE-CONSUMED").await;
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data_dir.clone()),
+            antigravity_hook_args(&base),
+            serde_json::json!({
+                "invocationNum": 4,
+                "initialNumSteps": 12,
+                "conversationId": "agy-conversation",
+                "workspacePaths": [tmp.path()]
+            })
+            .to_string(),
+            &mut stdout,
+            |_| Err(std::io::Error::other("must not spawn")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(first_request(&mut requests).await.is_none());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
     #[tokio::test]
