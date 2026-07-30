@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New MCP tool `memory_feedback` (17th tool) — the "finer-grained
+  reinforcement beyond access counts" P2 item. Record how useful a
+  recalled page actually was by exact path: `helpful` / `not_helpful`
+  step the page's new `pages.salience` column (V37, bounded to
+  `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
+  time term for sweep-eligible episodic pages instead of a single global
+  `salience_default`; `stale` /
+  `wrong` floor the salience AND surface the page as a
+  `feedback_flagged` finding in the next `memory_lint` report. Signals
+  land in a new append-only `page_feedback` table with an optional
+  sanitized, bounded single-line reason, the resulting salience needed to
+  rebuild derived state, and a full audit-log entry. Nothing is ever
+  deleted by feedback. The exact path resolves to the current page version
+  in the feedback transaction, so rewriting a flagged page later retires
+  both its salience and its lint findings — there is no separate dismissal
+  state. Pages without feedback keep `salience = NULL`, which reads as
+  exactly the previous behaviour. Retrieved content cannot authorize a
+  feedback call; agents treat it as untrusted data. (#318)
 - `memory_query` gained an optional `explain: true` mode for project and
   explicit-scope searches. Each compiled-page hit then includes its 1-based
   FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link

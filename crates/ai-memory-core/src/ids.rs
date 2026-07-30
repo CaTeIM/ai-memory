@@ -88,6 +88,7 @@ id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
+id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
 
 /// Relative path of a page within the wiki tree.
 ///

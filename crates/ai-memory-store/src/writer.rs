@@ -185,6 +185,16 @@ pub(crate) enum WriteCmd {
         page_ids: Vec<PageId>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    RecordPageFeedback {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        kind: ai_memory_core::FeedbackKind,
+        reason: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        params: crate::decay::DecayParams,
+        reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
+    },
     SoftDeleteForDecay {
         page_ids: Vec<PageId>,
         reply: oneshot::Sender<StoreResult<usize>>,
@@ -851,6 +861,38 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
             page_ids,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one explicit feedback signal for a page and update its
+    /// derived salience. Returns `None` when the path has no latest
+    /// version in that scope.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_page_feedback(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        kind: ai_memory_core::FeedbackKind,
+        reason: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        params: crate::decay::DecayParams,
+    ) -> StoreResult<Option<(PageId, f64)>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordPageFeedback {
+            workspace_id,
+            project_id,
+            path,
+            kind,
+            reason,
+            author_id,
+            params,
             reply: tx,
         })
         .await?;
@@ -1675,6 +1717,28 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::reorg_sessions(&mut conn, &workspace_id, &plan);
                 send_or_warn(reply, result, "reorg_sessions");
+            }
+            WriteCmd::RecordPageFeedback {
+                workspace_id,
+                project_id,
+                path,
+                kind,
+                reason,
+                author_id,
+                params,
+                reply,
+            } => {
+                let result = ops::record_page_feedback(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &path,
+                    kind,
+                    reason.as_deref(),
+                    author_id,
+                    &params,
+                );
+                send_or_warn(reply, result, "record_page_feedback");
             }
             WriteCmd::BumpAccess { page_ids, reply } => {
                 let result = ops::bump_access_for_pages(&mut conn, &page_ids);

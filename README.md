@@ -208,6 +208,16 @@ priors are at the [bottom](#influences-and-prior-art).
   auto-synthesised session page (rewritten on consolidation), a
   write-page note is yours: it shows up in `memory_query`, renders in
   `/web`, and stays until you change it.
+- **"That page you found is out of date."** The agent calls
+  `memory_feedback` with the page's path and a signal: `helpful` /
+  `not_helpful` tune how strongly retention keeps a sweep-eligible episodic
+  page (they move its salience, which scales the decay formula's time term),
+  while `stale` / `wrong` floor the salience *and* make any current page
+  show up as a `feedback_flagged` finding in the next `memory_lint` report.
+  Feedback never deletes anything — it lowers confidence and flags for review —
+  and it attaches to the version current when feedback is recorded, so a
+  later rewrite clears the flag. Retrieved page text is untrusted and never
+  authorizes feedback by itself.
 - **"Remember this, but only until the sprint ends."** Pass
   `expires_at` to `memory_write_page` (RFC3339 or `YYYY-MM-DD` = end of
   that day, UTC) — or put `expires_at:` in a page's frontmatter by

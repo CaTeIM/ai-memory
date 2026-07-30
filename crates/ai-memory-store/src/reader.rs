@@ -220,6 +220,22 @@ fn rerank_page_hits_with_meta(
     hits
 }
 
+/// One page flagged by `stale`/`wrong` feedback on its current version,
+/// aggregated per (page, kind) for the lint pass.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedbackFinding {
+    /// Wiki path of the flagged page.
+    pub path: String,
+    /// `stale` or `wrong`.
+    pub kind: String,
+    /// How many signals of this kind the current version has.
+    pub signal_count: u32,
+    /// ISO-8601 timestamp of the most recent signal.
+    pub latest_at: String,
+    /// Most recent caller-supplied reason for this kind, if any.
+    pub reason: Option<String>,
+}
+
 /// A graph-expansion neighbour with provenance (which seed and which
 /// link direction produced it). Internal to hybrid search + explain.
 struct GraphNeighbor {
@@ -2079,7 +2095,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json, expires_at \
+                        frontmatter_json, expires_at, salience \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -2090,6 +2106,63 @@ impl ReaderPool {
             let mut out = Vec::new();
             for r in rows {
                 out.push(r??);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Return `stale` / `wrong` feedback still attached to a *current*
+    /// page version in one project, grouped by (page, kind) — the input
+    /// for the lint pass's `feedback_flagged` findings. Rewriting a
+    /// flagged page supersedes the version the feedback points at, so
+    /// the finding drops out here without any explicit dismissal.
+    /// Most-recent signal first.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn open_feedback_findings(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<FeedbackFinding>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT pg.path, f.kind, COUNT(*) AS signal_count, MAX(f.created_at) AS latest, \
+                        (SELECT reason FROM page_feedback r \
+                          WHERE r.page_id = f.page_id AND r.kind = f.kind \
+                            AND r.reason IS NOT NULL \
+                          ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reason \
+                 FROM page_feedback f \
+                 JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                 WHERE f.workspace_id = ?1 AND f.project_id = ?2 \
+                   AND f.kind IN ('stale', 'wrong') \
+                 GROUP BY f.page_id, pg.path, f.kind \
+                 ORDER BY latest DESC, pg.path ASC, f.kind ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let path: String = row.get(0)?;
+                    let kind: String = row.get(1)?;
+                    let signal_count: i64 = row.get(2)?;
+                    let latest_us: i64 = row.get(3)?;
+                    let reason: Option<String> = row.get(4)?;
+                    Ok((path, kind, signal_count, latest_us, reason))
+                },
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path, kind, signal_count, latest_us, reason) = row?;
+                out.push(FeedbackFinding {
+                    path,
+                    kind,
+                    signal_count: u32::try_from(signal_count.max(0)).unwrap_or(u32::MAX),
+                    latest_at: jiff::Timestamp::from_microsecond(latest_us)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_default(),
+                    reason,
+                });
             }
             Ok(out)
         })
@@ -5261,6 +5334,9 @@ pub struct DecayCandidate {
     /// TTL instant in microseconds since epoch. The sweep hard-deletes
     /// pages past this regardless of tier or pin.
     pub expires_at_us: Option<i64>,
+    /// Per-page salience once explicit feedback has moved it (V37);
+    /// `None` means "use `DecayParams::salience_default`".
+    pub salience: Option<f64>,
 }
 
 fn row_to_decay_candidate(
@@ -5275,6 +5351,7 @@ fn row_to_decay_candidate(
     let last_accessed_at_us: Option<i64> = row.get(6)?;
     let frontmatter_json: String = row.get(7)?;
     let expires_at_us: Option<i64> = row.get(8)?;
+    let salience: Option<f64> = row.get(9)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -5285,6 +5362,7 @@ fn row_to_decay_candidate(
         last_accessed_at_us,
         frontmatter_json,
         expires_at_us,
+        salience,
     ))
 }
 
@@ -5299,6 +5377,7 @@ fn materialise_decay_candidate(
     last_accessed_at_us: Option<i64>,
     frontmatter_json: String,
     expires_at_us: Option<i64>,
+    salience: Option<f64>,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
@@ -5312,6 +5391,7 @@ fn materialise_decay_candidate(
         last_accessed_at_us,
         frontmatter_json,
         expires_at_us,
+        salience,
     })
 }
 

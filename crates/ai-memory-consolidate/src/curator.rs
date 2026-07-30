@@ -98,6 +98,7 @@ pub async fn run_curator_report(
             page_age_days,
             c.access_count,
             days_since_access,
+            c.salience,
         );
         if score < params.decay_params.cold_threshold {
             cold.push(CuratorFinding {
