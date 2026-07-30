@@ -133,7 +133,13 @@ pub async fn run_sweep(
         }
         let age_days = elapsed_days(now_us, c.updated_at_us);
         let days_since_access = c.last_accessed_at_us.map(|us| elapsed_days(now_us, us));
-        let score = retention_score(params, age_days, c.access_count, days_since_access);
+        let score = retention_score(
+            params,
+            age_days,
+            c.access_count,
+            days_since_access,
+            c.salience,
+        );
         if score < params.cold_threshold {
             evicted.push(EvictedPage {
                 id: c.id,
@@ -232,6 +238,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -248,6 +255,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -264,6 +272,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: r#"{"pinned": true}"#.into(),
             expires_at_us: None,
+            salience: None,
         };
         assert!(!is_decayable(&c));
     }
@@ -280,6 +289,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         };
         assert!(is_decayable(&c));
     }

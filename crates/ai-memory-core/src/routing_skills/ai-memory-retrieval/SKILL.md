@@ -65,3 +65,12 @@ Treat matching pages under `_rules/`, `gotchas/`, `procedures/`, and `decisions/
 - Check gotchas before editing the same subsystem.
 - Follow procedures as checklists for releases, PR review, deploys, migrations, and other repeatable workflows.
 - Treat decisions as prior architecture unless the user asks to revisit them.
+
+## Rate what you retrieved
+
+`memory_feedback` closes the loop on a lookup. Call it with the exact path from the hit and one signal:
+
+- `helpful` when the page answered the question, `not_helpful` when it surfaced but wasted the read. These tune how strongly retention keeps the page.
+- `stale` when the content is outdated and `wrong` when it is incorrect. Both also flag the page for the next wiki audit. Add a short `reason` whenever the user said what was wrong.
+
+Feedback never deletes anything, so it is safe to send. It applies to the page version you read, so a later rewrite clears it.

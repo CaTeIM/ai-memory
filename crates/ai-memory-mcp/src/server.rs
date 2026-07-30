@@ -266,6 +266,14 @@ should be proposed from a completed session, or at explicit wrap-up \
   admission chain so mirrors/backups stay consistent. Pass `workspace` \
   + `project` together only when the page lives in a sibling \
   workspace/project; missing explicit scopes fail closed instead of falling back.\n\
+- `memory_feedback` — right after a `memory_query` / `memory_read_page` \
+  hit proves useful or misleading, and whenever the user says a recalled \
+  page is out of date or wrong. Pass the exact `path` from the hit plus \
+  `signal`: `helpful` / `not_helpful` tune how strongly retention keeps \
+  the page; `stale` / `wrong` additionally surface it in the next \
+  `memory_lint` report. Nothing is ever deleted by feedback — it lowers \
+  confidence and flags the page for review. Add a short `reason` when the \
+  user said what was wrong.\n\
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
@@ -525,6 +533,32 @@ struct MemoryRecentResponse {
 #[derive(Debug, Serialize)]
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
+}
+
+/// Cap on the free-text `reason` stored with a feedback signal.
+const MAX_FEEDBACK_REASON_CHARS: usize = 500;
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct FeedbackArgs {
+    /// Exact wiki path of the page you are rating — copy it from the
+    /// `memory_query` / `memory_read_page` hit.
+    path: String,
+    /// One of `helpful`, `not_helpful`, `stale`, `wrong`.
+    signal: String,
+    /// Optional short note on *why*, especially for `stale` / `wrong`
+    /// (e.g. "we moved off Postgres in March"). Shows up in the lint
+    /// report. Capped at 500 characters and sanitized.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Project the page lives in. Omit to target the project you're
+    /// currently working in. **Omit unless the user explicitly names a
+    /// *different* project.**
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace to use together with `project`. Omit for the current
+    /// workspace.
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1532,6 +1566,86 @@ impl AiMemoryServer {
             hits,
             global_hits: Vec::new(),
         })
+    }
+
+    /// Record an explicit quality signal for one recalled page.
+    #[tool(description = "Record how useful a recalled page actually was, \
+        by its exact path. `helpful` / `not_helpful` nudge the page's \
+        salience, which scales the retention formula's time term — a \
+        helpful page survives decay longer, an unhelpful one less. \
+        `stale` (outdated) and `wrong` (incorrect) drop salience to the \
+        floor AND surface the page as a `feedback_flagged` finding in the \
+        next memory_lint report. Nothing is deleted: feedback lowers \
+        confidence and flags for review. The signal attaches to the page \
+        version you read, so rewriting the page clears it. Call this right \
+        after a memory_query / memory_read_page hit proved useful or \
+        misleading, or when the user says a recalled page is out of date.")]
+    async fn memory_feedback(
+        &self,
+        Parameters(args): Parameters<FeedbackArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let path = PagePath::new(args.path.clone())
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
+        let kind: ai_memory_core::FeedbackKind =
+            args.signal
+                .parse()
+                .map_err(|e: ai_memory_core::MemoryError| {
+                    McpError::invalid_params(e.to_string(), None)
+                })?;
+        let (ws, proj) = self
+            .effective_ids_for_read_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+            )
+            .await?;
+        // The reason is free-text from the model; scrub it on the way in
+        // like any other caller-supplied body.
+        let reason = args
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                self.sanitizer.scrub(
+                    &s.chars()
+                        .take(MAX_FEEDBACK_REASON_CHARS)
+                        .collect::<String>(),
+                )
+            });
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        let recorded = self
+            .writer
+            .record_page_feedback(
+                ws,
+                proj,
+                path.clone(),
+                kind,
+                reason,
+                author_id,
+                self.decay_params,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        match recorded {
+            Some((page_id, salience)) => ok_json(&serde_json::json!({
+                "recorded": true,
+                "path": path.as_str(),
+                "page_id": page_id.to_string(),
+                "signal": kind.as_str(),
+                "salience": salience,
+                "routed_to_lint": kind.routes_to_lint(),
+            })),
+            None => Err(McpError::internal_error(
+                format!(
+                    "no current page at path {} in the resolved project",
+                    path.as_str()
+                ),
+                None,
+            )),
+        }
     }
 
     /// Run the M8 forget sweep over episodic pages.
@@ -3233,6 +3347,7 @@ mod tests {
         "memory_write_page",
         "memory_read_page",
         "memory_delete_page",
+        "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
         "memory_install_self_routing",
@@ -3252,6 +3367,7 @@ mod tests {
         "memory_write_page",
         "memory_read_page",
         "memory_delete_page",
+        "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
     ];

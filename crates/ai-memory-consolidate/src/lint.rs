@@ -139,6 +139,36 @@ pub async fn run_lint(
         });
     }
 
+    // Explicit `stale` / `wrong` feedback (memory_feedback). An agent or
+    // user asserting a page is outdated or incorrect is the highest-signal
+    // finding the zero-LLM path can produce — it came from a human/agent
+    // judgement, not a heuristic. Findings repeat until the page is
+    // rewritten, which is the point: an unfixed stale page is still stale.
+    let feedback_flagged = reader
+        .open_feedback_findings(workspace_id, project_id)
+        .await?;
+    for flagged in &feedback_flagged {
+        let plural = if flagged.signal_count == 1 {
+            "signal"
+        } else {
+            "signals"
+        };
+        let mut message = format!(
+            "Page {} was flagged `{}` ({} {}, latest {})",
+            flagged.path, flagged.kind, flagged.signal_count, plural, flagged.latest_at,
+        );
+        if let Some(reason) = &flagged.reason {
+            message.push_str(&format!(": {reason}"));
+        }
+        findings.push(LintFinding {
+            kind: "feedback_flagged".into(),
+            severity: "warning".into(),
+            message,
+            pages: vec![flagged.path.clone()],
+            detail: None,
+        });
+    }
+
     if use_llm && let Some(provider) = llm {
         match contradiction_pass(
             provider.clone(),
@@ -396,6 +426,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         }];
         let findings = rule_based_findings(&candidates);
         assert_eq!(findings.len(), 1);
@@ -414,6 +445,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki"}"#.into(),
             expires_at_us: None,
+            salience: None,
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -440,6 +472,7 @@ mod tests {
             frontmatter_json: r#"{"title": "Never ship code without a test", "kind": "rule"}"#
                 .into(),
             expires_at_us: None,
+            salience: None,
         };
         let findings = rule_based_findings(&[candidate]);
         let rules: Vec<_> = findings
@@ -465,6 +498,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
@@ -488,6 +522,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
             expires_at_us: None,
+            salience: None,
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
@@ -543,6 +578,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
             expires_at_us: None,
+            salience: None,
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.

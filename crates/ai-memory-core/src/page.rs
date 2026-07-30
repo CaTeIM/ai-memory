@@ -166,6 +166,65 @@ impl Tier {
     }
 }
 
+/// An explicit judgement on how useful a recalled page was.
+///
+/// The M8 decay formula's only reinforcement signal is the access
+/// counter every search hit bumps, which cannot distinguish "this page
+/// answered the question" from "this page surfaced and wasted a read".
+/// These four signals close that gap: `Helpful` / `NotHelpful` nudge the
+/// page's salience (bounded, see the store's feedback op), while `Stale`
+/// / `Wrong` additionally route the page into the next `memory_lint`
+/// report rather than deleting anything — an agent's judgement lowers
+/// confidence, it does not destroy memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    /// The page answered the question it surfaced for.
+    Helpful,
+    /// The page surfaced but did not help.
+    NotHelpful,
+    /// The content is outdated — the page needs a refresh.
+    Stale,
+    /// The content is factually wrong, not merely dated.
+    Wrong,
+}
+
+impl FeedbackKind {
+    /// Canonical short string for storage and serialisation. Matches the
+    /// `page_feedback.kind` CHECK constraint (V37).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Helpful => "helpful",
+            Self::NotHelpful => "not_helpful",
+            Self::Stale => "stale",
+            Self::Wrong => "wrong",
+        }
+    }
+
+    /// Whether this signal should surface as a `memory_lint` finding.
+    #[must_use]
+    pub const fn routes_to_lint(&self) -> bool {
+        matches!(self, Self::Stale | Self::Wrong)
+    }
+}
+
+impl FromStr for FeedbackKind {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "helpful" => Ok(Self::Helpful),
+            "not_helpful" => Ok(Self::NotHelpful),
+            "stale" => Ok(Self::Stale),
+            "wrong" => Ok(Self::Wrong),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown feedback kind: {other} (want helpful|not_helpful|stale|wrong)"
+            ))),
+        }
+    }
+}
+
 impl FromStr for Tier {
     type Err = crate::MemoryError;
 
@@ -209,5 +268,21 @@ mod tests {
             serde_json::to_string(&Tier::Procedural).unwrap(),
             "\"procedural\""
         );
+    }
+    #[test]
+    fn feedback_kind_round_trips_and_flags_lint_routing() {
+        for k in [
+            FeedbackKind::Helpful,
+            FeedbackKind::NotHelpful,
+            FeedbackKind::Stale,
+            FeedbackKind::Wrong,
+        ] {
+            assert_eq!(k.as_str().parse::<FeedbackKind>().unwrap(), k);
+        }
+        assert!("nope".parse::<FeedbackKind>().is_err());
+        assert!(!FeedbackKind::Helpful.routes_to_lint());
+        assert!(!FeedbackKind::NotHelpful.routes_to_lint());
+        assert!(FeedbackKind::Stale.routes_to_lint());
+        assert!(FeedbackKind::Wrong.routes_to_lint());
     }
 }

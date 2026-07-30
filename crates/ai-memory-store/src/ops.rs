@@ -1078,6 +1078,79 @@ pub fn bump_access_for_pages(conn: &mut Connection, page_ids: &[PageId]) -> Stor
     Ok(())
 }
 
+/// Record one explicit feedback signal against the latest version of a
+/// page and update its derived salience, in a single transaction.
+///
+/// `page_feedback` is the append-only source of truth; `pages.salience`
+/// is the derived value the decay formula reads. Returns the page id and
+/// the salience after the update, or `None` when the path has no latest
+/// version in that scope (idempotent no-op for a deleted page).
+#[allow(clippy::too_many_arguments)]
+pub fn record_page_feedback(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    kind: ai_memory_core::FeedbackKind,
+    reason: Option<&str>,
+    author_id: Option<ai_memory_core::UserId>,
+    params: &crate::decay::DecayParams,
+) -> StoreResult<Option<(PageId, f64)>> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let existing: Option<(Vec<u8>, Option<f64>)> = tx
+        .query_row(
+            "SELECT id, salience FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                path.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((page_id_bytes, current_salience)) = existing else {
+        return Ok(None);
+    };
+    let page_id = PageId::from_slice(&page_id_bytes)?;
+    let next_salience = crate::decay::salience_after_feedback(params, current_salience, kind);
+
+    tx.execute(
+        "INSERT INTO page_feedback \
+         (id, page_id, workspace_id, project_id, kind, reason, author_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            ai_memory_core::PageFeedbackId::new().as_bytes(),
+            page_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            kind.as_str(),
+            reason,
+            author_id.map(|id| id.as_bytes().to_vec()),
+            now,
+        ],
+    )?;
+    // Salience rides on the page *version*: a later supersession starts
+    // from salience_default again, which is intentional — feedback is a
+    // judgement on the content that was read, not on the path forever.
+    tx.execute(
+        "UPDATE pages SET salience = ?1 WHERE id = ?2",
+        params![next_salience, page_id.as_bytes()],
+    )?;
+    audit(
+        &tx,
+        "page_feedback",
+        Some(workspace_id.as_bytes()),
+        Some(project_id.as_bytes()),
+        Some(page_id.as_bytes()),
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(Some((page_id, next_salience)))
+}
+
 /// Mark a set of `is_latest=1` pages as soft-deleted by the forget
 /// sweep. Distinguished from M7 supersession by `supersedes IS NULL`.
 pub fn soft_delete_for_decay(conn: &mut Connection, page_ids: &[PageId]) -> StoreResult<usize> {
