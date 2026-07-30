@@ -110,26 +110,28 @@ from hook paths.
    trust boundary and delimiters precede automatically injected handoffs,
    project briefs, and managed-workstream packets; current instructions and
    checkout state remain authoritative.
-6. `memory_query` answers via FTS5 + entity-match + link-neighbour RRF;
-   when an embedder is configured, vector cosine over `page_embeddings`
-   joins the same RRF. Each stream contributes nothing when its input is
-   absent, so the zero-LLM default is FTS5 + entity + graph. Before final
-   truncation, a bounded authority multiplier adjusts the relevance score
-   using the canonical page kind, tier, `pinned`, and explicit
-   positive/negative frontmatter tags. It favors maintained rules,
-   decisions, procedures, and gotchas in close contests while keeping
-   episodic, historical, lint, and test evidence searchable. No
-   query-intent regex or hard exclusion participates. When
-   `AI_MEMORY_RERANKER=llm` is set the adjusted candidates get a final LLM
-   relevance pass (degrading to the adjusted order on error). If compiled
-   wiki pages miss entirely in default, explicit project, or explicit
+6. `memory_query` answers via FTS5 + entity-match + link-neighbour RRF; when an
+   embedder is configured, vector cosine over `page_embeddings` joins the same
+   RRF. The entity index is derived from the canonical frontmatter `entities`
+   list, and an empty index contributes no candidates or score. Before final
+   truncation, a bounded authority multiplier adjusts relevance using canonical
+   page kind, tier, `pinned`, and explicit positive/negative frontmatter tags.
+   It favors maintained rules, decisions, procedures, and gotchas in close
+   contests while keeping episodic, historical, lint, and test evidence
+   searchable. No query-intent regex or hard exclusion participates. An
+   optional `AI_MEMORY_RERANKER=llm` pass sends a bounded query plus up to 30
+   bounded titles/snippets to the configured provider after project/scope
+   fusion; it is limited to one call per query and four calls in flight, and any
+   invalid, failed, timed-out, or saturated attempt preserves the local order.
+   Global and supplemental global-preference results do not take this path. If
+   compiled wiki pages miss entirely in default, explicit project, or explicit
    `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
-   `global=true` searches compiled wiki pages across projects only. Page
-   hits bump `access_count` + `last_accessed_at` - the M8 reinforcement
-   term, which `memory_feedback` complements with explicit per-page
-   salience. That bump is throttled to at most once per page per minute,
-   so a burst of overlapping searches does not flood the writer actor
-   with redundant reinforcement writes.
+   `global=true` searches compiled wiki pages across projects only. Page hits
+   bump `access_count` + `last_accessed_at` - the M8 reinforcement term, which
+   `memory_feedback` complements with explicit per-page salience. That bump is
+   throttled to at most once per page per minute, so a burst of overlapping
+   searches does not flood the writer actor with redundant reinforcement
+   writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -255,8 +257,8 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `links` | Wikilink / markdown cross-references. `to_page_id` (a global PageId) is nullable for unresolved forward links. `to_workspace` / `to_project` carry a cross-project scope (NULL = the source page's own project). |
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
-| `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional reason. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
-| `entities`, `entity_page_links` | V38 noun index derived from the frontmatter `entities:` list the consolidator writes. Names are lowercase and unique per project; links are per page *version* and replaced on rewrite. Powers the 4th retrieval stream. `entities.id` is deliberately the stable anchor a future temporal-triples table could reference — that P2 item stays deferred. |
+| `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
+| `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target page versions and are replaced transactionally on rewrite. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
 **Memory tiers (M8 policy):**
@@ -328,7 +330,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). When `AI_MEMORY_RERANKER=llm` is set the adjusted candidates get a final LLM relevance pass (degrading to the adjusted order on error). `explain=true` attaches per-hit `score_details` (per-stream ranks, raw FTS/cosine scores, RRF contributions, graph provenance, and the authority multiplier applied after fusion) to project/scopes hits plus a top-level `streams_active` list. The distinct global FTS-only ranker reports its active stream without per-hit RRF details. `include_expired=true` also returns TTL-expired pages. |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, raw FTS/cosine scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
@@ -338,7 +340,7 @@ invariants below.
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
-| `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step its `pages.salience` (which scales the retention formula's time term), `stale`/`wrong` floor salience AND surface the page as a `feedback_flagged` lint finding. Never deletes; attaches to the page *version*, so a rewrite clears it. |
+| `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
@@ -505,11 +507,13 @@ min_session_age_secs = 600
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | openai | openai-oauth | copilot | gemini | openai-compat
+AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | copilot |
+                           gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
 AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
+AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
@@ -523,19 +527,6 @@ auth and from OpenAI Platform API keys.
 GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with
 the `vscode-chat` integration headers. The raw GitHub token is not sent to the
 Copilot chat endpoint.
-
-**Reranker env** (opt-in, requires an LLM provider):
-```
-AI_MEMORY_RERANKER            llm  (only supported value; unknown values fail at startup)
-```
-`memory_query` then over-fetches (`limit * 3`, capped at 30 candidates)
-from the RRF stage and has the configured LLM provider score each
-candidate against the query via JSON-schema structured output. Scored
-candidates sort by relevance; any the model skipped follow in RRF order.
-On timeout (20 s), provider error, or a response covering fewer than half
-the candidates, the query answers from plain RRF order — the same
-degrade-don't-fail contract as the embedder. Off by default: it puts an
-LLM call on the search hot path.
 
 **Embedder env** (opt-in):
 ```

@@ -220,6 +220,7 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_write_page` | Write durable wiki knowledge on explicit user request | destructive |
 | `memory_read_page` | Read a full page body by exact path or top search hit | read-only |
 | `memory_delete_page` | Delete a single exact-path page with admission hooks | destructive |
+| `memory_feedback` | Record bounded page-quality feedback; adjust episodic retention and flag stale/wrong current versions for lint review | write |
 | `memory_forget_sweep` | Retention sweep (M8); soft-delete below cold threshold; `dry_run=true` previews | destructive |
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical slim CLAUDE.md / AGENTS.md routing block, managed Agent Skill payloads, target hints, and overwrite guidance | read-only |

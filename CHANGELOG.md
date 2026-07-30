@@ -9,125 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Entity-match retrieval as a fourth RRF stream (V38 `entities` +
-  `entity_page_links`). Consolidation now emits an `entities` list per
-  page — the specific technologies, components, and domain nouns the
-  content names — which lands in the page's frontmatter (markdown stays
-  the source of truth; a reindex rebuilds the index) and is matched
-  lexically at query time: exact name, name-prefix, or a word inside a
-  multi-word entity, weighted by inverse entity frequency so a rare noun
-  outranks a ubiquitous one. This finds pages whose *wording* misses the
-  query — a note whose body says "the streaming broker" now answers a
-  query for "jetstream". No spaCy, no NLP dependency, and no LLM call at
-  query time: extraction happens only where an LLM already runs, so a
-  project that never consolidated has an empty table and the stream
-  contributes nothing — the zero-LLM default path is unchanged. With
-  `explain: true` each hit reports its `entity_rank` and
-  `matched_entities`. `entities.id` is deliberately shaped as the stable
-  anchor a future temporal-triples table could reference; that P2 item
-  stays deferred, and no graph database is involved either way.
-- Optional post-RRF reranking for `memory_query`, off by default. Set
-  `AI_MEMORY_RERANKER=llm` (requires `AI_MEMORY_LLM_PROVIDER`) and the
-  query over-fetches `limit * 3` candidates (capped at 30) from the RRF
-  stage, then has the configured LLM provider score each one against the
-  query through JSON-schema structured output — no new provider dialect,
-  and it works across all eight existing providers. Scored candidates
-  sort by relevance and any the model skipped follow in RRF order.
-  Degrades rather than fails: a 20-second timeout, a provider error, or a
-  response covering fewer than half the candidates all fall back to plain
-  RRF order, matching the embedder's contract. With `explain: true` each
-  hit's `score_details` carries its `rerank_score`. An unknown
-  `AI_MEMORY_RERANKER` value, or `llm` without a provider, fails at
-  startup instead of silently disabling the feature.
+  `entity_page_links`). Consolidation emits up to 10 normalized technologies,
+  components, services, files, or domain nouns per page into frontmatter;
+  manually edited `entities` use the same index path, and reindex rebuilds the
+  derived tables from markdown. Project-scoped query tokens match exact names,
+  name prefixes, or word prefixes inside compound names and are weighted by
+  inverse entity frequency before RRF fusion and the existing authority and
+  optional LLM reranking stages. Empty entity indexes add no query-time work or
+  score, and entity matching makes no LLM call. `explain: true` reports the
+  entity stream's rank, contribution, and matched names. (#320)
+- Optional post-RRF reranking for project and explicit-scope
+  `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires
+  `AI_MEMORY_LLM_PROVIDER`) to over-fetch candidates, fuse scopes, and
+  make at most one structured-output call through any existing LLM
+  provider. The prompt JSON-encodes untrusted input and sends the query
+  (up to 1,000 bytes) plus at most 30 page titles (200 bytes each) and
+  snippets (600 bytes each) to that provider. The requested result limit
+  is preserved even above 30; only the first 30 candidates are judged.
+  A partial/duplicate/unknown id set, invalid score, timeout, provider error,
+  or four-call concurrency saturation preserves the pre-rerank order.
+  `global=true` and supplemental
+  global-preference hits keep their existing non-RRF ranking. With
+  `explain: true`, judged hits include `rerank_score`. Unknown reranker
+  values and `llm` without a provider fail at startup. (#319)
 - New MCP tool `memory_feedback` (17th tool) — the "finer-grained
   reinforcement beyond access counts" P2 item. Record how useful a
   recalled page actually was by exact path: `helpful` / `not_helpful`
   step the page's new `pages.salience` column (V37, bounded to
   `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
-  time term instead of a single global `salience_default`; `stale` /
+  time term for sweep-eligible episodic pages instead of a single global
+  `salience_default`; `stale` /
   `wrong` floor the salience AND surface the page as a
   `feedback_flagged` finding in the next `memory_lint` report. Signals
   land in a new append-only `page_feedback` table with an optional
-  sanitized reason and full audit-log entry. Nothing is ever deleted by
-  feedback. Signals attach to the page *version* that was read, so
-  rewriting a flagged page retires both its salience and its lint
-  findings — there is no separate dismissal state. Pages without
-  feedback keep `salience = NULL`, which reads as exactly the previous
-  behaviour.
-- `memory_query` explain mode: pass `explain: true` and every hit carries
-  `score_details` — its 1-based rank and raw score in each retrieval
-  stream (FTS5 bm25 score, embedding cosine, graph-neighbour provenance
-  naming the seed page and link direction), the per-stream RRF
-  contributions, the fused score, and the bounded page-authority
-  multiplier applied after fusion — plus a top-level `streams_active`
-  list that makes degradation visible (an embedder failure shows up as
-  `["fts"]` instead of `["fts","vector","graph"]`). Reporting the
-  authority factor alongside `fused` is what keeps the surface honest:
-  the returned `rank` is the fused score *after* that multiplier, so
-  `fused` alone would not account for the ordering. Costs nothing extra:
-  the data was already computed and discarded. Hybrid ranking also gained
-  a deterministic path tiebreak for equal adjusted scores, which
-  previously fell back to hash-map iteration order.
-- Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
-  `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
-  `pages.expires_at` column (V36) and settable through a new optional
-  `expires_at` parameter on `memory_write_page`. Expired pages are hidden
-  from `memory_query`/`memory_recent`/briefing/session-brief surfaces —
-  `memory_query` gains `include_expired: true` to still see them — while
-  exact-path reads still return the page, annotated `expired: true`,
-  because an explicit read is not a search. The forget sweep hard-deletes
-  them through the wiki layer, so the markdown file goes too, not just
-  the rows. An explicit TTL outranks `pinned` (a pin means "don't decay
-  this", not "keep it past the date its author set"); `memory_lint`
-  flags pinned+expiring pages so the combination is visible rather than
-  silent ([#309]).
-- New `openai-compat` embedding provider for self-hosted engines
-  (Ollama, LM Studio, vLLM). Set
-  `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` together with explicit
-  `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
-  `AI_MEMORY_EMBEDDING_DIM` — there is no safe default model or
-  dimensionality for a self-hosted engine, so each is required rather
-  than guessed. Unlike the other providers it is keyless: a bearer
-  token is sent only when `LLM_API_KEY` is present, for gateways that
-  want one. Embeddings are stored under their own
-  `provider="openai-compat"` identity, so switching an existing
-  `openai`+base-URL setup over changes the stored
-  `{provider, model, dim}` triple — run `ai-memory embed --force` to
-  re-embed. (#300)
-- Optional post-RRF reranking for `memory_query`, off by default. Set
-  `AI_MEMORY_RERANKER=llm` (requires `AI_MEMORY_LLM_PROVIDER`) and the
-  query over-fetches `limit * 3` candidates (capped at 30) from the RRF
-  stage, then has the configured LLM provider score each one against the
-  query through JSON-schema structured output — no new provider dialect,
-  and it works across all eight existing providers. Scored candidates
-  sort by relevance and any the model skipped follow in RRF order.
-  Degrades rather than fails: a 20-second timeout, a provider error, or a
-  response covering fewer than half the candidates all fall back to plain
-  RRF order, matching the embedder's contract. With `explain: true` each
-  hit's `score_details` carries its `rerank_score`. An unknown
-  `AI_MEMORY_RERANKER` value, or `llm` without a provider, fails at
-  startup instead of silently disabling the feature.
-- New MCP tool `memory_feedback` (17th tool) — the "finer-grained
-  reinforcement beyond access counts" P2 item. Record how useful a
-  recalled page actually was by exact path: `helpful` / `not_helpful`
-  step the page's new `pages.salience` column (V37, bounded to
-  `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
-  time term instead of a single global `salience_default`; `stale` /
-  `wrong` floor the salience AND surface the page as a
-- New MCP tool `memory_feedback` (17th tool) — the "finer-grained
-  reinforcement beyond access counts" P2 item. Record how useful a
-  recalled page actually was by exact path: `helpful` / `not_helpful`
-  step the page's new `pages.salience` column (V37, bounded to
-  `[0.25, 2.0]` in 0.25 steps), which now scales the retention formula's
-  time term instead of a single global `salience_default`; `stale` /
-  `wrong` floor the salience AND surface the page as a
-  `feedback_flagged` finding in the next `memory_lint` report. Signals
-  land in a new append-only `page_feedback` table with an optional
-  sanitized reason and full audit-log entry. Nothing is ever deleted by
-  feedback. Signals attach to the page *version* that was read, so
-  rewriting a flagged page retires both its salience and its lint
-  findings — there is no separate dismissal state. Pages without
-  feedback keep `salience = NULL`, which reads as exactly the previous
-  behaviour.
+  sanitized, bounded single-line reason, the resulting salience needed to
+  rebuild derived state, and a full audit-log entry. Nothing is ever
+  deleted by feedback. The exact path resolves to the current page version
+  in the feedback transaction, so rewriting a flagged page later retires
+  both its salience and its lint findings — there is no separate dismissal
+  state. Pages without feedback keep `salience = NULL`, which reads as
+  exactly the previous behaviour. Retrieved content cannot authorize a
+  feedback call; agents treat it as untrusted data. (#318)
 - `memory_query` gained an optional `explain: true` mode for project and
   explicit-scope searches. Each compiled-page hit then includes its 1-based
   FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link

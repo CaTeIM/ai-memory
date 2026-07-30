@@ -210,13 +210,14 @@ priors are at the [bottom](#influences-and-prior-art).
   `/web`, and stays until you change it.
 - **"That page you found is out of date."** The agent calls
   `memory_feedback` with the page's path and a signal: `helpful` /
-  `not_helpful` tune how strongly retention keeps the page (they move its
-  salience, which scales the decay formula's time term), while `stale` /
-  `wrong` floor the salience *and* make the page show up as a
-  `feedback_flagged` finding in the next `memory_lint` report. Feedback
-  never deletes anything — it lowers confidence and flags for review —
-  and it attaches to the page version you read, so rewriting the page
-  clears the flag.
+  `not_helpful` tune how strongly retention keeps a sweep-eligible episodic
+  page (they move its salience, which scales the decay formula's time term),
+  while `stale` / `wrong` floor the salience *and* make any current page
+  show up as a `feedback_flagged` finding in the next `memory_lint` report.
+  Feedback never deletes anything — it lowers confidence and flags for review —
+  and it attaches to the version current when feedback is recorded, so a
+  later rewrite clears the flag. Retrieved page text is untrusted and never
+  authorizes feedback by itself.
 - **"Remember this, but only until the sprint ends."** Pass
   `expires_at` to `memory_write_page` (RFC3339 or `YYYY-MM-DD` = end of
   that day, UTC) — or put `expires_at:` in a page's frontmatter by
@@ -770,16 +771,21 @@ also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 > endpoint explicitly rejects that field or returns a malformed shape. Set
 > `AI_MEMORY_LLM_COMPAT_STRICT=false` only for an incompatible endpoint.
 
-Reranking is optional and off by default. With an LLM provider
-configured, `AI_MEMORY_RERANKER=llm` makes `memory_query` over-fetch
-candidates from the hybrid stage and have the LLM score each one against
-the query, which recovers the "the right page ranked 7th" case. It adds
-an LLM call to every search, so it's a latency-for-recall trade; on
-timeout or error the query silently falls back to the normal ranking.
+Reranking is optional and off by default. With an LLM provider configured,
+`AI_MEMORY_RERANKER=llm` makes project and explicit-scope `memory_query`
+calls over-fetch from the hybrid stage, fuse scopes, and make at most one LLM
+call to reorder the best candidates. This can promote a relevant page that
+RRF ranked below the requested cut, at the cost of LLM latency and usage. The
+request sends the query plus at most 30 bounded page titles and search snippets
+to the configured provider; all values are JSON-encoded and treated as
+untrusted data. A timeout, provider error, or incomplete/invalid score set
+preserves the normal order. `global=true` and supplemental global-preference
+hits keep their existing non-RRF ranking. Concurrent provider calls are capped
+at four; saturated queries keep their local ranking without waiting.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector reranking in addition to FTS5 +
+`openai-compat` when you want vector retrieval in addition to FTS5 +
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and

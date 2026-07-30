@@ -1172,8 +1172,8 @@ pub fn record_page_feedback(
 
     tx.execute(
         "INSERT INTO page_feedback \
-         (id, page_id, workspace_id, project_id, kind, reason, author_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (id, page_id, workspace_id, project_id, kind, reason, salience_after, author_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             ai_memory_core::PageFeedbackId::new().as_bytes(),
             page_id.as_bytes(),
@@ -1181,6 +1181,7 @@ pub fn record_page_feedback(
             project_id.as_bytes(),
             kind.as_str(),
             reason,
+            next_salience,
             author_id.map(|id| id.as_bytes().to_vec()),
             now,
         ],
@@ -2366,7 +2367,8 @@ pub(crate) mod tests {
     //! one-line diff instead of a cascading e2e failure.
     use super::*;
     use ai_memory_core::{
-        LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier, WorkspaceId,
+        FeedbackKind, LinkTarget, NewHandoff, NewPage, NewSession, PagePath, ProjectId, Tier,
+        UserId, WorkspaceId,
     };
     use rusqlite::Connection;
     use std::io::Write;
@@ -2676,6 +2678,206 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn page_feedback_is_scoped_rebuildable_and_audited() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let path = PagePath::new("notes/shared.md").unwrap();
+        let target_id = upsert_page(&mut conn, &page(ws, proj, path.as_str(), "target")).unwrap();
+        upsert_page(&mut conn, &page(ws, other, path.as_str(), "other")).unwrap();
+
+        let author = UserId::new();
+        let now = Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO users (id, username, token_hash, created_at) \
+             VALUES (?1, 'feedback-author', X'01', ?2)",
+            params![author.as_bytes(), now],
+        )
+        .unwrap();
+        let params = crate::decay::DecayParams::default();
+
+        let first = record_page_feedback(
+            &mut conn,
+            ws,
+            proj,
+            &path,
+            FeedbackKind::Helpful,
+            Some("useful"),
+            Some(author),
+            &params,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.0, target_id);
+        assert!((first.1 - 1.25).abs() < f64::EPSILON);
+
+        let second = record_page_feedback(
+            &mut conn,
+            ws,
+            proj,
+            &path,
+            FeedbackKind::NotHelpful,
+            None,
+            Some(author),
+            &params,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.0, target_id);
+        assert!((second.1 - 1.0).abs() < f64::EPSILON);
+
+        let target_salience: Option<f64> = conn
+            .query_row(
+                "SELECT salience FROM pages WHERE id = ?1",
+                params![target_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_salience, Some(1.0));
+        let other_salience: Option<f64> = conn
+            .query_row(
+                "SELECT salience FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+                params![ws.as_bytes(), other.as_bytes(), path.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_salience, None,
+            "same path in another scope must not move"
+        );
+
+        let events: Vec<(String, Option<String>, f64, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, reason, salience_after, author_id FROM page_feedback \
+                     WHERE page_id = ?1 ORDER BY rowid ASC",
+                )
+                .unwrap();
+            stmt.query_map(params![target_id.as_bytes()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "helpful");
+        assert_eq!(events[0].1.as_deref(), Some("useful"));
+        assert_eq!(events[0].2, 1.25);
+        assert_eq!(events[1].0, "not_helpful");
+        assert_eq!(events[1].2, 1.0);
+        assert!(events.iter().all(|event| event.3 == author.as_bytes()[..]));
+
+        let audit_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE op = 'page_feedback' AND page_id = ?1 AND author_id = ?2",
+                params![target_id.as_bytes(), author.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_rows, 2);
+    }
+
+    #[test]
+    fn page_feedback_noop_and_failure_leave_no_partial_state() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let params = crate::decay::DecayParams::default();
+        let missing = PagePath::new("notes/missing.md").unwrap();
+        assert!(
+            record_page_feedback(
+                &mut conn,
+                ws,
+                proj,
+                &missing,
+                FeedbackKind::Helpful,
+                None,
+                None,
+                &params,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let path = PagePath::new("notes/rollback.md").unwrap();
+        let page_id = upsert_page(&mut conn, &page(ws, proj, path.as_str(), "body")).unwrap();
+        let err = record_page_feedback(
+            &mut conn,
+            ws,
+            proj,
+            &path,
+            FeedbackKind::Wrong,
+            Some("must roll back"),
+            Some(UserId::new()),
+            &params,
+        )
+        .expect_err("unknown author must violate the feedback FK");
+        assert!(
+            matches!(err, StoreError::Sqlite(_)),
+            "unexpected error: {err}"
+        );
+
+        let (feedback_rows, audit_rows, salience): (i64, i64, Option<f64>) = conn
+            .query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM page_feedback), \
+                    (SELECT COUNT(*) FROM audit_log WHERE op = 'page_feedback'), \
+                    (SELECT salience FROM pages WHERE id = ?1)",
+                params![page_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(feedback_rows, 0);
+        assert_eq!(audit_rows, 0);
+        assert_eq!(salience, None);
+    }
+
+    #[test]
+    fn rewriting_a_flagged_page_retires_the_flag_but_keeps_its_event() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let path = PagePath::new("notes/versioned.md").unwrap();
+        let old_id = upsert_page(&mut conn, &page(ws, proj, path.as_str(), "old")).unwrap();
+        let params = crate::decay::DecayParams::default();
+        record_page_feedback(
+            &mut conn,
+            ws,
+            proj,
+            &path,
+            FeedbackKind::Stale,
+            Some("outdated"),
+            None,
+            &params,
+        )
+        .unwrap()
+        .unwrap();
+
+        let new_id = upsert_page(&mut conn, &page(ws, proj, path.as_str(), "new")).unwrap();
+        assert_ne!(old_id, new_id);
+        let new_salience: Option<f64> = conn
+            .query_row(
+                "SELECT salience FROM pages WHERE id = ?1",
+                params![new_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_salience, None);
+
+        let (events, open_flags): (i64, i64) = conn
+            .query_row(
+                "SELECT \
+                    (SELECT COUNT(*) FROM page_feedback WHERE page_id = ?1), \
+                    (SELECT COUNT(*) FROM page_feedback f \
+                     JOIN pages pg ON pg.id = f.page_id AND pg.is_latest = 1 \
+                     WHERE f.page_id = ?1)",
+                params![old_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "supersession keeps the append-only event");
+        assert_eq!(open_flags, 0, "superseded feedback must not remain open");
     }
 
     /// Trickier path: upserting a page with a CHANGED body must
