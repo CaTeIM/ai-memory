@@ -42,6 +42,11 @@ Expired pages are excluded from project, sibling-scope, and global searches by
 default. Pass `include_expired: true` only when the user explicitly asks to
 inspect expired historical memory; do not broaden ordinary recall to stale data.
 
+Use `explain: true` only when the user asks why project or explicit-scope hits
+ranked as they did. It adds per-stream score provenance to compiled-page hits.
+Cross-project `global: true` search has a distinct FTS-only ranker, so it reports
+the active stream without per-hit RRF details.
+
 ## Snippets are not full pages
 
 Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.

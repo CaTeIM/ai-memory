@@ -1200,7 +1200,7 @@ async fn configure_embedder(
     // M9 — pluggable embedder. Stored rows carry provider/model/dim so
     // query paths can ignore stale vectors after an embedding config change.
     let Some(cfg) = config.embedder_config()? else {
-        info!("AI_MEMORY_EMBEDDING_PROVIDER unset; hybrid search disabled (FTS5-only)");
+        info!("AI_MEMORY_EMBEDDING_PROVIDER unset; vector search disabled (FTS5 + graph active)");
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();

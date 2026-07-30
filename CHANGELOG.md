@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `memory_query` gained an optional `explain: true` mode for project and
+  explicit-scope searches. Each compiled-page hit then includes its 1-based
+  FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link
+  direction; per-stream RRF contributions; fused score; and bounded authority
+  multiplier. `streams_active` makes vector degradation visible. Global
+  cross-project search reports its distinct FTS-only stream but does not attach
+  RRF details to `global_hits`. Explain provenance is computed only when
+  requested. (#317)
 - Per-project consolidation instructions: write a reserved
   `_prompts/consolidation.md` wiki page (via `memory_write_page` or on
   disk - no config key) and its body is appended to both single-page and
@@ -18,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema-subordinate system-prompt contract. `memory_consolidate` also gained
   an optional `instructions` argument that overrides the page for one call;
   TTL-expired standing pages are ignored. (#316)
+
+### Fixed
+- Zero-LLM `memory_query` now keeps graph-neighbour expansion active instead
+  of falling back to FTS5 alone when no query embedding exists. Equal adjusted
+  hybrid and explicit multi-scope scores now use a deterministic path
+  tiebreak. (#317)
 
 ## [1.20.2] - 2026-07-30
 

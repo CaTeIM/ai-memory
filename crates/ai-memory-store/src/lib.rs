@@ -45,11 +45,11 @@ pub use ops::{
 pub use reader::{
     ActivityWindow, AutoImproveCandidateSession, BriefPageBody, BriefingPage, BriefingSnapshot,
     ContaminationFinding, ContaminationReport, ContaminationSummary, DecayCandidate,
-    DerivedIndexStatus, EmbeddingTripleCount, HealthDetail, HealthPage, ObservationHit,
+    DerivedIndexStatus, EmbeddingTripleCount, GraphVia, HealthDetail, HealthPage, ObservationHit,
     OpenSession, PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, ScopeRow, SessionEndDisposition,
-    StatusCounts, StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary,
-    f32_vec_to_bytes,
+    ProjectSummary, ReaderPool, ReindexTargetStatus, RelatedPage, RrfContributions, ScopeRow,
+    SearchExplain, SessionEndDisposition, StatusCounts, StoredEmbedding, StoredPageBody,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use scope::{
     ResolvedScope, ScopeName, ScopeResolutionError, ScopeResolver, WORKSPACE_PROJECT_PAIR_REQUIRED,
@@ -2385,9 +2385,20 @@ mod tests {
             .await
             .unwrap();
 
-        store
+        let target_id = store
             .writer
             .upsert_page(sample_page(ws, proj, "target.md", "neighbor-only content"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .store_embedding(
+                target_id,
+                f32_vec_to_bytes(&[1.0, 0.0]),
+                "test".into(),
+                "two-dim".into(),
+                2,
+            )
             .await
             .unwrap();
         let mut source = sample_page(ws, proj, "source.md", "needle source content");
@@ -2415,6 +2426,80 @@ mod tests {
             paths.contains(&"target.md"),
             "linked neighbor should be included"
         );
+
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let explained_paths: Vec<&str> =
+            explained.iter().map(|(hit, _)| hit.path.as_str()).collect();
+        assert_eq!(paths, explained_paths, "explain must not change ranking");
+
+        let (source_hit, source_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "source.md")
+            .unwrap();
+        assert_eq!(source_details.fts_rank, Some(1));
+        assert!(source_details.vector_rank.is_none());
+        assert!(source_details.graph_rank.is_none());
+
+        let (target_hit, target_details) = explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert!(target_details.fts_rank.is_none());
+        assert!(target_details.vector_rank.is_none());
+        assert_eq!(target_details.graph_rank, Some(1));
+        let via = target_details.graph_via.as_ref().unwrap();
+        assert_eq!(via.seed_path, "source.md");
+        assert_eq!(via.direction, "outgoing");
+
+        for (hit, details) in [(source_hit, source_details), (target_hit, target_details)] {
+            let authority = details.authority.unwrap();
+            let expected_rank = -(details.fused * authority);
+            assert!(
+                (hit.rank - expected_rank).abs() < f64::EPSILON,
+                "rank must equal -(fused * authority): {hit:?} {details:?}"
+            );
+            assert!(
+                (details.fused - (details.rrf.fts + details.rrf.vector + details.rrf.graph)).abs()
+                    < f64::EPSILON
+            );
+        }
+
+        let vector_explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "needle".into(),
+                Some(vec![1.0, 0.0]),
+                "test".into(),
+                "two-dim".into(),
+                2,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, target_vector_details) = vector_explained
+            .iter()
+            .find(|(hit, _)| hit.path.as_str() == "target.md")
+            .unwrap();
+        assert_eq!(target_vector_details.vector_rank, Some(1));
+        assert_eq!(target_vector_details.cosine, Some(1.0));
+        assert!(target_vector_details.rrf.vector > 0.0);
     }
 
     #[tokio::test]

@@ -220,6 +220,80 @@ fn rerank_page_hits_with_meta(
     hits
 }
 
+/// A graph-expansion neighbour with provenance (which seed and which
+/// link direction produced it). Internal to hybrid search + explain.
+struct GraphNeighbor {
+    hit: PageHit,
+    /// Index into the seed list handed to the expansion.
+    seed_ord: usize,
+    /// `true` when the neighbour links TO the seed (backlink).
+    incoming: bool,
+}
+
+/// Which seed page pulled a hit in via graph expansion, and the link
+/// direction. Part of [`SearchExplain`].
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphVia {
+    /// Path of the FTS/vector seed page the link was followed from.
+    pub seed_path: String,
+    /// `outgoing` = seed links to the hit; `incoming` = hit links to
+    /// the seed (backlink).
+    pub direction: &'static str,
+}
+
+/// Per-stream RRF contributions (`1/(k+rank)`, k=60) for one hit.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RrfContributions {
+    /// FTS5 stream contribution (0.0 when the hit missed that stream).
+    pub fts: f64,
+    /// Vector stream contribution.
+    pub vector: f64,
+    /// Graph-neighbour stream contribution.
+    pub graph: f64,
+}
+
+/// Score transparency for one `memory_query` hit: where the hit ranked
+/// in each retrieval stream, the raw per-stream scores, and how the
+/// RRF fusion combined them. All ranks are 1-based; a `None` rank
+/// means the hit did not surface in that stream.
+///
+/// [`Default`] is "surfaced in no stream": every rank `None`, zero
+/// contributions. Streams fill in their own fields as they contribute.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchExplain {
+    /// 1-based rank in the FTS5 stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_rank: Option<usize>,
+    /// Raw FTS5 (bm25-based) score — lower is better.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fts_score: Option<f64>,
+    /// 1-based rank in the vector stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<usize>,
+    /// Cosine similarity against the query embedding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cosine: Option<f32>,
+    /// 1-based rank in the graph-neighbour stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_rank: Option<usize>,
+    /// Which seed page and link direction pulled the hit in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_via: Option<GraphVia>,
+    /// Per-stream RRF contributions.
+    pub rrf: RrfContributions,
+    /// Total fused score (sum of the RRF contributions) — higher is
+    /// better. The returned `rank` is its negation *after* the
+    /// authority multiplier below, so `fused` alone does not reproduce
+    /// the ordering.
+    pub fused: f64,
+    /// Bounded page-authority multiplier applied to the fused rank
+    /// after RRF (canonical kind/tier/`pinned`/frontmatter tags).
+    /// `None` when the page had no authority row to adjust with; `1.0`
+    /// means it was considered and left alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<f64>,
+}
+
 /// One hit returned by [`ReaderPool::search_pages`].
 #[derive(Debug, Clone, Serialize)]
 pub struct PageHit {
@@ -2022,8 +2096,7 @@ impl ReaderPool {
         .await
     }
 
-    /// Return pages linked to or from the seed pages, scoped to latest pages
-    /// in the same project.
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2035,16 +2108,42 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
+        Ok(self
+            .graph_neighbors_for_project_explained(
+                workspace_id,
+                project_id,
+                seed_ids,
+                limit,
+                expiry_cutoff_us,
+            )
+            .await?
+            .into_iter()
+            .map(|n| n.hit)
+            .collect())
+    }
+
+    /// [`Self::graph_neighbors_for_project`] plus provenance: which seed
+    /// produced each neighbour (`seed_ord` indexes into the caller's
+    /// `seed_ids`) and in which direction the link points. Feeds the
+    /// `memory_query` explain surface.
+    async fn graph_neighbors_for_project_explained(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        seed_ids: Vec<PageId>,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<GraphNeighbor>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let now = expiry_cutoff_us.unwrap_or_else(now_us);
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
 
             let mut values_clause = String::with_capacity(seed_ids.len() * 8);
-            let mut sql_params = Vec::with_capacity(seed_ids.len() * 2 + 4);
+            let mut sql_params = Vec::with_capacity(seed_ids.len() * 2 + 6);
             for (idx, seed_id) in seed_ids.iter().enumerate() {
                 if idx > 0 {
                     values_clause.push_str(", ");
@@ -2053,6 +2152,7 @@ impl ReaderPool {
                 sql_params.push(Value::Blob(seed_id.as_bytes().to_vec()));
                 sql_params.push(Value::Integer(idx as i64));
             }
+            let now = cutoff;
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
             sql_params.push(Value::Integer(now));
@@ -2062,8 +2162,7 @@ impl ReaderPool {
 
             let out_not_expired = not_expired("tp", "?");
             let in_not_expired = not_expired("fp", "?");
-
-            let mut sql = String::with_capacity(values_clause.len() + 1_400);
+            let mut sql = String::with_capacity(values_clause.len() + 1_500);
             write!(
                 &mut sql,
                 "WITH seeds(seed_id, seed_ord) AS (VALUES {values_clause}), \
@@ -2084,10 +2183,10 @@ impl ReaderPool {
                    JOIN pages fp ON fp.id = l.from_page_id \
                    WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
                  ) \
-                 SELECT id, path, title, snippet \
+                 SELECT id, path, title, snippet, stream_ord \
                  FROM neighbors \
                  WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = neighbors.id) \
-                 ORDER BY stream_ord ASC, updated_at DESC"
+                 ORDER BY stream_ord ASC, updated_at DESC, path ASC"
             )
             .expect("writing SQL into String cannot fail");
 
@@ -2097,21 +2196,28 @@ impl ReaderPool {
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
                 let snippet: String = row.get(3)?;
-                Ok((id_bytes, path, title, snippet))
+                let stream_ord: i64 = row.get(4)?;
+                Ok((id_bytes, path, title, snippet, stream_ord))
             })?;
 
             for row in rows {
-                let (id_bytes, path, title, snippet) = row?;
+                let (id_bytes, path, title, snippet, stream_ord) = row?;
                 let id = PageId::from_slice(&id_bytes)?;
                 if !seen.insert(id) {
                     continue;
                 }
-                out.push(PageHit {
-                    id,
-                    path: PagePath::new(path)?,
-                    title,
-                    snippet,
-                    rank: 0.0,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let seed_ord = (stream_ord / 2).max(0) as usize;
+                out.push(GraphNeighbor {
+                    hit: PageHit {
+                        id,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    },
+                    seed_ord,
+                    incoming: stream_ord % 2 == 1,
                 });
                 if out.len() >= limit {
                     break;
@@ -2185,14 +2291,14 @@ impl ReaderPool {
     /// Applies the bounded page-authority adjustment after fusion and returns
     /// the top-`limit` pages by adjusted fused score.
     ///
-    /// When `query_vec` is `None`, the vector stream is skipped but graph
-    /// expansion still runs from the FTS seeds.
+    /// Each stream degrades independently to contributing nothing: no
+    /// `query_vec` skips the vector stream, while graph expansion still
+    /// runs from whatever seeds the other streams produced.
+    ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. The
+    /// cutoff resolves once here so all streams agree on it.
     ///
     /// k=60 is the canonical RRF constant.
-    ///
-    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. Every
-    /// stream shares one cutoff so a page cannot be filtered out of one
-    /// ranker while still seeding another.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -2209,6 +2315,78 @@ impl ReaderPool {
         limit: usize,
         expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
+        Ok(self
+            .hybrid_search_inner(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                false,
+            )
+            .await?
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .collect())
+    }
+
+    /// [`Self::hybrid_search`] plus a [`SearchExplain`] per hit — the
+    /// per-stream ranks, raw scores, and RRF contributions the fusion
+    /// otherwise discards. Callers that don't need the bounded provenance
+    /// bookkeeping use `hybrid_search`.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn hybrid_search_explained(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<(PageHit, SearchExplain)>> {
+        Ok(self
+            .hybrid_search_inner(
+                workspace_id,
+                project_id,
+                query,
+                query_vec,
+                provider,
+                model,
+                dim,
+                limit,
+                expiry_cutoff_us,
+                true,
+            )
+            .await?
+            .into_iter()
+            .map(|(hit, explain)| (hit, explain.unwrap_or_default()))
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn hybrid_search_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        query_vec: Option<Vec<f32>>,
+        provider: String,
+        model: String,
+        dim: u32,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+        explain: bool,
+    ) -> StoreResult<Vec<(PageHit, Option<SearchExplain>)>> {
         let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
@@ -2252,17 +2430,25 @@ impl ReaderPool {
 
         let mut seed_seen = std::collections::HashSet::new();
         let mut seed_ids = Vec::new();
-        for id in fts_hits
-            .iter()
-            .map(|h| h.id)
-            .chain(vec_hits.iter().map(|(id, _, _)| *id))
-        {
-            if seed_seen.insert(id) {
-                seed_ids.push(id);
+        let mut seed_paths = explain.then(Vec::new);
+        for hit in &fts_hits {
+            if seed_seen.insert(hit.id) {
+                seed_ids.push(hit.id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(hit.path.as_str().to_string());
+                }
+            }
+        }
+        for (id, path, _) in &vec_hits {
+            if seed_seen.insert(*id) {
+                seed_ids.push(*id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(path.as_str().to_string());
+                }
             }
         }
         let graph_hits = self
-            .graph_neighbors_for_project(
+            .graph_neighbors_for_project_explained(
                 workspace_id,
                 project_id,
                 seed_ids,
@@ -2273,70 +2459,116 @@ impl ReaderPool {
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
-        let mut fused: std::collections::HashMap<PageId, (PagePath, String, String, f64, f64)> =
-            std::collections::HashMap::new();
+        struct Fused {
+            path: PagePath,
+            title: String,
+            snippet: String,
+            score: f64,
+            explain: Option<SearchExplain>,
+        }
+        let mut fused: std::collections::HashMap<PageId, Fused> = std::collections::HashMap::new();
 
         for (rank, h) in fts_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+            let entry = fused.entry(h.id).or_insert_with(|| Fused {
+                path: h.path.clone(),
+                title: h.title.clone(),
+                snippet: h.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.fts_rank = Some(rank + 1);
+                details.fts_score = Some(h.rank);
+                details.rrf.fts = contrib;
+                details.fused += contrib;
+            }
         }
-        for (rank, (id, path, _score)) in vec_hits.iter().enumerate() {
+        for (rank, (id, path, cosine)) in vec_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(*id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((path.clone(), String::new(), String::new(), contrib, 0.0));
+            let entry = fused.entry(*id).or_insert_with(|| Fused {
+                path: path.clone(),
+                title: String::new(),
+                snippet: String::new(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.vector_rank = Some(rank + 1);
+                details.cosine = Some(*cosine);
+                details.rrf.vector = contrib;
+                details.fused += contrib;
+            }
         }
-        for (rank, h) in graph_hits.iter().enumerate() {
+        for (rank, n) in graph_hits.iter().enumerate() {
             let contrib = 1.0 / (k + (rank + 1) as f64);
-            fused
-                .entry(h.id)
-                .and_modify(|entry| entry.3 += contrib)
-                .or_insert((
-                    h.path.clone(),
-                    h.title.clone(),
-                    h.snippet.clone(),
-                    contrib,
-                    h.rank,
-                ));
+            let entry = fused.entry(n.hit.id).or_insert_with(|| Fused {
+                path: n.hit.path.clone(),
+                title: n.hit.title.clone(),
+                snippet: n.hit.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.graph_rank = Some(rank + 1);
+                details.graph_via = Some(GraphVia {
+                    seed_path: seed_paths
+                        .as_ref()
+                        .and_then(|paths| paths.get(n.seed_ord))
+                        .cloned()
+                        .unwrap_or_default(),
+                    direction: if n.incoming { "incoming" } else { "outgoing" },
+                });
+                details.rrf.graph = contrib;
+                details.fused += contrib;
+            }
         }
 
-        let mut out: Vec<PageHit> = fused
+        let mut out: Vec<(PageHit, Option<SearchExplain>)> = fused
             .into_iter()
-            .map(|(id, (path, title, snippet, fused_rank, _orig))| PageHit {
-                id,
-                path,
-                title,
-                snippet,
-                rank: -fused_rank, // lower = better (matches FTS5 convention)
+            .map(|(id, entry)| {
+                (
+                    PageHit {
+                        id,
+                        path: entry.path,
+                        title: entry.title,
+                        snippet: entry.snippet,
+                        rank: -entry.score, // lower = better (matches FTS5 convention)
+                    },
+                    entry.explain,
+                )
             })
             .collect();
         let missing_authorities: Vec<PageId> = out
             .iter()
-            .filter_map(|hit| (!authorities.contains_key(&hit.id)).then_some(hit.id))
+            .filter_map(|(hit, _)| (!authorities.contains_key(&hit.id)).then_some(hit.id))
             .collect();
         authorities.extend(
             self.page_authorities_for_project(workspace_id, project_id, missing_authorities)
                 .await?,
         );
-        for hit in &mut out {
+        for (hit, explain) in &mut out {
             if let Some(authority) = authorities.get(&hit.id) {
                 hit.rank = authority.adjust_rank(hit.rank);
+                // `fused` stays the raw RRF sum; without the multiplier
+                // beside it the explain could not account for the rank it
+                // returns, which is the whole point of the surface.
+                if let Some(details) = explain {
+                    details.authority = Some(authority.factor);
+                }
             }
         }
         out.sort_by(|a, b| {
-            a.rank
-                .partial_cmp(&b.rank)
+            a.0.rank
+                .partial_cmp(&b.0.rank)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                // Deterministic tiebreak: equal fused scores (common when
+                // two streams each contribute a rank-1 hit) previously fell
+                // back to HashMap iteration order.
+                .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
         out.truncate(limit);
         Ok(out)

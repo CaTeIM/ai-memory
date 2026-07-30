@@ -193,7 +193,9 @@ developer, user, and canonical project instructions.\n\
   reserved `_global` scope; treat them as context that applies to \
   every project. Expired pages are hidden by default; use \
   `include_expired=true` only when the user explicitly wants to inspect \
-  expired historical memory.\n\
+  expired historical memory. Use `explain=true` only when diagnosing \
+  project/scopes ranking; it adds score provenance, while global search \
+  reports only its distinct FTS stream.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
@@ -348,7 +350,7 @@ pub struct AiMemoryServer {
     /// caller (typically from the user's config.toml `[decay]` block).
     decay_params: DecayParams,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
-    /// falls back to pure FTS5.
+    /// still fuses FTS5 with graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
     /// Privacy strip. Applied to agent-supplied handoff fields in
     /// `memory_handoff_begin` (handoffs bypass `Wiki::write_page` so
@@ -419,6 +421,13 @@ struct QueryArgs {
     /// default; they are deleted by the next forget sweep). Default false.
     #[serde(default)]
     include_expired: Option<bool>,
+    /// Attach `score_details` to project/scopes hits: per-stream ranks
+    /// (FTS5, vector, graph), raw scores, and RRF contributions, plus a
+    /// top-level `streams_active` list. A `global=true` query uses a
+    /// different FTS-only ranker, so it reports only `streams_active`.
+    /// Default false.
+    #[serde(default)]
+    explain: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -448,9 +457,38 @@ struct StatusArgs {
     workspace: Option<String>,
 }
 
+/// One `memory_query` hit; serializes exactly like a bare
+/// [`ai_memory_store::PageHit`] unless `explain=true` attached
+/// `score_details`.
+#[derive(Debug, Serialize)]
+struct QueryHit {
+    #[serde(flatten)]
+    hit: ai_memory_store::PageHit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score_details: Option<ai_memory_store::SearchExplain>,
+}
+
+impl From<ai_memory_store::PageHit> for QueryHit {
+    fn from(hit: ai_memory_store::PageHit) -> Self {
+        Self {
+            hit,
+            score_details: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectSearchOptions<'a> {
+    query: &'a str,
+    query_vec: Option<&'a [f32]>,
+    limit: usize,
+    include_expired: bool,
+    explain: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct MemoryQueryResponse {
-    hits: Vec<ai_memory_store::PageHit>,
+    hits: Vec<QueryHit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     raw_hits: Vec<ai_memory_store::ObservationHit>,
     /// Populated only by a `global=true` query: cross-project hits, each
@@ -463,7 +501,13 @@ struct MemoryQueryResponse {
     /// the query was explicitly scoped (`workspace`/`project`/`scopes`/
     /// `global=true`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    global_scope_hits: Vec<ai_memory_store::PageHit>,
+    global_scope_hits: Vec<QueryHit>,
+    /// Present only when `explain=true`: which retrieval streams ran for
+    /// the primary search. Project/scopes retrieval always runs `fts` and
+    /// `graph`; `vector` is present only when an embedder produced a query
+    /// vector. Cross-project `global=true` retrieval is FTS-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streams_active: Option<Vec<&'static str>>,
 }
 
 /// Response for `memory_recent`. `hits` carries the current project's recent
@@ -863,8 +907,8 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach an embedder for hybrid (FTS5 + vector RRF) query. Without
-    /// this, `memory_query` runs pure FTS5.
+    /// Attach an embedder for hybrid (FTS5 + vector + graph RRF) query.
+    /// Without this, `memory_query` keeps its FTS5 + graph streams.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -1064,7 +1108,7 @@ impl AiMemoryServer {
                     provider = embedder.provider(),
                     model = embedder.model(),
                     error = %e,
-                    "embedder failed; degrading memory_query to BM25-only"
+                    "embedder failed; degrading memory_query to FTS5 + graph"
                 );
                 None
             }
@@ -1075,40 +1119,55 @@ impl AiMemoryServer {
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        query: &str,
-        query_vec: Option<&[f32]>,
-        limit: usize,
-        include_expired: bool,
-    ) -> ai_memory_store::StoreResult<Vec<PageHit>> {
+        options: ProjectSearchOptions<'_>,
+    ) -> ai_memory_store::StoreResult<Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>> {
         // `i64::MIN` as the expiry cutoff makes every stored TTL pass
         // the `expires_at > cutoff` guard, i.e. expired pages stay
         // searchable when the caller opted in.
-        let expiry_cutoff = include_expired.then_some(i64::MIN);
-        if let (Some(embedder), Some(qv)) = (&self.embedder, query_vec) {
-            return self
+        let expiry_cutoff = options.include_expired.then_some(i64::MIN);
+        // Provider/model/dim only select which stored vectors are
+        // eligible; with no query vector the vector stream never runs,
+        // so the empty triple is inert rather than a fake identity.
+        let (provider, model, dim) = match (&self.embedder, options.query_vec) {
+            (Some(e), Some(_)) => (e.provider().to_string(), e.model().to_string(), e.dim()),
+            _ => (String::new(), String::new(), 0),
+        };
+        if options.explain {
+            return Ok(self
                 .reader
-                .hybrid_search(
+                .hybrid_search_explained(
                     workspace_id,
                     project_id,
-                    query.to_owned(),
-                    Some(qv.to_vec()),
-                    embedder.provider().to_string(),
-                    embedder.model().to_string(),
-                    embedder.dim(),
-                    limit,
+                    options.query.to_owned(),
+                    options.query_vec.map(<[f32]>::to_vec),
+                    provider,
+                    model,
+                    dim,
+                    options.limit,
                     expiry_cutoff,
                 )
-                .await;
+                .await?
+                .into_iter()
+                .map(|(hit, details)| (hit, Some(details)))
+                .collect());
         }
-        self.reader
-            .search_pages_for_project(
+        Ok(self
+            .reader
+            .hybrid_search(
                 workspace_id,
                 project_id,
-                query.to_owned(),
-                limit,
+                options.query.to_owned(),
+                options.query_vec.map(<[f32]>::to_vec),
+                provider,
+                model,
+                dim,
+                options.limit,
                 expiry_cutoff,
             )
-            .await
+            .await?
+            .into_iter()
+            .map(|hit| (hit, None))
+            .collect())
     }
 
     /// Override the retention-sweep parameters (typically populated
@@ -1160,6 +1219,11 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Set `explain=true` to attach per-stream ranks, raw scores, RRF \
+        contributions, graph provenance, and the authority multiplier to \
+        project/scopes hits; it also returns `streams_active`. \
+        Cross-project `global=true` search is FTS-only and therefore reports \
+        `streams_active` without per-hit RRF details. \
         If compiled wiki search misses in default/project/`scopes` mode, \
         `raw_hits` contains bounded raw observation fallback matches; \
         `global=true` searches compiled wiki pages only and returns no raw \
@@ -1178,6 +1242,7 @@ impl AiMemoryServer {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
+        let explain = args.explain.unwrap_or(false);
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
         // behave as `global=true`. Precedence is strict: an explicit
@@ -1218,6 +1283,7 @@ impl AiMemoryServer {
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
+                streams_active: explain.then(|| vec!["fts"]),
             });
         }
         if !args.scopes.is_empty()
@@ -1244,35 +1310,41 @@ impl AiMemoryServer {
             Some(self.resolve_query_scopes(&args.scopes).await?)
         };
         let hits = if let Some(scopes) = &resolved_scopes {
-            let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
+            let mut hits_by_id: HashMap<PageId, (PageHit, Option<ai_memory_store::SearchExplain>)> =
+                HashMap::new();
             for &(ws, proj) in scopes {
                 let hits = self
                     .search_project(
                         ws,
                         proj,
-                        &args.query,
-                        query_vec.as_deref(),
-                        limit,
-                        include_expired,
+                        ProjectSearchOptions {
+                            query: &args.query,
+                            query_vec: query_vec.as_deref(),
+                            limit,
+                            include_expired,
+                            explain,
+                        },
                     )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 for hit in hits {
                     hits_by_id
-                        .entry(hit.id)
+                        .entry(hit.0.id)
                         .and_modify(|existing| {
-                            if hit.rank < existing.rank {
+                            if hit.0.rank < existing.0.rank {
                                 *existing = hit.clone();
                             }
                         })
                         .or_insert(hit);
                 }
             }
-            let mut hits: Vec<PageHit> = hits_by_id.into_values().collect();
+            let mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> =
+                hits_by_id.into_values().collect();
             hits.sort_by(|a, b| {
-                a.rank
-                    .partial_cmp(&b.rank)
+                a.0.rank
+                    .partial_cmp(&b.0.rank)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
             });
             hits.truncate(limit);
             Ok(hits)
@@ -1287,15 +1359,18 @@ impl AiMemoryServer {
             self.search_project(
                 ws,
                 proj,
-                &args.query,
-                query_vec.as_deref(),
-                limit,
-                include_expired,
+                ProjectSearchOptions {
+                    query: &args.query,
+                    query_vec: query_vec.as_deref(),
+                    limit,
+                    include_expired,
+                    explain,
+                },
             )
             .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
+        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
         // for explicit `scopes` — the recommended scope-bleed mitigation —
@@ -1363,15 +1438,20 @@ impl AiMemoryServer {
                             .search_project(
                                 scope.workspace_id,
                                 scope.project_id,
-                                &args.query,
-                                query_vec.as_deref(),
-                                limit,
-                                include_expired,
+                                ProjectSearchOptions {
+                                    query: &args.query,
+                                    query_vec: query_vec.as_deref(),
+                                    limit,
+                                    include_expired,
+                                    explain,
+                                },
                             )
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-                        hits
+                        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+                        hits.into_iter()
+                            .map(|(hit, score_details)| QueryHit { hit, score_details })
+                            .collect()
                     }
                 }
                 Ok(None) => Vec::new(),
@@ -1380,11 +1460,26 @@ impl AiMemoryServer {
         } else {
             Vec::new()
         };
+        let streams_active = explain.then(|| {
+            if query_vec.is_some() {
+                vec!["fts", "vector", "graph"]
+            } else {
+                vec!["fts", "graph"]
+            }
+        });
+        let hits = hits
+            .into_iter()
+            .map(|(hit, score_details)| QueryHit {
+                hit,
+                score_details: score_details.filter(|_| explain),
+            })
+            .collect();
         let response = MemoryQueryResponse {
             hits,
             raw_hits,
             global_hits: Vec::new(),
             global_scope_hits,
+            streams_active,
         };
         ok_json(&response)
     }
@@ -3520,6 +3615,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prompts_and_tool_schema_document_query_explain_mode() {
+        assert_detailed_prompt_surfaces(|label, prompt| {
+            assert!(
+                prompt.contains("explain=true") || prompt.contains("explain: true"),
+                "{label} must document the opt-in query explanation"
+            );
+            assert!(
+                prompt.contains("FTS-only") || prompt.contains("FTS stream"),
+                "{label} must distinguish global search from project RRF explanation"
+            );
+        });
+
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let query = tools
+            .iter()
+            .find(|tool| tool.name == "memory_query")
+            .expect("memory_query must be registered");
+        let description = query
+            .description
+            .as_deref()
+            .expect("memory_query must carry a description");
+        assert!(description.contains("explain=true"));
+        assert!(description.contains("global=true") && description.contains("FTS-only"));
+        let properties = query
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("memory_query schema must expose properties");
+        assert!(properties.contains_key("explain"));
+    }
+
     #[test]
     fn prompts_treat_retrieved_memory_as_actionable_guidance() {
         assert_detailed_prompt_surfaces(|label, prompt| {
@@ -4100,6 +4228,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4110,6 +4239,36 @@ mod tests {
             None => panic!("expected text content"),
         };
         assert!(text.contains("foo.md"), "expected hit; got {text}");
+        assert!(!text.contains("score_details"));
+        assert!(!text.contains("streams_active"));
+
+        let explained = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "karpathy".into(),
+                    limit: Some(5),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    explain: Some(true),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = explained.content.first().and_then(|c| c.as_text()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(value["streams_active"], serde_json::json!(["fts", "graph"]));
+        let details = &value["hits"][0]["score_details"];
+        assert_eq!(details["fts_rank"], 1);
+        assert!(details.get("vector_rank").is_none());
+        assert_eq!(details["rrf"]["vector"], 0.0);
+        let rank = value["hits"][0]["rank"].as_f64().unwrap();
+        let fused = details["fused"].as_f64().unwrap();
+        let authority = details["authority"].as_f64().unwrap();
+        assert!((rank + fused * authority).abs() < f64::EPSILON);
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -4146,6 +4305,7 @@ mod tests {
             workspace: workspace.map(str::to_string),
             global: None,
             include_expired: None,
+            explain: None,
         };
 
         let result = server
@@ -4165,6 +4325,30 @@ mod tests {
             text.text.contains("global_scope_hits") && text.text.contains("preferences/style.md"),
             "default query must union the reserved global scope: {}",
             text.text
+        );
+        assert!(
+            !text.text.contains("score_details") && !text.text.contains("streams_active"),
+            "ordinary default queries must preserve the old response shape"
+        );
+
+        let mut explained_args = query(None, None);
+        explained_args.explain = Some(true);
+        let explained = server
+            .memory_query(
+                Parameters(explained_args),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let explained_text = explained.content.first().and_then(|c| c.as_text()).unwrap();
+        let explained_value: serde_json::Value =
+            serde_json::from_str(&explained_text.text).unwrap();
+        assert!(explained_value["hits"][0].get("score_details").is_some());
+        assert!(
+            explained_value["global_scope_hits"][0]
+                .get("score_details")
+                .is_some(),
+            "the default query's reserved global-scope union must keep its explanation"
         );
 
         let result = server
@@ -4197,6 +4381,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4322,6 +4507,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4398,6 +4584,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 test_optional_parts(),
             )
@@ -4491,6 +4678,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4555,6 +4743,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4595,6 +4784,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 test_optional_parts(),
             )
@@ -4666,6 +4856,7 @@ mod tests {
                         workspace: None,
                         global: None,
                         include_expired: None,
+                        explain: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4728,6 +4919,7 @@ mod tests {
                     workspace: Some("practice".into()),
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5103,6 +5295,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: Some(true),
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5120,6 +5313,18 @@ mod tests {
             "expected practice hit: {text}"
         );
         assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["streams_active"], serde_json::json!(["fts", "graph"]));
+        assert_eq!(
+            value["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|hit| hit.get("score_details").is_some())
+                .count(),
+            2,
+            "every explicit-scope hit must keep its explanation"
+        );
     }
 
     #[tokio::test]
@@ -5191,6 +5396,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    explain: Some(true),
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5211,6 +5417,16 @@ mod tests {
             "hit must carry project name: {text}"
         );
         assert!(text.contains("global_hits"), "global hits field: {text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["streams_active"], serde_json::json!(["fts"]));
+        assert!(
+            value["global_hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|hit| hit.get("score_details").is_none()),
+            "global FTS hits must not claim project RRF provenance"
+        );
         assert!(
             !text.contains("expired.md"),
             "expired global hit must be hidden by default: {text}"
@@ -5226,6 +5442,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: Some(true),
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5302,6 +5519,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5332,6 +5550,7 @@ mod tests {
                     workspace: Some("ops".into()),
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5366,6 +5585,7 @@ mod tests {
                     workspace: None,
                     global: Some(true),
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6926,6 +7146,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6958,6 +7179,7 @@ mod tests {
                     workspace: None,
                     global: None,
                     include_expired: None,
+                    explain: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
