@@ -409,6 +409,7 @@ impl Wiki {
                 links,
                 author_id: None,
                 expires_at: meta.expires_at,
+                entities: meta.entities,
             })
             .await?;
         Ok(id)
@@ -843,8 +844,9 @@ impl Wiki {
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
         let title = self.sanitizer.scrub(&detail.summary.title);
         let links = extract_links(&markdown.body, &path);
-        let emitted = emit(&markdown)?;
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
+        let emitted = emit(&markdown)?;
         let page = NewPage {
             workspace_id,
             project_id,
@@ -857,6 +859,7 @@ impl Wiki {
             links,
             author_id,
             expires_at,
+            entities,
         };
 
         let result = {
@@ -949,8 +952,9 @@ impl Wiki {
                 frontmatter_json: md.frontmatter,
                 pinned: meta.pinned,
                 links,
-                expires_at: meta.expires_at,
                 author_id: None,
+                expires_at: meta.expires_at,
+                entities: meta.entities,
             })
             .await?;
         Ok(id)
@@ -1228,6 +1232,7 @@ impl Wiki {
                         links: extract_links(&req.body, &req.path),
                         author_id: req.author_id,
                         expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
+                        entities: parse_entities(&req.path, &req.frontmatter)?,
                     })
                 })
                 .collect::<WikiResult<Vec<_>>>()?;
@@ -1353,6 +1358,7 @@ impl Wiki {
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links = extract_links(&markdown.body, &path);
         let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1389,6 +1395,7 @@ impl Wiki {
                     links,
                     author_id,
                     expires_at,
+                    entities,
                 })
                 .await
             {
@@ -1517,10 +1524,12 @@ fn derive_index_metadata(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
     let expires_at = parse_expires_at(path, frontmatter)?;
+    let entities = parse_entities(path, frontmatter)?;
     Ok(IndexMetadata {
         tier,
         pinned,
         expires_at,
+        entities,
     })
 }
 
@@ -1530,14 +1539,39 @@ struct IndexMetadata {
     tier: Tier,
     pinned: bool,
     expires_at: Option<jiff::Timestamp>,
+    entities: Vec<String>,
 }
 
-/// Parse the frontmatter `expires_at:` key into a TTL instant.
+/// Parse the optional frontmatter `entities:` list — salient nouns the
+/// consolidator extracted, indexed by the store as a retrieval stream.
 ///
-/// Accepts RFC3339 (`2026-08-01T12:00:00Z`) or a bare `YYYY-MM-DD`,
-/// which means the *end* of that day in UTC — a date-only TTL that
-/// expired at midnight would surprise anyone who wrote "expires
-/// 2026-08-01" meaning "good through the 1st".
+/// Unlike `expires_at`, malformed entries are *dropped* rather than
+/// rejected: entities are a soft ranking signal, and refusing a whole
+/// page write because one hand-edited entity is 80 characters long
+/// would trade a real page for a marginal signal. A non-array value is
+/// still an error — that's a structural mistake, not a bad item.
+pub(crate) fn parse_entities(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Vec<String>> {
+    let raw = match frontmatter.get("entities") {
+        None | Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-array entities in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    let strings = raw.iter().filter_map(|v| v.as_str());
+    Ok(ai_memory_core::normalize_entities(strings))
+}
+
+/// Parse the optional frontmatter `expires_at:` key. Accepts RFC3339
+/// (`2026-09-01T12:00:00Z`) or a bare date (`2026-09-01` = end of that
+/// day, UTC). Anything else is rejected in the same style as an
+/// invalid `tier`, so a typo can't silently mean "never expires".
 pub(crate) fn parse_expires_at(
     path: &PagePath,
     frontmatter: &serde_json::Value,
@@ -3573,5 +3607,42 @@ mod tests {
             err.to_string().contains("symlinked scope manifest"),
             "reindex must reject symlinked manifests, got {err:#}"
         );
+    }
+
+    /// Frontmatter `entities:` round-trips through the write path and is
+    /// normalised on the way into the index. A non-array value is a
+    /// structural error; bad *items* are dropped, because entities are a
+    /// ranking signal and one long hand-typed entry must not cost the page.
+    #[test]
+    fn parse_entities_normalises_and_rejects_non_arrays() {
+        let path = PagePath::new("concepts/x.md").unwrap();
+
+        assert!(
+            parse_entities(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_empty(),
+            "absent key means no entities",
+        );
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["SQLite", "  sqlite ", "Writer\nActor", 42]}),
+            )
+            .unwrap(),
+            vec!["sqlite".to_string(), "writer actor".to_string()],
+            "lowercased, whitespace-collapsed, de-duplicated, non-strings dropped",
+        );
+        assert!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["ok", "x".repeat(200)]}),
+            )
+            .unwrap()
+                == vec!["ok".to_string()],
+            "over-long items are dropped, not fatal",
+        );
+        let err = parse_entities(&path, &serde_json::json!({"entities": "sqlite"}))
+            .expect_err("a string instead of a list is a structural error");
+        assert!(err.to_string().contains("non-array entities"), "{err}");
     }
 }

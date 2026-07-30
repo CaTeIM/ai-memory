@@ -121,6 +121,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();

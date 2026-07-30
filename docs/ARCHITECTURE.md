@@ -110,20 +110,26 @@ from hook paths.
    trust boundary and delimiters precede automatically injected handoffs,
    project briefs, and managed-workstream packets; current instructions and
    checkout state remain authoritative.
-6. `memory_query` answers via FTS5 + link-neighbour RRF; when an
-   embedder is configured, vector cosine over `page_embeddings` joins
-   the same RRF. Before final truncation, a bounded authority multiplier
-   adjusts the relevance score using the canonical page kind, tier,
-   `pinned`, and explicit positive/negative frontmatter tags. It favors
-   maintained rules, decisions, procedures, and gotchas in close contests
-   while keeping episodic, historical, lint, and test evidence searchable.
-   No query-intent regex or hard exclusion participates. If compiled wiki pages miss entirely in default,
-   explicit project, or explicit `scopes` mode, bounded raw observation
-   FTS returns fallback `raw_hits`; `global=true` searches compiled wiki
-   pages across projects only. Page hits bump `access_count` +
-   `last_accessed_at` - the M8 reinforcement term. That bump is throttled
-   to at most once per page per minute, so a burst of overlapping searches
-   does not flood the writer actor with redundant reinforcement writes.
+6. `memory_query` answers via FTS5 + entity-match + link-neighbour RRF;
+   when an embedder is configured, vector cosine over `page_embeddings`
+   joins the same RRF. Each stream contributes nothing when its input is
+   absent, so the zero-LLM default is FTS5 + entity + graph. Before final
+   truncation, a bounded authority multiplier adjusts the relevance score
+   using the canonical page kind, tier, `pinned`, and explicit
+   positive/negative frontmatter tags. It favors maintained rules,
+   decisions, procedures, and gotchas in close contests while keeping
+   episodic, historical, lint, and test evidence searchable. No
+   query-intent regex or hard exclusion participates. When
+   `AI_MEMORY_RERANKER=llm` is set the adjusted candidates get a final LLM
+   relevance pass (degrading to the adjusted order on error). If compiled
+   wiki pages miss entirely in default, explicit project, or explicit
+   `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
+   `global=true` searches compiled wiki pages across projects only. Page
+   hits bump `access_count` + `last_accessed_at` - the M8 reinforcement
+   term, which `memory_feedback` complements with explicit per-page
+   salience. That bump is throttled to at most once per page per minute,
+   so a burst of overlapping searches does not flood the writer actor
+   with redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -250,6 +256,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional reason. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
+| `entities`, `entity_page_links` | V38 noun index derived from the frontmatter `entities:` list the consolidator writes. Names are lowercase and unique per project; links are per page *version* and replaced on rewrite. Powers the 4th retrieval stream. `entities.id` is deliberately the stable anchor a future temporal-triples table could reference — that P2 item stays deferred. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
 **Memory tiers (M8 policy):**
@@ -355,8 +362,7 @@ must re-write its own routing rules into a project's `CLAUDE.md` /
 safe default-on learning review through the same approval/write path as
 pending writes, and `memory_delete_page` is the exact-path destructive pair
 needed by admission-aware mirrors. `memory_handoff_cancel` is the safety valve
-for mistaken handoff creation. The narrow-surface discipline still holds —
-every new tool has to earn its slot — but the v1 count is 16, not 10. `memory_feedback` implements the
+for mistaken handoff creation. `memory_feedback` implements the
 "finer-grained reinforcement beyond access counts" P2 item from
 `prior-art-implementation-findings.md`: it cannot ride on a read tool
 without conflating read and write semantics, and the access counter it
@@ -517,6 +523,19 @@ auth and from OpenAI Platform API keys.
 GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with
 the `vscode-chat` integration headers. The raw GitHub token is not sent to the
 Copilot chat endpoint.
+
+**Reranker env** (opt-in, requires an LLM provider):
+```
+AI_MEMORY_RERANKER            llm  (only supported value; unknown values fail at startup)
+```
+`memory_query` then over-fetches (`limit * 3`, capped at 30 candidates)
+from the RRF stage and has the configured LLM provider score each
+candidate against the query via JSON-schema structured output. Scored
+candidates sort by relevance; any the model skipped follow in RRF order.
+On timeout (20 s), provider error, or a response covering fewer than half
+the candidates, the query answers from plain RRF order — the same
+degrade-don't-fail contract as the embedder. Off by default: it puts an
+LLM call on the search hot path.
 
 **Embedder env** (opt-in):
 ```

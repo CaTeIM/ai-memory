@@ -3377,6 +3377,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -4507,10 +4508,414 @@ mod tests {
         assert_eq!(details["fts_rank"], 1);
         assert!(details.get("vector_rank").is_none());
         assert_eq!(details["rrf"]["vector"], 0.0);
+        // This project never consolidated, so no entity rows exist and the
+        // fourth stream contributes nothing — the same way the vector stream
+        // stays silent without an embedder.
+        assert!(details.get("entity_rank").is_none());
+        assert_eq!(details["rrf"]["entity"], 0.0);
         let rank = value["hits"][0]["rank"].as_f64().unwrap();
         let fused = details["fused"].as_f64().unwrap();
         let authority = details["authority"].as_f64().unwrap();
         assert!((rank + fused * authority).abs() < f64::EPSILON);
+    }
+
+    /// Regression: with NO embedder configured — the default deployment —
+    /// `memory_query` must still run the entity and graph streams, not
+    /// just FTS. This path used to short-circuit to a bare FTS query,
+    /// which silently disabled both for every zero-LLM install.
+    #[tokio::test]
+    async fn query_without_embedder_still_runs_entity_and_graph_streams() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        assert!(
+            server.embedder.is_none(),
+            "this test is specifically the no-embedder path"
+        );
+
+        // A page findable ONLY via its entities (body avoids the query
+        // word), and a page findable ONLY via a link from an FTS hit.
+        let mut entity_only = NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("concepts/broker.md").unwrap(),
+            title: "Broker".into(),
+            body: "The chosen transport gives at-least-once semantics.".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["nats jetstream".into()],
+        };
+        store.writer.upsert_page(entity_only.clone()).await.unwrap();
+        entity_only.path = PagePath::new("concepts/linked.md").unwrap();
+        entity_only.title = "Linked".into();
+        entity_only.body = "Nothing quotable here.".into();
+        entity_only.entities = Vec::new();
+        store.writer.upsert_page(entity_only).await.unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("concepts/seed.md").unwrap(),
+                title: "Seed".into(),
+                body: "graphseed points at [[concepts/linked.md]].".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![PagePath::new("concepts/linked.md").unwrap().into()],
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = async |q: &str| -> serde_json::Value {
+            let result = server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: q.into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: Vec::new(),
+                        workspace: None,
+                        global: None,
+                        include_expired: None,
+                        explain: Some(true),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+            serde_json::from_str(&text.text).unwrap()
+        };
+
+        let entity_hit = query("jetstream").await;
+        let paths: Vec<&str> = entity_hit["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"concepts/broker.md"),
+            "entity stream must run without an embedder: {paths:?}"
+        );
+        assert_eq!(
+            entity_hit["hits"][0]["score_details"]["matched_entities"],
+            serde_json::json!(["nats jetstream"]),
+            "{entity_hit}"
+        );
+
+        let graph_hit = query("graphseed").await;
+        let paths: Vec<&str> = graph_hit["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"concepts/linked.md"),
+            "graph stream must run without an embedder: {paths:?}"
+        );
+    }
+
+    /// A configured reranker reorders the RRF result; a failing or
+    /// hanging one degrades to RRF order instead of erroring the query.
+    #[tokio::test]
+    async fn reranker_reorders_hits_and_degrades_on_failure() {
+        use ai_memory_llm::{RerankCandidate, RerankScore, Reranker};
+
+        /// Scores candidates by a fixed path→relevance table; paths not
+        /// in the table are skipped (the "reranker had no opinion" case).
+        struct TableReranker(Vec<(&'static str, f32)>);
+        #[async_trait::async_trait]
+        impl Reranker for TableReranker {
+            fn name(&self) -> &'static str {
+                "table"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn rerank(
+                &self,
+                _query: &str,
+                candidates: &[RerankCandidate],
+            ) -> ai_memory_llm::error::LlmResult<Vec<RerankScore>> {
+                Ok(candidates
+                    .iter()
+                    .filter_map(|c| {
+                        self.0
+                            .iter()
+                            .find(|(path, _)| *path == c.id)
+                            .map(|(_, rel)| RerankScore {
+                                id: c.id.clone(),
+                                relevance: *rel,
+                            })
+                    })
+                    .collect())
+            }
+        }
+
+        struct FailingReranker;
+        #[async_trait::async_trait]
+        impl Reranker for FailingReranker {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn rerank(
+                &self,
+                _query: &str,
+                _candidates: &[RerankCandidate],
+            ) -> ai_memory_llm::error::LlmResult<Vec<RerankScore>> {
+                Err(ai_memory_llm::LlmError::Provider {
+                    status: 500,
+                    body: "boom".into(),
+                })
+            }
+        }
+
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        // Three pages all matching "karpathy"; `foo.md` comes from the
+        // fixture. FTS decides the baseline order.
+        for (path, body) in [
+            ("second.md", "Karpathy wiki second page about compiling"),
+            ("third.md", "Karpathy wiki third page about compiling"),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: body.into(),
+                    tier: Tier::Semantic,
+                    frontmatter_json: serde_json::json!({}),
+                    pinned: false,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let paths_of = |json: &serde_json::Value| -> Vec<String> {
+            json["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        async fn query(server: &AiMemoryServer) -> serde_json::Value {
+            let args = QueryArgs {
+                query: "karpathy".into(),
+                limit: Some(3),
+                project: None,
+                scopes: Vec::new(),
+                workspace: None,
+                global: None,
+                include_expired: None,
+                explain: Some(true),
+            };
+            let result = server
+                .memory_query(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap();
+            let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text.text).unwrap()
+        }
+
+        let baseline = paths_of(&query(&server).await);
+        assert_eq!(baseline.len(), 3, "{baseline:?}");
+
+        // Rerank promoting the LAST baseline hit to the front, and
+        // scoring only two of the three (the third keeps its position).
+        let promoted = baseline[2].clone();
+        let demoted = baseline[0].clone();
+        let table: Vec<(&'static str, f32)> = vec![
+            (
+                Box::leak(promoted.clone().into_boxed_str()) as &'static str,
+                0.95,
+            ),
+            (
+                Box::leak(demoted.clone().into_boxed_str()) as &'static str,
+                0.10,
+            ),
+        ];
+        let reranked_server =
+            AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+                .with_reranker(Arc::new(TableReranker(table)));
+        let reranked = query(&reranked_server).await;
+        let order = paths_of(&reranked);
+        assert_eq!(order[0], promoted, "top score must lead: {order:?}");
+        assert_eq!(
+            order[1], demoted,
+            "scored candidates sort by relevance ahead of unjudged ones: {order:?}"
+        );
+        assert_eq!(
+            order[2], baseline[1],
+            "the skipped candidate follows in RRF order: {order:?}"
+        );
+        assert!(
+            (reranked["hits"][0]["score_details"]["rerank_score"]
+                .as_f64()
+                .unwrap()
+                - 0.95)
+                .abs()
+                < 1e-6,
+            "explain must surface the rerank score: {reranked}"
+        );
+        assert!(
+            reranked["hits"][2]["score_details"]
+                .get("rerank_score")
+                .is_none(),
+            "an unscored candidate carries no rerank_score: {reranked}"
+        );
+
+        // Thin coverage (1 of 3 scored) is treated as a degradation.
+        let thin_server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_reranker(Arc::new(TableReranker(vec![(
+                Box::leak(promoted.clone().into_boxed_str()) as &'static str,
+                0.99,
+            )])));
+        assert_eq!(
+            paths_of(&query(&thin_server).await),
+            baseline,
+            "a reranker that scored under half the candidates must degrade to RRF order"
+        );
+
+        // A failing reranker must not fail the query.
+        let failing_server =
+            AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+                .with_reranker(Arc::new(FailingReranker));
+        assert_eq!(
+            paths_of(&query(&failing_server).await),
+            baseline,
+            "a failing reranker must degrade to RRF order"
+        );
+    }
+
+    /// Feedback moves the page's salience, drives the decay formula, and
+    /// routes stale/wrong signals to lint — without deleting anything.
+    #[tokio::test]
+    async fn memory_feedback_moves_salience_and_flags_for_lint() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let feedback = |signal: &str, reason: Option<&str>| FeedbackArgs {
+            path: "foo.md".into(),
+            signal: signal.into(),
+            reason: reason.map(str::to_string),
+            project: None,
+            workspace: None,
+        };
+        let call = async |args: FeedbackArgs| {
+            server
+                .memory_feedback(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+        };
+        let json_of = |result: &CallToolResult| -> serde_json::Value {
+            let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+            serde_json::from_str(&text.text).unwrap()
+        };
+
+        // Baseline: no feedback yet → NULL salience → decay uses the default.
+        let baseline = store.reader.decay_candidates(ws, proj).await.unwrap();
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].salience.is_none());
+
+        let helpful = json_of(&call(feedback("helpful", None)).await.unwrap());
+        assert_eq!(helpful["recorded"], true);
+        assert_eq!(helpful["signal"], "helpful");
+        assert_eq!(helpful["routed_to_lint"], false);
+        let boosted = helpful["salience"].as_f64().unwrap();
+        assert!(
+            boosted > ai_memory_store::DecayParams::default().salience_default,
+            "helpful must raise salience, got {boosted}",
+        );
+        let after = store.reader.decay_candidates(ws, proj).await.unwrap();
+        assert_eq!(after[0].salience, Some(boosted));
+
+        // stale drops to the floor and flags the page for lint.
+        let stale = json_of(
+            &call(feedback("stale", Some("we moved off Postgres in March")))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stale["routed_to_lint"], true);
+        assert!(
+            (stale["salience"].as_f64().unwrap() - ai_memory_store::SALIENCE_MIN).abs() < 1e-9,
+            "stale must floor salience: {stale}",
+        );
+        let flagged = store.reader.open_feedback_findings(ws, proj).await.unwrap();
+        assert_eq!(flagged.len(), 1, "{flagged:?}");
+        assert_eq!(flagged[0].path, "foo.md");
+        assert_eq!(flagged[0].kind, "stale");
+        assert_eq!(
+            flagged[0].reason.as_deref(),
+            Some("we moved off Postgres in March")
+        );
+
+        // Nothing was deleted: the page is still searchable.
+        assert!(
+            !store
+                .reader
+                .search_pages_for_project(ws, proj, "karpathy".into(), 5, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "feedback must never delete or hide a page",
+        );
+
+        // Rewriting the page retires the flag (feedback is per version).
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("foo.md").unwrap(),
+                title: "Foo".into(),
+                body: "Karpathy says compile, not retrieve. Now on SQLite.".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .open_feedback_findings(ws, proj)
+                .await
+                .unwrap()
+                .is_empty(),
+            "rewriting the page must clear its findings",
+        );
+
+        // Unknown signal and unknown path both fail closed.
+        assert!(call(feedback("meh", None)).await.is_err());
+        assert!(
+            call(FeedbackArgs {
+                path: "does/not/exist.md".into(),
+                signal: "helpful".into(),
+                reason: None,
+                project: None,
+                workspace: None,
+            })
+            .await
+            .is_err(),
+        );
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -4535,6 +4940,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5066,6 +5472,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5147,6 +5554,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5361,6 +5769,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5480,6 +5889,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5497,6 +5907,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5514,6 +5925,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5606,6 +6018,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -5624,6 +6037,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: Some("2020-01-01T23:59:59Z".parse().unwrap()),
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5739,6 +6153,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -6023,6 +6438,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();

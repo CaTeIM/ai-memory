@@ -588,6 +588,7 @@ pub(crate) fn upsert_page_in_tx(
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
+        replace_entities_in_tx(tx, &new_id, page)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
@@ -626,6 +627,7 @@ pub(crate) fn upsert_page_in_tx(
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
+    replace_entities_in_tx(tx, &new_id, page)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
@@ -639,6 +641,58 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// Re-point a page version's entity set (V38). Entity *rows* are shared
+/// per project and intentionally survive: a page dropping its last
+/// mention of `postgres` should not invalidate every other page's link
+/// to the same noun, and the orphan row costs one short string. The
+/// links are what get replaced.
+fn replace_entities_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    page: &NewPage,
+) -> StoreResult<()> {
+    tx.execute(
+        "DELETE FROM entity_page_links WHERE page_id = ?1",
+        params![page_id.as_bytes()],
+    )?;
+    if page.entities.is_empty() {
+        return Ok(());
+    }
+    let now = Timestamp::now().as_microsecond();
+    // Defence in depth: the wiki layer normalises on the way in, but the
+    // store is the last gate before the UNIQUE(name) constraint.
+    for name in ai_memory_core::normalize_entities(&page.entities) {
+        tx.execute(
+            "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (workspace_id, project_id, name) DO NOTHING",
+            params![
+                ai_memory_core::PageId::new().as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                name,
+                now,
+            ],
+        )?;
+        let entity_id: Vec<u8> = tx.query_row(
+            "SELECT id FROM entities \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND name = ?3",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                name
+            ],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2) \
+             ON CONFLICT (entity_id, page_id) DO NOTHING",
+            params![entity_id, page_id.as_bytes()],
+        )?;
+    }
+    Ok(())
 }
 
 fn replace_links_in_tx(
@@ -2620,6 +2674,7 @@ pub(crate) mod tests {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         }
     }
 
