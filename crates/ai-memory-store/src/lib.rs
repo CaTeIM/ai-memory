@@ -35,7 +35,10 @@ pub use auto_improve::{
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
 };
-pub use decay::{DecayParams, retention_score};
+pub use decay::{
+    DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
+    salience_after_feedback,
+};
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
@@ -146,6 +149,7 @@ mod tests {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         }
     }
 
@@ -3835,6 +3839,7 @@ mod tests {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         };
         store.writer.upsert_page(page).await.unwrap();
 
@@ -5384,6 +5389,254 @@ mod tests {
                 .unwrap()
                 .state,
             "active"
+        );
+    }
+    #[tokio::test]
+    async fn entity_stream_finds_and_weights_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "entities", None)
+            .await
+            .unwrap();
+
+        let with_entities = |path: &str, body: &str, entities: Vec<&str>| {
+            let mut page = sample_page(ws, proj, path, body);
+            page.entities = entities.into_iter().map(str::to_string).collect();
+            page
+        };
+        // `turbopuffer` is rare (one page); `sqlite` is common (three).
+        store
+            .writer
+            .upsert_page(with_entities(
+                "rare.md",
+                "no query words in this body at all",
+                vec!["turbopuffer", "sqlite"],
+            ))
+            .await
+            .unwrap();
+        for path in ["common1.md", "common2.md"] {
+            store
+                .writer
+                .upsert_page(with_entities(path, "unrelated prose", vec!["sqlite"]))
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .upsert_page(with_entities(
+                "delimiters.md",
+                "more unrelated prose",
+                vec!["writer-actor", "queue_worker", "comma, entity"],
+            ))
+            .await
+            .unwrap();
+
+        // A query naming the entity finds the page whose body lacks the term.
+        let hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "how do we use Turbopuffer?", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].hit.path.as_str(), "rare.md");
+        assert_eq!(hits[0].matched, vec!["turbopuffer".to_string()]);
+
+        let delimiter_hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "actor worker comma", 10, None)
+            .await
+            .unwrap();
+        let delimiter_hit = delimiter_hits
+            .iter()
+            .find(|hit| hit.hit.path.as_str() == "delimiters.md")
+            .expect("word prefixes after hyphen and underscore must match");
+        assert_eq!(
+            delimiter_hit.matched,
+            vec![
+                "comma, entity".to_string(),
+                "queue_worker".to_string(),
+                "writer-actor".to_string(),
+            ],
+            "explain names must preserve commas and sort deterministically",
+        );
+
+        // Inverse frequency: the page carrying the rare entity outranks
+        // pages carrying only the common one.
+        let hits = store
+            .reader
+            .entity_hits_for_project(ws, proj, "turbopuffer sqlite", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert_eq!(hits[0].hit.path.as_str(), "rare.md");
+        assert!(
+            hits[0].weight > hits[1].weight,
+            "rare entity must weigh more: {:?}",
+            hits.iter()
+                .map(|h| (h.hit.path.as_str(), h.weight))
+                .collect::<Vec<_>>(),
+        );
+
+        // Prefix matching, and short tokens are ignored as noise.
+        assert_eq!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "turbopuff", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "prefix should match the entity",
+        );
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "a of", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "sub-3-char tokens must not match",
+        );
+
+        // Hybrid search surfaces the entity-only hit and explains it.
+        let explained = store
+            .reader
+            .hybrid_search_explained(
+                ws,
+                proj,
+                "turbopuffer".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        let (hit, explain) = explained
+            .iter()
+            .find(|(h, _)| h.path.as_str() == "rare.md")
+            .expect("entity stream must feed hybrid search");
+        assert_eq!(explain.entity_rank, Some(1));
+        assert!(explain.entity_weight.is_some_and(|weight| weight > 0.0));
+        assert_eq!(explain.matched_entities, vec!["turbopuffer".to_string()]);
+        assert!(explain.rrf.entity > 0.0);
+        assert!(
+            explain.fts_rank.is_none(),
+            "the body has no query term, so FTS must miss it",
+        );
+        // `rank` is the fused score after the bounded authority multiplier,
+        // so it tracks `fused` only up to that factor — which is exactly why
+        // the explain reports the factor alongside it.
+        let authority = explain.authority.unwrap_or(1.0);
+        assert!((hit.rank + explain.fused * authority).abs() < 1e-12);
+
+        // Rewriting the page replaces the latest version's entity set.
+        store
+            .writer
+            .upsert_page(with_entities("rare.md", "rewritten body", vec!["lancedb"]))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "turbopuffer", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a rewrite must drop the old entity links",
+        );
+        assert_eq!(
+            store
+                .reader
+                .entity_hits_for_project(ws, proj, "lancedb", 10, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let mut expired = with_entities("expired.md", "historical prose", vec!["lancedb"]);
+        expired.expires_at = Some("2000-01-01T00:00:00Z".parse().unwrap());
+        store.writer.upsert_page(expired).await.unwrap();
+        let current_only = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", usize::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(current_only.len(), 1, "expired entity pages stay hidden");
+        assert_eq!(
+            current_only[0].weight, 1.0,
+            "expired pages must not dilute inverse-frequency weighting"
+        );
+
+        // A project with no declared entities contributes nothing.
+        let bare = store
+            .writer
+            .get_or_create_project(ws, "bare", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(ws, bare, "plain.md", "sqlite and turbopuffer"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .entity_hits_for_project(ws, bare, "turbopuffer", 10, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no entities declared → the stream stays silent",
+        );
+
+        let decoy = store
+            .writer
+            .get_or_create_project(ws, "decoy", None)
+            .await
+            .unwrap();
+        let mut decoy_page = sample_page(ws, decoy, "private.md", "unrelated");
+        decoy_page.entities = vec!["lancedb".into()];
+        store.writer.upsert_page(decoy_page).await.unwrap();
+        let scoped = store
+            .reader
+            .entity_hits_for_project(ws, proj, "lancedb", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            scoped
+                .iter()
+                .all(|hit| hit.hit.path.as_str() != "private.md"),
+            "entity retrieval must not leak a sibling project's pages"
+        );
+
+        store
+            .writer
+            .delete_page(ws, proj, PagePath::new("delimiters.md").unwrap(), None)
+            .await
+            .unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let deleted_entities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                 WHERE workspace_id = ?1 AND project_id = ?2 \
+                   AND name IN ('writer-actor', 'queue_worker', 'comma, entity')",
+                params![ws.as_bytes(), proj.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            deleted_entities, 0,
+            "deleting every page version must remove unlinked derived entities"
         );
     }
 }

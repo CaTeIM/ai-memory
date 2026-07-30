@@ -39,6 +39,7 @@ fn new_page(
         links: Vec::new(),
         author_id: None,
         expires_at: None,
+        entities: Vec::new(),
     }
 }
 
@@ -623,6 +624,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();
@@ -643,6 +645,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         })
         .await
         .unwrap();

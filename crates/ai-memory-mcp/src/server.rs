@@ -360,7 +360,7 @@ pub struct AiMemoryServer {
     /// caller (typically from the user's config.toml `[decay]` block).
     decay_params: DecayParams,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
-    /// still fuses FTS5 with graph-neighbour expansion.
+    /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
     /// Optional post-RRF reranker. When `None`, `memory_query` returns
     /// fused, authority-adjusted order and stays on the zero-LLM path.
@@ -438,7 +438,7 @@ struct QueryArgs {
     #[serde(default)]
     include_expired: Option<bool>,
     /// Attach `score_details` to project/scopes hits: per-stream ranks
-    /// (FTS5, vector, graph), raw scores, and RRF contributions, plus a
+    /// (FTS5, entity, vector, graph), raw scores, and RRF contributions, plus a
     /// top-level `streams_active` list. A `global=true` query uses a
     /// different FTS-only ranker, so it reports only `streams_active`.
     /// Default false.
@@ -520,8 +520,8 @@ struct MemoryQueryResponse {
     global_scope_hits: Vec<QueryHit>,
     /// Present only when `explain=true`: which retrieval streams ran for
     /// the primary search. Project/scopes retrieval always runs `fts` and
-    /// `graph`; `vector` is present only when an embedder produced a query
-    /// vector. Cross-project `global=true` retrieval is FTS-only.
+    /// `entity`, and `graph`; `vector` is present only when an embedder
+    /// produced a query vector. Cross-project `global=true` retrieval is FTS-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     streams_active: Option<Vec<&'static str>>,
 }
@@ -983,8 +983,8 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach an embedder for hybrid (FTS5 + vector + graph RRF) query.
-    /// Without this, `memory_query` keeps its FTS5 + graph streams.
+    /// Attach an embedder for hybrid (FTS5 + entity + vector + graph RRF) query.
+    /// Without this, `memory_query` keeps its FTS5 + entity + graph streams.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -1184,7 +1184,7 @@ impl AiMemoryServer {
                     provider = embedder.provider(),
                     model = embedder.model(),
                     error = %e,
-                    "embedder failed; degrading memory_query to FTS5 + graph"
+                    "embedder failed; degrading memory_query to FTS5 + entity + graph"
                 );
                 None
             }
@@ -1427,7 +1427,7 @@ impl AiMemoryServer {
         self
     }
 
-    /// Search the compiled wiki via FTS5/vector/graph retrieval. Default,
+    /// Search the compiled wiki via FTS5/entity/vector/graph retrieval. Default,
     /// explicit project, and explicit `scopes` searches fall back to bounded
     /// raw observation search when no compiled page matches; `global=true`
     /// searches compiled wiki pages across projects only.
@@ -1436,12 +1436,12 @@ impl AiMemoryServer {
         by ai-memory across earlier runs. Call this BEFORE proposing \
         designs, BEFORE answering 'why does X work this way', and \
         whenever the user references prior work you don't recognise. \
-        FTS5 + graph RRF + (when configured) vector RRF re-ranking, \
+        FTS5 + entity-match + graph RRF + (when configured) vector RRF, \
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
-        Set `explain=true` to attach per-stream ranks, raw scores, RRF \
-        contributions, graph provenance, and the authority multiplier to \
+        Set `explain=true` to attach per-stream ranks, matched entities, raw \
+        scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active`. \
         Cross-project `global=true` search is FTS-only and therefore reports \
         `streams_active` without per-hit RRF details. \
@@ -1686,9 +1686,9 @@ impl AiMemoryServer {
         };
         let streams_active = explain.then(|| {
             if query_vec.is_some() {
-                vec!["fts", "vector", "graph"]
+                vec!["fts", "entity", "vector", "graph"]
             } else {
-                vec!["fts", "graph"]
+                vec!["fts", "entity", "graph"]
             }
         });
         let hits = hits
@@ -3428,6 +3428,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -3723,6 +3724,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -4520,6 +4522,7 @@ mod tests {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         };
         let target_id = store
             .writer
@@ -5109,15 +5112,136 @@ mod tests {
             .unwrap();
         let text = explained.content.first().and_then(|c| c.as_text()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text.text).unwrap();
-        assert_eq!(value["streams_active"], serde_json::json!(["fts", "graph"]));
+        assert_eq!(
+            value["streams_active"],
+            serde_json::json!(["fts", "entity", "graph"])
+        );
         let details = &value["hits"][0]["score_details"];
         assert_eq!(details["fts_rank"], 1);
         assert!(details.get("vector_rank").is_none());
         assert_eq!(details["rrf"]["vector"], 0.0);
+        // This project never consolidated, so no entity rows exist and the
+        // fourth stream contributes nothing — the same way the vector stream
+        // stays silent without an embedder.
+        assert!(details.get("entity_rank").is_none());
+        assert!(details.get("entity_weight").is_none());
+        assert_eq!(details["rrf"]["entity"], 0.0);
         let rank = value["hits"][0]["rank"].as_f64().unwrap();
         let fused = details["fused"].as_f64().unwrap();
         let authority = details["authority"].as_f64().unwrap();
         assert!((rank + fused * authority).abs() < f64::EPSILON);
+    }
+
+    /// With NO embedder configured — the default deployment —
+    /// `memory_query` must still run the lexical entity and graph streams.
+    #[tokio::test]
+    async fn query_without_embedder_runs_entity_and_graph_streams() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        assert!(
+            server.embedder.is_none(),
+            "this test is specifically the no-embedder path"
+        );
+
+        // A page findable ONLY via its entities (body avoids the query
+        // word), and a page findable ONLY via a link from an FTS hit.
+        let mut entity_only = NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("concepts/broker.md").unwrap(),
+            title: "Broker".into(),
+            body: "The chosen transport gives at-least-once semantics.".into(),
+            tier: Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["nats jetstream".into()],
+        };
+        store.writer.upsert_page(entity_only.clone()).await.unwrap();
+        entity_only.path = PagePath::new("concepts/linked.md").unwrap();
+        entity_only.title = "Linked".into();
+        entity_only.body = "Nothing quotable here.".into();
+        entity_only.entities = Vec::new();
+        store.writer.upsert_page(entity_only).await.unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("concepts/seed.md").unwrap(),
+                title: "Seed".into(),
+                body: "graphseed points at [[concepts/linked.md]].".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![PagePath::new("concepts/linked.md").unwrap().into()],
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let query = async |q: &str| -> serde_json::Value {
+            let result = server
+                .memory_query(
+                    Parameters(QueryArgs {
+                        query: q.into(),
+                        limit: Some(10),
+                        project: None,
+                        scopes: Vec::new(),
+                        workspace: None,
+                        global: None,
+                        include_expired: None,
+                        explain: Some(true),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result.content.first().and_then(|c| c.as_text()).unwrap();
+            serde_json::from_str(&text.text).unwrap()
+        };
+
+        let entity_hit = query("jetstream").await;
+        let paths: Vec<&str> = entity_hit["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"concepts/broker.md"),
+            "entity stream must run without an embedder: {paths:?}"
+        );
+        assert_eq!(
+            entity_hit["hits"][0]["score_details"]["matched_entities"],
+            serde_json::json!(["nats jetstream"]),
+            "{entity_hit}"
+        );
+        assert!(
+            entity_hit["hits"][0]["score_details"]["entity_weight"]
+                .as_f64()
+                .is_some_and(|weight| weight > 0.0),
+            "{entity_hit}"
+        );
+        assert_eq!(
+            entity_hit["streams_active"],
+            serde_json::json!(["fts", "entity", "graph"])
+        );
+
+        let graph_hit = query("graphseed").await;
+        let paths: Vec<&str> = graph_hit["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            paths.contains(&"concepts/linked.md"),
+            "graph stream must run without an embedder: {paths:?}"
+        );
     }
 
     // Issue #154: default-scoped queries union the reserved `_global`
@@ -5142,6 +5266,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5673,6 +5798,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5754,6 +5880,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -5968,6 +6095,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -6087,6 +6215,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -6104,6 +6233,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -6121,6 +6251,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: None,
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -6163,7 +6294,10 @@ mod tests {
         );
         assert!(!text.contains("hidden.md"), "unexpected hidden hit: {text}");
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["streams_active"], serde_json::json!(["fts", "graph"]));
+        assert_eq!(
+            value["streams_active"],
+            serde_json::json!(["fts", "entity", "graph"])
+        );
         assert_eq!(
             value["hits"]
                 .as_array()
@@ -6213,6 +6347,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -6231,6 +6366,7 @@ mod tests {
                 links: Vec::new(),
                 author_id: None,
                 expires_at: Some("2020-01-01T23:59:59Z".parse().unwrap()),
+                entities: Vec::new(),
             })
             .await
             .unwrap();
@@ -6346,6 +6482,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -6630,6 +6767,7 @@ mod tests {
                     links: Vec::new(),
                     author_id: None,
                     expires_at: None,
+                    entities: Vec::new(),
                 })
                 .await
                 .unwrap();

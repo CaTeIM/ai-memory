@@ -250,6 +250,84 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
     );
 }
 
+/// The entity stream recovers a probe that BOTH pure FTS and the graph
+/// stream miss: the page's body never carries the query's wording, and it
+/// has no links. The only bridge is the frontmatter `entities:` list the
+/// consolidator writes.
+#[tokio::test]
+async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("decisions/queue-choice.md").expect("path"),
+        // Body deliberately avoids the probe term and carries no links.
+        frontmatter: serde_json::json!({
+            "title": "Queue choice",
+            "entities": ["nats jetstream", "delivery guarantees"],
+        }),
+        body: "We picked the streaming broker for at-least-once delivery.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+    })
+    .await
+    .expect("write page");
+
+    let probe = "jetstream";
+    let fts_hits = store
+        .reader
+        .search_pages_for_project(ws, proj, probe.into(), 5, None)
+        .await
+        .expect("fts search");
+    assert!(
+        fts_hits.is_empty(),
+        "pure FTS must miss: the body never says {probe}"
+    );
+
+    let hybrid_hits = store
+        .reader
+        .hybrid_search(
+            ws,
+            proj,
+            probe.into(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            5,
+            None,
+        )
+        .await
+        .expect("hybrid search");
+    assert!(
+        hybrid_hits
+            .iter()
+            .any(|hit| hit.path.as_str() == "decisions/queue-choice.md"),
+        "the entity stream should recover the page: {:?}",
+        hybrid_hits
+            .iter()
+            .map(|h| h.path.as_str())
+            .collect::<Vec<_>>(),
+    );
+}
+
 #[tokio::test]
 async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
     let tmp = TempDir::new().expect("tempdir");

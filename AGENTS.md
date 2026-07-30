@@ -112,15 +112,16 @@ Core design:
   produces a git commit (via `git2`).
 - **SQLite is the derived index** (`<data_dir>/db/memory.sqlite`, WAL
   mode): FTS5 search, sessions, observations, handoffs, users, audit log,
-  embeddings, and the optional managed-workstream ledger. One writer
-  actor owns the writer connection; reads go through a read-only pool.
+  entity/page links, embeddings, and the optional managed-workstream ledger.
+  One writer actor owns the writer connection; reads go through a read-only
+  pool.
 - **Capture is automatic** through agent lifecycle hooks that POST
   sanitized, bounded observations to the server (`/hook`). The server
   compiles session observations into durable wiki pages (Karpathy-style
   "compile, not retrieve").
-- **Retrieval** is FTS5 + link-neighbor RRF, with optional vector RRF
-  when an embedding provider is configured, plus bounded raw-observation
-  fallback.
+- **Retrieval** is FTS5 + lexical entity-match + link-neighbor RRF, with
+  optional vector RRF when an embedding provider is configured, plus bounded
+  raw-observation fallback.
 - **LLM is opt-in.** Zero-LLM mode still captures, searches (FTS5), and
   writes rule-based summaries. Providers (Anthropic, OpenAI, OpenAI/Codex
   OAuth, GitHub Copilot, Gemini, OpenAI-compatible endpoints) enable

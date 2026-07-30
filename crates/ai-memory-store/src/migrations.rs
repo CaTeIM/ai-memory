@@ -238,6 +238,123 @@ mod tests {
     }
 
     #[test]
+    fn v38_adds_scoped_entity_index_without_disturbing_existing_pages() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 37).unwrap();
+
+        let ws1 = [1_u8; 16];
+        let ws2 = [2_u8; 16];
+        let proj1 = [3_u8; 16];
+        let proj2 = [4_u8; 16];
+        let page1 = [5_u8; 16];
+        let page2 = [6_u8; 16];
+        let hash = [0_u8; 32];
+        for (workspace, name) in [(ws1, "one"), (ws2, "two")] {
+            conn.execute(
+                "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, 1)",
+                params![workspace.as_slice(), name],
+            )
+            .unwrap();
+        }
+        for (project, workspace, name) in [(proj1, ws1, "project-one"), (proj2, ws2, "project-two")]
+        {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, 1)",
+                params![project.as_slice(), workspace.as_slice(), name],
+            )
+            .unwrap();
+        }
+        for (page, workspace, project, path) in
+            [(page1, ws1, proj1, "one.md"), (page2, ws2, proj2, "two.md")]
+        {
+            conn.execute(
+                "INSERT INTO pages \
+                 (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+                  frontmatter_json, is_latest, pinned, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'title', 'semantic', 'body', ?5, '{}', 1, 0, 1, 1)",
+                params![
+                    page.as_slice(),
+                    workspace.as_slice(),
+                    project.as_slice(),
+                    path,
+                    hash.as_slice()
+                ],
+            )
+            .unwrap();
+        }
+
+        run(&mut conn).unwrap();
+        assert_eq!(schema_object_count(&conn, "table", "entities"), 1);
+        assert_eq!(schema_object_count(&conn, "table", "entity_page_links"), 1);
+        assert_eq!(
+            schema_object_count(&conn, "trigger", "entities_ws_proj_pairing_ai"),
+            1
+        );
+        assert_eq!(
+            schema_object_count(&conn, "trigger", "entity_page_links_scope_pairing_ai"),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pages", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "V38 must preserve existing pages"
+        );
+
+        let entity1 = [7_u8; 16];
+        conn.execute(
+            "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+             VALUES (?1, ?2, ?3, 'sqlite', 1)",
+            params![entity1.as_slice(), ws1.as_slice(), proj1.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2)",
+            params![entity1.as_slice(), page1.as_slice()],
+        )
+        .unwrap();
+
+        let wrong_scope = conn
+            .execute(
+                "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, 'mismatch', 1)",
+                params![[8_u8; 16].as_slice(), ws2.as_slice(), proj1.as_slice()],
+            )
+            .unwrap_err();
+        assert!(
+            wrong_scope
+                .to_string()
+                .contains("workspace/project mismatch")
+        );
+        let wrong_page = conn
+            .execute(
+                "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2)",
+                params![entity1.as_slice(), page2.as_slice()],
+            )
+            .unwrap_err();
+        assert!(
+            wrong_page
+                .to_string()
+                .contains("entity/page scope mismatch")
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                params![
+                    [9_u8; 16].as_slice(),
+                    ws1.as_slice(),
+                    proj1.as_slice(),
+                    "x".repeat(65)
+                ],
+            )
+            .is_err(),
+            "the schema must enforce the public entity length bound"
+        );
+    }
+
+    #[test]
     fn v33_to_v35_preserves_queue_and_backfills_end_generation() {
         let mut conn = Connection::open_in_memory().unwrap();
         run_to(&mut conn, 33).unwrap();

@@ -41,11 +41,15 @@ pub use actor::{ActorContext, AuthLevel, AuthzError, Capability};
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffState, NewHandoff};
 pub use ids::{
-    AgentKind, AutoImproveProposalId, AutoImproveRunId, HandoffId, ManagedRunId, ObservationId,
-    PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId, WorkstreamId,
+    AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
+    ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,
+    WorkstreamId,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
-pub use page::{FeedbackKind, LinkTarget, NewPage, Page, Tier};
+pub use page::{
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, Tier,
+    normalize_entities, normalize_entity,
+};
 pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,

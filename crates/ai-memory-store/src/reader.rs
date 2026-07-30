@@ -236,6 +236,76 @@ pub struct FeedbackFinding {
     pub reason: Option<String>,
 }
 
+/// A page matched by the entity stream, with the inverse-frequency
+/// weight that ranked it and the entity names that matched.
+#[derive(Debug, Clone)]
+pub(crate) struct EntityHit {
+    /// The matched page.
+    pub(crate) hit: PageHit,
+    /// Sum of `1 / pages_carrying_entity` over the matched entities.
+    pub(crate) weight: f64,
+    /// Entity names that matched the query.
+    pub(crate) matched: Vec<String>,
+}
+
+/// Escape a literal for use inside a SQL `LIKE` pattern with
+/// `ESCAPE '\'`. Entity tokens legitimately contain `_`, which `LIKE`
+/// would otherwise treat as "any single character" — so `foo_bar` would
+/// match `fooxbar`.
+fn like_escape(literal: &str) -> String {
+    literal
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Split a query into entity-match tokens: lowercase, alphanumeric-ish
+/// runs, 3+ characters, de-duplicated, bounded. Short tokens are
+/// dropped because a 1-2 character prefix match is noise, not a signal.
+///
+/// A hyphenated/underscored run yields BOTH the whole token and its
+/// parts — the same both-forms trick [`crate::ops::path_search_text`]
+/// uses on paths, and for the same reason: an entity may be written
+/// `ai-memory`, `ai_memory`, or `ai memory`, and the query may pick
+/// any of them.
+fn entity_query_tokens(query: &str) -> Vec<String> {
+    /// Beyond this the query is prose, not a set of nouns; the FTS
+    /// stream already handles prose better than prefix matching does.
+    const MAX_TOKENS: usize = 12;
+    const MIN_TOKEN_CHARS: usize = 3;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    let mut push = |raw: &str| -> bool {
+        let char_count = raw.chars().count();
+        if !(MIN_TOKEN_CHARS..=ai_memory_core::MAX_ENTITY_LEN).contains(&char_count) {
+            return true;
+        }
+        let token = raw.to_lowercase();
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+        out.len() < MAX_TOKENS
+    };
+    'outer: for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')) {
+        let token = raw.trim_matches(['-', '_']);
+        if token.is_empty() {
+            continue;
+        }
+        let compound = token.contains(['-', '_']);
+        if !push(token) {
+            break;
+        }
+        if compound {
+            for part in token.split(['-', '_']) {
+                if !push(part) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A graph-expansion neighbour with provenance (which seed and which
 /// link direction produced it). Internal to hybrid search + explain.
 struct GraphNeighbor {
@@ -266,6 +336,8 @@ pub struct RrfContributions {
     pub vector: f64,
     /// Graph-neighbour stream contribution.
     pub graph: f64,
+    /// Entity-match stream contribution.
+    pub entity: f64,
 }
 
 /// Score transparency for one `memory_query` hit: where the hit ranked
@@ -295,6 +367,15 @@ pub struct SearchExplain {
     /// Which seed page and link direction pulled the hit in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_via: Option<GraphVia>,
+    /// 1-based rank in the entity-match stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_rank: Option<usize>,
+    /// Raw inverse-frequency weight used to order the entity stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_weight: Option<f64>,
+    /// Entity names on this page that matched the query.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_entities: Vec<String>,
     /// Per-stream RRF contributions.
     pub rrf: RrfContributions,
     /// Total fused score (sum of the RRF contributions) — higher is
@@ -2117,6 +2198,134 @@ impl ReaderPool {
         .await
     }
 
+    /// Rank pages by how many of the query's tokens match their indexed
+    /// entities, weighting each match by inverse entity frequency — a
+    /// query token matching an entity that appears on 2 pages is a much
+    /// stronger signal than one matching an entity on 200.
+    ///
+    /// Matching is lexical (exact name, name prefix, or a compound-word
+    /// prefix) so this stays a plain SQL stream with no LLM call. It returns
+    /// no candidates when the project has no entities indexed, as in the
+    /// common zero-LLM case without hand-edited entity frontmatter.
+    ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub(crate) async fn entity_hits_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: &str,
+        limit: usize,
+        expiry_cutoff_us: Option<i64>,
+    ) -> StoreResult<Vec<EntityHit>> {
+        let tokens = entity_query_tokens(query);
+        if tokens.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
+        self.with_conn(move |conn| {
+            let mut placeholders = String::with_capacity(tokens.len() * 96);
+            let mut sql_params: Vec<Value> = Vec::with_capacity(tokens.len() * 5 + 7);
+            for (idx, token) in tokens.iter().enumerate() {
+                if idx > 0 {
+                    placeholders.push_str(" OR ");
+                }
+                // Match exact names, name prefixes, and word prefixes after
+                // any accepted entity separator. The latter lets `actor`
+                // find `writer actor`, `writer-actor`, and `writer_actor`.
+                //
+                // `?` is positional-by-order, same as the graph query.
+                placeholders.push_str(
+                    "(e.name = ? \
+                      OR e.name LIKE ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '% ' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%-' || ? || '%' ESCAPE '\\' \
+                      OR e.name LIKE '%\\_' || ? || '%' ESCAPE '\\')",
+                );
+                sql_params.push(Value::Text(token.clone()));
+                let escaped = like_escape(token);
+                for _ in 0..4 {
+                    sql_params.push(Value::Text(escaped.clone()));
+                }
+            }
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(cutoff));
+            sql_params.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+
+            let mut sql = String::with_capacity(placeholders.len() + 1_200);
+            write!(
+                &mut sql,
+                // `freq` is how many current pages in this project carry
+                // the entity; 1/freq is the inverse-frequency weight.
+                "WITH matched AS ( \
+                   SELECT e.id AS entity_id, e.name AS name \
+                   FROM entities e \
+                   WHERE ({placeholders}) \
+                     AND e.workspace_id = ? AND e.project_id = ? \
+                 ), \
+                 freq AS ( \
+                   SELECT m.entity_id, m.name, COUNT(*) AS pages \
+                   FROM matched m \
+                   JOIN entity_page_links l ON l.entity_id = m.entity_id \
+                   JOIN pages p ON p.id = l.page_id AND p.is_latest = 1 \
+                   WHERE 1 = 1{freq_not_expired} \
+                   GROUP BY m.entity_id, m.name \
+                 ) \
+                 SELECT pg.id, pg.path, pg.title, substr(pg.body, 1, 240) AS snippet, \
+                        SUM(1.0 / f.pages) AS weight, \
+                        COUNT(*) AS matches, \
+                        json_group_array(f.name) AS names \
+                 FROM freq f \
+                 JOIN entity_page_links l ON l.entity_id = f.entity_id \
+                 JOIN pages pg ON pg.id = l.page_id \
+                 WHERE pg.workspace_id = ? AND pg.project_id = ? AND pg.is_latest = 1{not_expired} \
+                 GROUP BY pg.id, pg.path, pg.title \
+                 ORDER BY weight DESC, matches DESC, pg.path ASC \
+                 LIMIT ?",
+                not_expired = not_expired("pg", "?"),
+                freq_not_expired = not_expired("p", "?"),
+            )
+            .expect("writing SQL into String cannot fail");
+
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let snippet: String = row.get(3)?;
+                let weight: f64 = row.get(4)?;
+                let names_json: String = row.get(6)?;
+                Ok((id_bytes, path, title, snippet, weight, names_json))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id_bytes, path, title, snippet, weight, names_json) = row?;
+                let mut matched: Vec<String> = serde_json::from_str(&names_json)?;
+                matched.sort_unstable();
+                matched.dedup();
+                out.push(EntityHit {
+                    hit: PageHit {
+                        id: PageId::from_slice(&id_bytes)?,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    },
+                    weight,
+                    matched,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Return `stale` / `wrong` feedback still attached to a *current*
     /// page version in one project, grouped by (page, kind) — the input
     /// for the lint pass's `feedback_flagged` findings. Rewriting a
@@ -2174,6 +2383,9 @@ impl ReaderPool {
         .await
     }
 
+    /// Return pages linked to or from the seed pages, scoped to latest pages
+    /// in the same project.
+    ///
     /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`].
     ///
     /// # Errors
@@ -2365,13 +2577,14 @@ impl ReaderPool {
 
     /// Hybrid search: RRF-fuse FTS5 results with cosine-similarity
     /// over the stored embeddings of the matching `(provider, model,
-    /// dim)`, then add link-neighbour expansion as a third RRF stream.
-    /// Applies the bounded page-authority adjustment after fusion and returns
-    /// the top-`limit` pages by adjusted fused score.
+    /// dim)`, entity matches, and link-neighbour expansion — four RRF
+    /// streams. Applies the bounded page-authority adjustment after
+    /// fusion and returns the top-`limit` pages by adjusted fused score.
     ///
     /// Each stream degrades independently to contributing nothing: no
-    /// `query_vec` skips the vector stream, while graph expansion still
-    /// runs from whatever seeds the other streams produced.
+    /// `query_vec` skips the vector stream, an empty `entities` table
+    /// skips the entity stream, and graph expansion still runs from
+    /// whatever seeds the other streams produced.
     ///
     /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. The
     /// cutoff resolves once here so all streams agree on it.
@@ -2471,8 +2684,17 @@ impl ReaderPool {
         // window was too narrow at small limits for a canonical page to enter
         // the fused pool and receive its bounded promotion.
         let candidate_limit = authority_candidate_limit(limit);
-
-        // Fetch FTS5 hits first.
+        // Tokenize the borrowed query before the FTS candidate call consumes
+        // it. This avoids cloning a caller-controlled query on the hot path.
+        let entity_hits = self
+            .entity_hits_for_project(
+                workspace_id,
+                project_id,
+                &query,
+                candidate_limit,
+                Some(cutoff),
+            )
+            .await?;
         let fts_candidates = self
             .search_page_candidates_for_project(
                 workspace_id,
@@ -2522,6 +2744,14 @@ impl ReaderPool {
                 seed_ids.push(*id);
                 if let Some(paths) = &mut seed_paths {
                     paths.push(path.as_str().to_string());
+                }
+            }
+        }
+        for e in &entity_hits {
+            if seed_seen.insert(e.hit.id) {
+                seed_ids.push(e.hit.id);
+                if let Some(paths) = &mut seed_paths {
+                    paths.push(e.hit.path.as_str().to_string());
                 }
             }
         }
@@ -2577,6 +2807,24 @@ impl ReaderPool {
                 details.vector_rank = Some(rank + 1);
                 details.cosine = Some(*cosine);
                 details.rrf.vector = contrib;
+                details.fused += contrib;
+            }
+        }
+        for (rank, e) in entity_hits.iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            let entry = fused.entry(e.hit.id).or_insert_with(|| Fused {
+                path: e.hit.path.clone(),
+                title: e.hit.title.clone(),
+                snippet: e.hit.snippet.clone(),
+                score: 0.0,
+                explain: explain.then(SearchExplain::default),
+            });
+            entry.score += contrib;
+            if let Some(details) = &mut entry.explain {
+                details.entity_rank = Some(rank + 1);
+                details.entity_weight = Some(e.weight);
+                details.matched_entities = e.matched.clone();
+                details.rrf.entity = contrib;
                 details.fused += contrib;
             }
         }
@@ -5953,6 +6201,7 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
+    use super::{entity_query_tokens, like_escape};
     use crate::Store;
 
     use ai_memory_core::{
@@ -6533,5 +6782,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(matched, None, "legacy trailing separator must not match");
+    }
+
+    #[test]
+    fn entity_query_tokens_lowercases_filters_short_and_bounds() {
+        // A compound token yields the whole form AND its parts, so a
+        // query can spell an entity `writer-actor` or `writer actor`.
+        assert_eq!(
+            entity_query_tokens("How does the Writer-Actor use SQLite?"),
+            vec![
+                "how".to_string(),
+                "does".to_string(),
+                "the".to_string(),
+                "writer-actor".to_string(),
+                "writer".to_string(),
+                "actor".to_string(),
+                "use".to_string(),
+                "sqlite".to_string(),
+            ],
+        );
+        assert!(
+            entity_query_tokens("a of an X").is_empty(),
+            "sub-3-char tokens are noise for prefix matching",
+        );
+        assert_eq!(
+            entity_query_tokens("dup dup dup"),
+            vec!["dup".to_string()],
+            "tokens de-duplicate",
+        );
+        assert!(entity_query_tokens(&"word ".repeat(50)).len() <= 12);
+        assert!(
+            entity_query_tokens(&"x".repeat(1_000_000)).is_empty(),
+            "an oversized untrusted token must be rejected before lowercase allocation"
+        );
+        assert_eq!(
+            entity_query_tokens(&format!("{} usable", "x".repeat(1_000_000))),
+            vec!["usable".to_string()],
+            "a rejected compound must not hide later bounded tokens"
+        );
+    }
+
+    #[test]
+    fn like_escape_neutralises_wildcards() {
+        // `_` is LIKE's single-char wildcard and appears in real entity
+        // names (`writer_actor`), so it must not match `writerxactor`.
+        assert_eq!(like_escape("writer_actor"), "writer\\_actor");
+        assert_eq!(like_escape("100%"), "100\\%");
+        assert_eq!(like_escape("back\\slash"), "back\\\\slash");
+        assert_eq!(like_escape("plain-name"), "plain-name");
     }
 }

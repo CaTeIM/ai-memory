@@ -105,9 +105,14 @@ priors are at the [bottom](#influences-and-prior-art).
   `global_scope_hits`, so preferences travel with you into new projects
   without naming a magic project or paying the all-projects
   `global=true` fan-out. Event capture never writes there.
-- **Authority-aware recall.** FTS5, graph-neighbor RRF, and optional vector RRF
-  still generate candidates by relevance. Before truncation, a bounded
-  adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
+- **Entity-assisted recall.** Consolidation stores up to 10 specific nouns per
+  page in canonical `entities:` frontmatter. Exact, prefix, and compound-word
+  matches form a project-scoped RRF stream, so a query can recover a page even
+  when its body uses different wording. The stream is lexical and adds no
+  query-time LLM call.
+- **Authority-aware recall.** FTS5, entity-match RRF, graph-neighbor RRF, and
+  optional vector RRF generate candidates by relevance. Before truncation, a
+  bounded adjustment favors maintained `_rules/`, `decisions/`, `procedures/`, and
   `gotchas/` pages over closely matching episodic session evidence. Tier,
   `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
   `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
@@ -144,9 +149,10 @@ priors are at the [bottom](#influences-and-prior-art).
   single source of truth. `finalize-session` lists matching open
   sessions through `GET /admin/open-sessions`, then posts synthetic
   `session-end` hooks back to the server.
-- **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
-  rule-based summarisation. Add a provider when you want consolidated
-  pages, lint contradictions, or staged auto-improvement proposals.
+- **LLM is opt-in.** Zero-LLM mode still gives you FTS5, manually declared
+  entity, and graph-neighbor search plus rule-based summarisation. Add a
+  provider when you want consolidated pages, lint contradictions, or staged
+  auto-improvement proposals.
 
 ## Use cases
 
@@ -185,10 +191,11 @@ priors are at the [bottom](#influences-and-prior-art).
   captures lifecycle events but ignores SessionStart stdout, so ask it to call
   `memory_handoff_accept` when resuming from a handoff. Zero has the same
   no-stdout behavior and also must call `memory_handoff_accept`.
-- **"What did we decide about X six weeks ago?"** Type
-  `memory_query X` from the agent (or `ai-memory search X` from a
-  terminal) - FTS5 over the wiki, fused with linked-page expansion
-  (plus vector similarity when an embedder is configured). Pages are
+- **"What did we decide about X six weeks ago?"** Use `memory_query X` from
+  the agent for FTS5 fused with entity matches and linked-page expansion (plus
+  vector similarity when an embedder is configured). For a quick terminal-only
+  FTS5 lookup, use `ai-memory search X`; that admin command does not run the
+  hybrid streams. Pages are
   LLM-consolidated, so the hit is a coherent decision page, not a raw
   chat log. Pass `explain: true` to see why each hit ranked where it
   did in project or explicit-scope retrieval. Cross-project
@@ -691,10 +698,34 @@ routing, bootstrap details, web UI screenshots, and the raw-wiki inspection
 commands. CLI URL/auth configuration lives in
 [`docs/install.md`](docs/install.md#configuring-the-cli-url-and-auth).
 
+### Entity retrieval
+
+Consolidation extracts specific technologies, components, services, files, and
+domain nouns into each page's canonical frontmatter. Hand-edited wiki pages can
+declare the same bounded index explicitly:
+
+```yaml
+---
+title: Queue choice
+entities:
+  - nats jetstream
+  - delivery guarantees
+---
+```
+
+Names are lowercased, whitespace-normalized, de-duplicated, capped at 10 per
+page and 64 characters each, and rebuilt from Markdown during a clean-store
+`ai-memory reindex`.
+Entity lookup is project-scoped, ignores expired pages by default, and reports
+`entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
+and its RRF contribution under
+`memory_query(..., explain: true)`.
+
 ## LLM Providers
 
 ai-memory runs without an LLM: hooks still capture sessions, search uses
-FTS5, and summaries fall back to rule-based output. Add an LLM provider
+FTS5 + declared entities + graph neighbors, and summaries fall back to
+rule-based output. Add an LLM provider
 when you want LLM consolidation (on PreCompact, on demand via
 `memory_consolidate`, or opt-in at session end with
 `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`), richer linting, and bootstrap.
@@ -785,7 +816,7 @@ at four; saturated queries keep their local ranking without waiting.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`, or
-`openai-compat` when you want vector retrieval in addition to FTS5 +
+`openai-compat` when you want vector retrieval in addition to FTS5 + entity +
 graph-neighbor retrieval. `openai-compat` targets self-hosted engines
 (Ollama, LM Studio, vLLM): it needs no API key and requires explicit
 `AI_MEMORY_EMBEDDING_BASE_URL`, `AI_MEMORY_EMBEDDING_MODEL`, and
@@ -806,16 +837,16 @@ One Rust binary runs an MCP/HTTP server and owns one data directory:
 <data_dir>/
 ├── wiki/    # markdown source of truth, git-versioned
 ├── raw/     # immutable sanitized managed-workstream transcript segments
-├── db/      # SQLite indexes, including FTS5 and embeddings
+├── db/      # SQLite indexes, including FTS5, entities, and embeddings
 ├── models/  # reserved for local embedding models
 └── logs/    # rolling tracing output
 ```
 
 Hooks POST observations to the server. The server serializes writes
 through one SQLite writer, compiles session observations into markdown
-pages, and serves retrieval through FTS5, graph-neighbor RRF, optional
-vector RRF, bounded source-authority adjustment, and bounded raw-observation
-fallback for non-global searches.
+pages, and serves retrieval through FTS5, entity-match and graph-neighbor RRF,
+optional vector RRF, bounded source-authority adjustment, and bounded
+raw-observation fallback for non-global searches.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the data-flow
 diagram, crate breakdown, schema notes, and invariants.

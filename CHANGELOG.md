@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Entity-match retrieval as a fourth RRF stream (V38 `entities` +
+  `entity_page_links`). Consolidation emits up to 10 normalized technologies,
+  components, services, files, or domain nouns per page into frontmatter;
+  manually edited `entities` use the same index path, and reindex rebuilds the
+  derived tables from markdown. Project-scoped query tokens match exact names,
+  name prefixes, or word prefixes inside compound names and are weighted by
+  inverse entity frequency before RRF fusion and the existing authority and
+  optional LLM reranking stages. Empty entity indexes contribute no candidates
+  or score, and entity matching makes no LLM call. `explain: true` reports the
+  entity stream's rank, raw inverse-frequency weight, contribution, and matched
+  names. (#320)
 - Optional post-RRF reranking for project and explicit-scope
   `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires
   `AI_MEMORY_LLM_PROVIDER`) to over-fetch candidates, fuse scopes, and

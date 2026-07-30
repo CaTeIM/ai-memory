@@ -521,6 +521,20 @@ fn build_update(
             ),
         );
     }
+    // Entities land in frontmatter (markdown stays the source of truth);
+    // the store derives its index from there, so a reindex rebuilds them.
+    let entities = ai_memory_core::normalize_entities(&upd.entities);
+    if !entities.is_empty() {
+        fm.insert(
+            "entities".into(),
+            serde_json::Value::Array(
+                entities
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
     if is_slot_path(&path) {
         fm.insert(
             "slot_kind".into(),
@@ -725,9 +739,22 @@ fn build_batch_request_with_slots(
          - \"tier\"            (string)  required — one of: working | episodic | semantic | procedural\n\
          - \"kind\"            (string)  required — one of: decision | gotcha | rule | fact\n\
          - \"tags\"            (array of string)  required — may be empty `[]`, but the key must be present\n\
+         - \"entities\"        (array of string)  required — may be empty `[]`, but the key must be present; see below\n\
          - \"slot_kind\"       (string) optional — ONLY for `_slots/*`; one of \"state\" or \"invariant\"; this is the SLOT WRITE REGIME, NOT a tier value\n\
          No other keys except optional `slot_kind` on `_slots/*`. No `body`, no `content`, no `summary`. Field names \
          are case-sensitive and the `_markdown` suffix matters.\n\
+         \n## `entities` field — the specific nouns the page is about\n\
+         Up to 10 short names (max 64 chars each), lowercase, taken from \
+         what the page actually names: technologies (`sqlite`, `tokio`), \
+         components (`writer actor`, `hook router`), services, crates, \
+         file or module names, and product/domain nouns. They power a \
+         retrieval stream, so a later query naming one of them finds this \
+         page even when the wording differs.\n\
+         Do NOT include: generic words (`code`, `bug`, `change`, \
+         `refactor`), the tier or kind values, whole sentences, or \
+         restatements of the title. Prefer fewer, more specific entries \
+         over padding the list. `[]` is correct for a page with no \
+         specific nouns.\n\
          \n## Output format (read this carefully)\n\
          Reply with ONE JSON object matching the ConsolidatedBatch schema, \
          and nothing else. NO prose preamble, NO trailing commentary, NO \
@@ -1115,6 +1142,7 @@ mod tests {
             body_markdown: "Ship the slot-kind PR.".into(),
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            entities: Vec::new(),
         };
         let (req, _) = build_update(
             WorkspaceId::new(),
@@ -1138,6 +1166,7 @@ mod tests {
             body_markdown: "body".into(),
             tags: Vec::new(),
             slot_kind: SlotKind::State,
+            entities: Vec::new(),
         };
         let actor = ai_memory_core::ActorContext {
             user: Some("djalmajr".into()),
@@ -1165,6 +1194,41 @@ mod tests {
     }
 
     #[test]
+    fn build_update_persists_only_normalized_bounded_entities() {
+        let update = crate::types::ConsolidatedPageUpdate {
+            path: "notes/entities.md".into(),
+            tier: Tier::Semantic,
+            kind: crate::types::PageKind::Fact,
+            title: "Entities".into(),
+            body_markdown: "body".into(),
+            tags: Vec::new(),
+            slot_kind: SlotKind::State,
+            entities: vec![
+                " SQLite ".into(),
+                "sqlite".into(),
+                "Writer\nActor".into(),
+                "x".repeat(ai_memory_core::MAX_ENTITY_LEN + 1),
+                "bad\0entity".into(),
+            ],
+        };
+        let (req, _) = build_update(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            &update,
+            false,
+            &ai_memory_core::ActorContext::anonymous(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            req.frontmatter["entities"],
+            serde_json::json!(["sqlite", "writer actor"]),
+            "LLM output must cross the same bounded normalization boundary as manual pages"
+        );
+    }
+
+    #[test]
     fn slot_update_preserves_explicit_invariant_frontmatter() {
         let update = crate::types::ConsolidatedPageUpdate {
             path: "_slots/project_context.md".into(),
@@ -1174,6 +1238,7 @@ mod tests {
             body_markdown: "This repo uses a markdown wiki as source of truth.".into(),
             tags: Vec::new(),
             slot_kind: SlotKind::Invariant,
+            entities: Vec::new(),
         };
         let (req, _) = build_update(
             WorkspaceId::new(),

@@ -48,7 +48,16 @@ what the project is and is not designed to defend against.
 
 - **Per-project isolation.** Wiki files and SQLite rows are namespaced by
   `(workspace_id, project_id)`. A purge operation for project A cannot
-  delete files that also belong to project B.
+  delete files that also belong to project B. Entity lookup filters at the
+  project CTE and page boundaries; V38 triggers reject mismatched
+  workspace/project entities and cross-project entity/page links.
+
+- **Entity text remains bounded local data.** Consolidator output and
+  hand-edited `entities:` frontmatter cross the same normalization boundary:
+  at most 10 names per page, 64 characters per name, with control characters
+  rejected. Query tokens and SQL parameters are bounded, and lexical entity
+  matching does not add an outbound provider call. Entity names remain
+  untrusted stored content when rendered in an explain response.
 
 - **Assistant/Stop capture is opt-in and sanitized (#196).** The assistant's
   final turn is never persisted by default. Storing it requires a **double

@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
+    AgentKind, EntityId, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
     ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
@@ -588,6 +588,7 @@ pub(crate) fn upsert_page_in_tx(
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
+        attach_entities_in_tx(tx, &new_id, page)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
@@ -626,6 +627,7 @@ pub(crate) fn upsert_page_in_tx(
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
+    attach_entities_in_tx(tx, &new_id, page)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
@@ -639,6 +641,44 @@ pub(crate) fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+/// Attach the normalized entity set to a new page version (V38). Entity
+/// rows are shared within one project; links stay attached to immutable
+/// page versions and latest-page filtering controls retrieval.
+fn attach_entities_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    page: &NewPage,
+) -> StoreResult<()> {
+    if page.entities.is_empty() {
+        return Ok(());
+    }
+    let now = Timestamp::now().as_microsecond();
+    // Defence in depth: the wiki layer normalises on the way in, but the
+    // store is the last gate before the UNIQUE(name) constraint.
+    for name in ai_memory_core::normalize_entities(&page.entities) {
+        let entity_id: Vec<u8> = tx.query_row(
+            "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (workspace_id, project_id, name) DO UPDATE SET name = excluded.name \
+             RETURNING id",
+            params![
+                EntityId::new().as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                name,
+                now,
+            ],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO entity_page_links (entity_id, page_id) VALUES (?1, ?2) \
+             ON CONFLICT (entity_id, page_id) DO NOTHING",
+            params![entity_id, page_id.as_bytes()],
+        )?;
+    }
+    Ok(())
 }
 
 fn replace_links_in_tx(
@@ -1261,6 +1301,16 @@ fn delete_page_inner(
             path.as_str()
         ],
     )?;
+    if rows > 0 {
+        tx.execute(
+            "DELETE FROM entities \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
+               )",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+    }
     // Only audit a real deletion — a no-op delete (0 rows) writes nothing, so
     // the trail isn't polluted with idempotent misses.
     if rows > 0 {
@@ -2622,6 +2672,7 @@ pub(crate) mod tests {
             links: Vec::new(),
             author_id: None,
             expires_at: None,
+            entities: Vec::new(),
         }
     }
 

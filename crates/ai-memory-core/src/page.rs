@@ -74,6 +74,81 @@ pub struct NewPage {
     /// search/recent/briefing and hard-deleted by the retention sweep.
     #[serde(default)]
     pub expires_at: Option<Timestamp>,
+    /// Salient nouns for this page, from the frontmatter `entities:`
+    /// list the consolidator writes. Normalised by
+    /// [`normalize_entity`] before it reaches the store, which indexes
+    /// them as a retrieval stream (V38). Empty for hand-written pages
+    /// that don't declare any.
+    #[serde(default)]
+    pub entities: Vec<String>,
+}
+
+/// Longest accepted entity name; longer values are rejected rather than
+/// truncated (a 100-char "entity" is a sentence, not a noun).
+pub const MAX_ENTITY_LEN: usize = 64;
+/// Cap on entities indexed per page. Beyond this the list stops being a
+/// salience signal and starts being a second copy of the body.
+pub const MAX_ENTITIES_PER_PAGE: usize = 10;
+
+/// Normalise one entity name for storage and matching: trim, collapse
+/// internal whitespace, lowercase. Returns `None` when the result is
+/// empty, contains control characters, or is longer than
+/// [`MAX_ENTITY_LEN`]. Processing stops as soon as the input crosses the
+/// bound, so an oversized untrusted value cannot cause a proportional
+/// allocation.
+///
+/// Lowercasing is what makes query-time matching lexical rather than a
+/// second LLM call: `Postgres`, `postgres`, and `POSTGRES` all index and
+/// match as one entity.
+#[must_use]
+pub fn normalize_entity(raw: &str) -> Option<String> {
+    let mut collapsed = String::new();
+    let mut chars = 0;
+    for word in raw.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+            chars += 1;
+        }
+        for ch in word.chars() {
+            if ch.is_control() {
+                return None;
+            }
+            chars += 1;
+            if chars > MAX_ENTITY_LEN {
+                return None;
+            }
+            collapsed.push(ch);
+        }
+    }
+    let normalized = collapsed.to_lowercase();
+    if normalized.is_empty() || normalized.chars().count() > MAX_ENTITY_LEN {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Normalise a whole entity list: drop invalid entries, de-duplicate
+/// while preserving order, and cap at [`MAX_ENTITIES_PER_PAGE`].
+#[must_use]
+pub fn normalize_entities<I, S>(raw: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in raw {
+        let Some(name) = normalize_entity(item.as_ref()) else {
+            continue;
+        };
+        if seen.insert(name.clone()) {
+            out.push(name);
+            if out.len() >= MAX_ENTITIES_PER_PAGE {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// A link target discovered in a page body.
@@ -269,6 +344,7 @@ mod tests {
             "\"procedural\""
         );
     }
+
     #[test]
     fn feedback_kind_round_trips_and_flags_lint_routing() {
         for k in [
@@ -284,5 +360,38 @@ mod tests {
         assert!(!FeedbackKind::NotHelpful.routes_to_lint());
         assert!(FeedbackKind::Stale.routes_to_lint());
         assert!(FeedbackKind::Wrong.routes_to_lint());
+    }
+
+    #[test]
+    fn normalize_entity_lowercases_trims_and_collapses() {
+        assert_eq!(
+            normalize_entity("  Postgres  ").as_deref(),
+            Some("postgres")
+        );
+        assert_eq!(
+            normalize_entity("Writer\n\tActor").as_deref(),
+            Some("writer actor")
+        );
+        assert_eq!(normalize_entity("   ").as_deref(), None);
+        assert_eq!(normalize_entity("").as_deref(), None);
+        assert_eq!(
+            normalize_entity(&"x".repeat(MAX_ENTITY_LEN)).as_deref(),
+            Some("x".repeat(MAX_ENTITY_LEN).as_str()),
+        );
+        assert_eq!(normalize_entity(&"x".repeat(MAX_ENTITY_LEN + 1)), None);
+        assert_eq!(normalize_entity("writer\0actor"), None);
+        assert_eq!(normalize_entity(&"x".repeat(1_000_000)), None);
+    }
+
+    #[test]
+    fn normalize_entities_dedupes_preserves_order_and_caps() {
+        assert_eq!(
+            normalize_entities(["SQLite", "sqlite", " FTS5 ", ""]),
+            vec!["sqlite".to_string(), "fts5".to_string()],
+        );
+        let many: Vec<String> = (0..MAX_ENTITIES_PER_PAGE + 5)
+            .map(|i| format!("entity{i}"))
+            .collect();
+        assert_eq!(normalize_entities(&many).len(), MAX_ENTITIES_PER_PAGE);
     }
 }
