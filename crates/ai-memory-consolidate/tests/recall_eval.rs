@@ -217,7 +217,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
 
     let fts_hits = store
         .reader
-        .search_pages_for_project(ws, proj, "graphseed".into(), 5)
+        .search_pages_for_project(ws, proj, "graphseed".into(), 5, None)
         .await
         .expect("fts search");
     assert!(
@@ -238,6 +238,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
             String::new(),
             0,
             5,
+            None,
         )
         .await
         .expect("hybrid search");
@@ -297,7 +298,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
 
     let page_hits = store
         .reader
-        .search_pages_for_project(ws, proj, "capybara".into(), 5)
+        .search_pages_for_project(ws, proj, "capybara".into(), 5, None)
         .await
         .expect("page search");
     assert!(page_hits.is_empty(), "compiled wiki should miss");
@@ -333,6 +334,7 @@ async fn measure_recall(
                     emb.model().to_string(),
                     emb.dim(),
                     5,
+                    None,
                 )
                 .await
                 .expect("hybrid search")

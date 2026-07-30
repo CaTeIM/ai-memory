@@ -87,6 +87,7 @@ async fn read_page_falls_back_to_db_when_file_missing() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();

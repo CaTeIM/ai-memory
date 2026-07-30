@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use ai_memory_consolidate::{run_lint, run_sweep};
-use ai_memory_core::{PageId, PagePath, Tier};
+use ai_memory_core::{PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use rusqlite::params;
@@ -178,7 +178,9 @@ async fn m8_retention_lifecycle_end_to_end() {
         .get_or_create_project(ws, "lifecycle-test", None)
         .await
         .expect("proj");
-    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
 
     // ── Phase 2 — seed the 8 fixtures through the normal write path ─
     let mut ids: Vec<(&'static str, PageId)> = Vec::new();
@@ -220,6 +222,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     let dry = run_sweep(
         &store.reader,
         &store.writer,
+        None,
         ws,
         proj,
         &params,
@@ -262,6 +265,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     let real = run_sweep(
         &store.reader,
         &store.writer,
+        None,
         ws,
         proj,
         &params,
@@ -421,4 +425,245 @@ async fn m8_retention_lifecycle_end_to_end() {
             cold_old.retention,
         );
     }
+}
+
+/// TTL lifecycle: pages whose frontmatter `expires_at:` has passed are
+/// hidden from retrieval, listed by the sweep, and hard-deleted (file +
+/// rows) by a real sweep — including pinned pages, since an explicit
+/// expiry beats a pin. Future-dated TTLs change nothing.
+#[tokio::test]
+async fn ttl_expiry_lifecycle_end_to_end() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "ttl-test", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .expect("wiki")
+        .with_store_reader(store.reader.clone());
+
+    let write = |path: &str, body: &str, expires_at: Option<&str>, pinned: bool| {
+        let mut frontmatter = serde_json::Map::new();
+        if let Some(ts) = expires_at {
+            frontmatter.insert("expires_at".into(), serde_json::Value::String(ts.into()));
+        }
+        if pinned {
+            frontmatter.insert("pinned".into(), serde_json::Value::Bool(true));
+        }
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path.to_string()).expect("page path"),
+            frontmatter: serde_json::Value::Object(frontmatter),
+            body: body.to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+    };
+
+    write(
+        "notes/expired.md",
+        "# Expired\nttlmarker expired sprint context",
+        Some("2020-01-01"),
+        false,
+    )
+    .await
+    .expect("write expired page");
+    write(
+        "notes/expired-pinned.md",
+        "# Expired pinned\nttlmarker pinned but past its expiry",
+        Some("2020-06-01T00:00:00Z"),
+        true,
+    )
+    .await
+    .expect("write expired pinned page");
+    write(
+        "notes/future.md",
+        "# Future\nttlmarker still valid for decades",
+        Some("2099-01-01"),
+        false,
+    )
+    .await
+    .expect("write future page");
+    write(
+        "notes/forever.md",
+        "# Forever\nttlmarker no ttl at all",
+        None,
+        false,
+    )
+    .await
+    .expect("write forever page");
+
+    let stale_expired_id = write(
+        "notes/refreshed.md",
+        "# Refreshed\nttlmarker stale expired version",
+        Some("2020-01-01"),
+        false,
+    )
+    .await
+    .expect("write stale expired version");
+    let refreshed_id = write(
+        "notes/refreshed.md",
+        "# Refreshed\nttlmarker current non-expiring version",
+        None,
+        false,
+    )
+    .await
+    .expect("refresh expired page");
+    assert_ne!(stale_expired_id, refreshed_id);
+    assert!(
+        !wiki
+            .delete_page_if_latest(
+                ws,
+                proj,
+                &PagePath::new("notes/refreshed.md").unwrap(),
+                stale_expired_id,
+                None
+            )
+            .await
+            .expect("stale conditional delete"),
+        "a stale expiry candidate must not delete a refreshed page"
+    );
+    assert!(
+        ws_dir_for(&tmp, ws, proj)
+            .join("notes/refreshed.md")
+            .exists()
+    );
+
+    // Invalid expires_at fails closed instead of meaning "never".
+    let invalid = write("notes/bad.md", "# Bad\nbody", Some("soonish"), false).await;
+    assert!(invalid.is_err(), "invalid expires_at must be rejected");
+
+    // Retrieval hides expired pages by default…
+    let hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "ttlmarker".into(), 10, None)
+        .await
+        .expect("search");
+    let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&"notes/future.md"));
+    assert!(paths.contains(&"notes/forever.md"));
+    assert!(
+        !paths.contains(&"notes/expired.md"),
+        "expired hidden: {paths:?}"
+    );
+    assert!(!paths.contains(&"notes/expired-pinned.md"));
+    let recent = store
+        .reader
+        .recent_pages_for_project(ws, proj, 10)
+        .await
+        .expect("recent");
+    assert!(!recent.iter().any(|h| h.path.as_str() == "notes/expired.md"));
+
+    // …but an i64::MIN cutoff (memory_query include_expired) shows them.
+    let all_hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "ttlmarker".into(), 10, Some(i64::MIN))
+        .await
+        .expect("search all");
+    assert!(
+        all_hits
+            .iter()
+            .any(|h| h.path.as_str() == "notes/expired.md"),
+        "include_expired must surface expired pages",
+    );
+
+    // Dry-run sweep lists the expired pages without touching disk.
+    let params = DecayParams::default();
+    let dry = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &params,
+        true,
+    )
+    .await
+    .expect("dry sweep");
+    let dry_expired: HashSet<&str> = dry.expired.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        dry_expired,
+        HashSet::from(["notes/expired.md", "notes/expired-pinned.md"]),
+        "dry sweep lists exactly the expired pages",
+    );
+    assert!(dry.expired.iter().all(|e| !e.deleted));
+    let ws_dir = tmp
+        .path()
+        .join("wiki")
+        .join(ws.to_string())
+        .join(proj.to_string());
+    assert!(ws_dir.join("notes/expired.md").exists());
+
+    // A caller without the canonical wiki handle must fail closed. Deleting
+    // only the SQLite rows would let the watcher resurrect the file.
+    let no_wiki = run_sweep(&store.reader, &store.writer, None, ws, proj, &params, false)
+        .await
+        .expect("sweep without wiki");
+    assert!(no_wiki.expired.iter().all(|e| !e.deleted));
+    assert!(ws_dir.join("notes/expired.md").exists());
+    let still_indexed = store
+        .reader
+        .search_pages_for_project(ws, proj, "ttlmarker".into(), 10, Some(i64::MIN))
+        .await
+        .expect("search after refused store-only delete");
+    assert!(
+        still_indexed
+            .iter()
+            .any(|h| h.path.as_str() == "notes/expired.md")
+    );
+
+    // Real sweep hard-deletes them through the wiki layer.
+    let real = run_sweep(
+        &store.reader,
+        &store.writer,
+        Some(&wiki),
+        ws,
+        proj,
+        &params,
+        false,
+    )
+    .await
+    .expect("real sweep");
+    assert!(real.expired.iter().all(|e| e.deleted), "{:?}", real.expired);
+    assert!(
+        !ws_dir.join("notes/expired.md").exists(),
+        "markdown file must be removed, not just the rows",
+    );
+    assert!(
+        !ws_dir.join("notes/expired-pinned.md").exists(),
+        "explicit expiry beats pin",
+    );
+    assert!(ws_dir.join("notes/future.md").exists());
+    assert!(ws_dir.join("notes/refreshed.md").exists());
+
+    // Rows are gone too — even an include-everything search misses them.
+    let after = store
+        .reader
+        .search_pages_for_project(ws, proj, "ttlmarker".into(), 10, Some(i64::MIN))
+        .await
+        .expect("search after sweep");
+    let after_paths: Vec<&str> = after.iter().map(|h| h.path.as_str()).collect();
+    assert!(!after_paths.contains(&"notes/expired.md"));
+    assert!(after_paths.contains(&"notes/future.md"));
+    assert!(after_paths.contains(&"notes/forever.md"));
+    assert!(after_paths.contains(&"notes/refreshed.md"));
+}
+
+fn ws_dir_for(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {
+    tmp.path()
+        .join("wiki")
+        .join(ws.to_string())
+        .join(proj.to_string())
 }
