@@ -5526,6 +5526,7 @@ mod tests {
             .find(|(h, _)| h.path.as_str() == "rare.md")
             .expect("entity stream must feed hybrid search");
         assert_eq!(explain.entity_rank, Some(1));
+        assert!(explain.entity_weight.is_some_and(|weight| weight > 0.0));
         assert_eq!(explain.matched_entities, vec!["turbopuffer".to_string()]);
         assert!(explain.rrf.entity > 0.0);
         assert!(

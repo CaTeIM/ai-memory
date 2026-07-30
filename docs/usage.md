@@ -109,9 +109,9 @@ name prefixes, and word prefixes after spaces, hyphens, or underscores match
 without a query-time LLM call. Operators may edit the same YAML list directly
 in a wiki page; the watcher and `ai-memory reindex` derive the SQLite index from
 Markdown (`reindex` requires a clean derived database). `explain: true` exposes
-`entity_rank`, `matched_entities`, and the entity RRF contribution. Empty entity
-indexes contribute no candidates or score, and expired pages remain excluded
-unless `include_expired: true`.
+`entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
+and the entity RRF contribution. Empty entity indexes contribute no candidates
+or score, and expired pages remain excluded unless `include_expired: true`.
 
 ## Install the routing snippet and Agent Skills
 

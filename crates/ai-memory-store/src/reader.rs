@@ -370,6 +370,9 @@ pub struct SearchExplain {
     /// 1-based rank in the entity-match stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_rank: Option<usize>,
+    /// Raw inverse-frequency weight used to order the entity stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_weight: Option<f64>,
     /// Entity names on this page that matched the query.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub matched_entities: Vec<String>,
@@ -2819,6 +2822,7 @@ impl ReaderPool {
             entry.score += contrib;
             if let Some(details) = &mut entry.explain {
                 details.entity_rank = Some(rank + 1);
+                details.entity_weight = Some(e.weight);
                 details.matched_entities = e.matched.clone();
                 details.rrf.entity = contrib;
                 details.fused += contrib;

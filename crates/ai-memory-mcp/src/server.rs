@@ -5124,6 +5124,7 @@ mod tests {
         // fourth stream contributes nothing — the same way the vector stream
         // stays silent without an embedder.
         assert!(details.get("entity_rank").is_none());
+        assert!(details.get("entity_weight").is_none());
         assert_eq!(details["rrf"]["entity"], 0.0);
         let rank = value["hits"][0]["rank"].as_f64().unwrap();
         let fused = details["fused"].as_f64().unwrap();
@@ -5217,6 +5218,12 @@ mod tests {
         assert_eq!(
             entity_hit["hits"][0]["score_details"]["matched_entities"],
             serde_json::json!(["nats jetstream"]),
+            "{entity_hit}"
+        );
+        assert!(
+            entity_hit["hits"][0]["score_details"]["entity_weight"]
+                .as_f64()
+                .is_some_and(|weight| weight > 0.0),
             "{entity_hit}"
         );
         assert_eq!(

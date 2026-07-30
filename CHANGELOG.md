@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inverse entity frequency before RRF fusion and the existing authority and
   optional LLM reranking stages. Empty entity indexes contribute no candidates
   or score, and entity matching makes no LLM call. `explain: true` reports the
-  entity stream's rank, contribution, and matched names. (#320)
+  entity stream's rank, raw inverse-frequency weight, contribution, and matched
+  names. (#320)
 - Optional post-RRF reranking for project and explicit-scope
   `memory_query`, off by default. Set `AI_MEMORY_RERANKER=llm` (requires
   `AI_MEMORY_LLM_PROVIDER`) to over-fetch candidates, fuse scopes, and

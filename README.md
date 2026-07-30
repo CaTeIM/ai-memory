@@ -717,7 +717,8 @@ Names are lowercased, whitespace-normalized, de-duplicated, capped at 10 per
 page and 64 characters each, and rebuilt from Markdown during a clean-store
 `ai-memory reindex`.
 Entity lookup is project-scoped, ignores expired pages by default, and reports
-`entity_rank`, `matched_entities`, and its RRF contribution under
+`entity_rank`, its raw inverse-frequency `entity_weight`, `matched_entities`,
+and its RRF contribution under
 `memory_query(..., explain: true)`.
 
 ## LLM Providers
