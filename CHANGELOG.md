@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Antigravity CLI's `PreInvocation` hook now maps only its documented
+  `invocationNum = 0` call to ai-memory's synthetic `SessionStart`. Later model
+  invocations perform no capture or destructive handoff fetch, so a manual
+  handoff created while the conversation winds down remains open for the next
+  session. Native Windows hooks also emit Antigravity's required `injectSteps`
+  envelope instead of Claude Code's `hookSpecificOutput` shape. (#298)
 - Automatic handoff selection now prefers the newest cwd-eligible session over
   a stale, more-specific ancestor. A new automatic handoff expires prior open
   automatic handoffs from the exact cwd, and accepting the winner atomically

@@ -645,8 +645,13 @@ ai-memory finalize-session
 
 Antigravity CLI also lacks a true session-end event. Its `Stop` hook marks the
 end of one execution loop, so ai-memory intentionally records it without
-closing the conversation. After the final turn, finalize the latest matching
-Antigravity session explicitly:
+closing the conversation. Its `PreInvocation` hook likewise runs before every
+model call; ai-memory treats only the documented `invocationNum = 0` call as
+SessionStart. Later invocations return an empty hook result without capturing
+another start or fetching the single-use handoff, so a handoff created while
+the current conversation winds down remains available to the next session.
+After the final turn, finalize the latest matching Antigravity session
+explicitly:
 
 ```bash
 ai-memory finalize-session --agent antigravity-cli
