@@ -1081,6 +1081,11 @@ pub enum McpClient {
     /// design. See `install-mcp --client vscode-copilot`.
     #[value(name = "vscode-copilot", alias = "copilot", alias = "github-copilot")]
     VsCodeCopilot,
+    /// Zed editor - user-level `settings.json` under the platform config
+    /// directory. Zed reads remote MCP servers from the top-level
+    /// `context_servers` map. This integration is MCP-only because Zed
+    /// does not expose ai-memory-compatible lifecycle hooks.
+    Zed,
 }
 
 /// Arguments for `commit`.
@@ -2119,6 +2124,24 @@ mod tests {
                 "alias {alias} must resolve to the VS Code Copilot MCP client"
             );
         }
+    }
+
+    #[test]
+    fn zed_mcp_client_parses() {
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "install-mcp",
+            "--client",
+            "zed",
+            "--server-url",
+            "http://example.test:49374/mcp",
+        ])
+        .unwrap();
+
+        let Command::InstallMcp(args) = cli.command else {
+            panic!("expected install-mcp command");
+        };
+        assert!(matches!(args.client, McpClient::Zed));
     }
 
     #[test]

@@ -252,8 +252,9 @@ Client cleanup hints:
   MCP or hook entries.
 - OpenCode, OpenClaw, and OMP: check MCP config and plugin/extension directories;
   move old memory plugins to a disabled/quarantine directory before deleting.
-- VS Code Copilot and Claude Desktop: these are usually MCP-only, so confirm
-  whether the old tool was providing capture hooks elsewhere.
+- VS Code Copilot, Claude Desktop, and Zed: these are MCP-only, so confirm
+  whether the old tool was providing capture hooks elsewhere. Zed's MCP
+  entries live under `context_servers` in its user `settings.json`.
 
 If you want a visible startup reminder during the transition, keep it small. A
 rules-file note such as “Active memory: ai-memory; legacy export is historical

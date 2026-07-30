@@ -51,6 +51,9 @@ serde = { version = "1", features = ["derive"] }
 # cosmetic diff the user didn't ask for.
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+# Zed's settings.json is JSONC despite the .json suffix. Its CST lets
+# install/uninstall preserve comments, trailing commas, and unrelated layout.
+jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 
 # Async runtime.
 tokio = { version = "1", features = ["full"] }

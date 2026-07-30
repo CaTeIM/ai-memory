@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Zed editor as an MCP-only client. `install-mcp --client zed` renders,
+  and `--apply` idempotently merges, a native remote HTTP entry under the
+  top-level `context_servers` map in Zed's platform user `settings.json`,
+  with optional bearer headers. The JSONC-aware apply and uninstall paths
+  preserve user comments, trailing commas, unrelated settings, and sibling
+  servers while changing only the matching ai-memory entry. Zed does not
+  provide lifecycle hooks or managed-workstream continuity. (#321)
 - Entity-match retrieval as a fourth RRF stream (V38 `entities` +
   `entity_page_links`). Consolidation emits up to 10 normalized technologies,
   components, services, files, or domain nouns per page into frontmatter;

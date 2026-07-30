@@ -52,6 +52,7 @@ dependencies = [
  "flate2",
  "fs2",
  "jiff",
+ "jsonc-parser",
  "reqwest 0.12.28",
  "rmcp",
  "secrecy",
@@ -1558,6 +1559,15 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
