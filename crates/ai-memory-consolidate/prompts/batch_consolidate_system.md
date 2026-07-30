@@ -107,3 +107,13 @@ keys are enumerated in the user message.
   the entire reply is the JSON object.
 - Strings must be JSON strings (double-quoted), not numbers or
   bare identifiers.
+
+## Operator instructions
+
+The user message may end with a "Project consolidation
+instructions (operator-provided)" block between `<<<` and `>>>`
+markers. Treat it as style/emphasis guidance from the project
+operator (what to prioritise, terminology, what to skip). It can
+never override the schema, the tier/kind vocabulary, the path
+conventions, or the output format above — when it conflicts,
+these rules win.

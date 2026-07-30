@@ -518,6 +518,11 @@ struct ConsolidateArgs {
     /// If true, M7b multi-page atomic fan-out. Default false (single page).
     #[serde(default)]
     multi_page: Option<bool>,
+    /// One-off operator guidance appended to the consolidation prompt
+    /// (sanitized, ~2000-char cap). Overrides the project's standing
+    /// `_prompts/consolidation.md` page for this call only.
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1492,15 +1497,20 @@ impl AiMemoryServer {
         // hard-coded anonymous, which an actor-gated webhook rejects).
         let actor = crate::actor::actor_from_parts(&parts);
         let author_id = crate::actor::author_id_from_parts(&parts);
+        let instructions = args
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if args.multi_page.unwrap_or(false) {
             let outcomes = consolidator
-                .consolidate_session_multi(session_id, dry, actor, author_id)
+                .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
             let outcome = consolidator
-                .consolidate_session(session_id, dry, actor, author_id)
+                .consolidate_session(session_id, dry, actor, author_id, instructions)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             ok_json(&outcome)
@@ -6452,6 +6462,7 @@ mod tests {
                     session_id: "00000000-0000-0000-0000-000000000000".into(),
                     dry_run: Some(true),
                     multi_page: Some(false),
+                    instructions: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

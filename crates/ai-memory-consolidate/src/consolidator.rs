@@ -105,6 +105,7 @@ impl Consolidator {
         dry_run: bool,
         actor: ai_memory_core::ActorContext,
         author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         let observations = self.reader.observations_for_session(session_id).await?;
         if observations.is_empty() {
@@ -143,7 +144,13 @@ impl Consolidator {
             .read_page(ws, proj, &path)
             .map(|md| md.body)
             .unwrap_or_default();
-        let request = build_request(session_id, &observations, &current_body);
+        let instructions = self.resolve_instructions(ws, proj, instructions);
+        let request = build_request(
+            session_id,
+            &observations,
+            &current_body,
+            instructions.as_deref(),
+        );
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -267,6 +274,55 @@ impl Consolidator {
         ))
     }
 
+    /// Resolve the operator instructions to append to a consolidation
+    /// prompt: a per-call override when the caller passed one, else the
+    /// body of the reserved `_prompts/consolidation.md` page in the
+    /// target project (absent page → no block). Whatever the source,
+    /// the text is scrubbed through the wiki's configured sanitizer and
+    /// clipped to [`MAX_PROJECT_INSTRUCTIONS_CHARS`] — it lands in the
+    /// LLM *user message*, never the system prompt, so the schema
+    /// contract stays authoritative and the injection blast radius is
+    /// bounded. Read errors other than not-found are logged and treated
+    /// as "no instructions": a broken instructions page must not block
+    /// consolidation.
+    fn resolve_instructions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        per_call: Option<&str>,
+    ) -> Option<String> {
+        let raw = match per_call {
+            Some(text) => text.to_string(),
+            None => {
+                let path = PagePath::new(PROJECT_INSTRUCTIONS_PATH).ok()?;
+                match self.wiki.read_page(workspace_id, project_id, &path) {
+                    Ok(md) => md.body,
+                    Err(ai_memory_wiki::WikiError::Io(err))
+                        if err.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return None;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = PROJECT_INSTRUCTIONS_PATH,
+                            error = %err,
+                            "unreadable project consolidation instructions; ignoring"
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+        let scrubbed = self.wiki.sanitizer().scrub(&raw);
+        let clipped = clip_for_prompt(&scrubbed, MAX_PROJECT_INSTRUCTIONS_CHARS);
+        let trimmed = clipped.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     async fn slot_snapshots(
         &self,
         workspace_id: WorkspaceId,
@@ -303,6 +359,7 @@ impl Consolidator {
         dry_run: bool,
         actor: ai_memory_core::ActorContext,
         author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         let observations = self.reader.observations_for_session(session_id).await?;
         if observations.is_empty() {
@@ -337,7 +394,13 @@ impl Consolidator {
         }
 
         let slots = self.slot_snapshots(ws, proj).await?;
-        let request = build_batch_request_with_slots(session_id, &observations, &slots);
+        let instructions = self.resolve_instructions(ws, proj, instructions);
+        let request = build_batch_request_with_slots(
+            session_id,
+            &observations,
+            &slots,
+            instructions.as_deref(),
+        );
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -521,18 +584,41 @@ fn should_skip_high_resistance_slot_update_from_frontmatter(
         && slot_kind_from_frontmatter(incoming_frontmatter) != SlotKind::Invariant
 }
 
+/// Reserved per-project wiki page whose body is appended to
+/// consolidation prompts as operator guidance (mem0's
+/// `custom_instructions`, ai-memory style: the page is git-versioned
+/// and editable via `memory_write_page` or on disk — no config key).
+pub const PROJECT_INSTRUCTIONS_PATH: &str = "_prompts/consolidation.md";
+/// Cap on the instructions block rendered into the prompt.
+const MAX_PROJECT_INSTRUCTIONS_CHARS: usize = 2_000;
+
+fn push_instructions_block(buf: &mut String, instructions: Option<&str>) {
+    let Some(instructions) = instructions else {
+        return;
+    };
+    buf.push_str(
+        "\n## Project consolidation instructions (operator-provided)\n\
+         Follow these where they do not conflict with the schema, tier/kind \
+         vocabulary, and output-format rules above — those rules always win.\n\
+         <<<\n",
+    );
+    buf.push_str(instructions);
+    buf.push_str("\n>>>\n");
+}
+
 /// Build the exact ChatRequest the consolidator sends for batch
 /// multi-page consolidation. Exposed so off-tree A/B harnesses
 /// (e.g. `evals/`) can exercise the same workload against
 /// alternative providers without duplicating the prompt.
 pub fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> ChatRequest {
-    build_batch_request_with_slots(session_id, observations, &[])
+    build_batch_request_with_slots(session_id, observations, &[], None)
 }
 
 fn build_batch_request_with_slots(
     session_id: SessionId,
     observations: &[Observation],
     slots: &[SlotSnapshot],
+    instructions: Option<&str>,
 ) -> ChatRequest {
     let mut buf = String::new();
     buf.push_str(
@@ -621,6 +707,7 @@ fn build_batch_request_with_slots(
          \x20\x20\"rationale\": \"<one short sentence about why this batch>\"\n\
          }\n",
     );
+    push_instructions_block(&mut buf, instructions);
     ChatRequest {
         system: Some(BATCH_SYSTEM_PROMPT.into()),
         messages: vec![ChatMessage {
@@ -645,6 +732,7 @@ fn build_request(
     session_id: SessionId,
     observations: &[Observation],
     current_body: &str,
+    instructions: Option<&str>,
 ) -> ChatRequest {
     let mut buf = String::new();
     buf.push_str("Session id: ");
@@ -666,6 +754,7 @@ fn build_request(
         buf.push_str(&current_body);
         buf.push_str("\n```\n");
     }
+    push_instructions_block(&mut buf, instructions);
 
     ChatRequest {
         system: Some(SYSTEM_PROMPT.into()),
@@ -854,7 +943,7 @@ mod tests {
     #[test]
     fn build_request_uses_projected_observation_metadata() {
         let observations = vec![obs_of_size(10), obs_of_size(20)];
-        let request = build_request(SessionId::new(), &observations, "");
+        let request = build_request(SessionId::new(), &observations, "", None);
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("--- observation 1/2 ---"));
         assert!(prompt.contains("id:"));
@@ -914,7 +1003,7 @@ mod tests {
             "# session\n\nKeep this summary.\n\n## Raw observations\n\n{raw_dump}\n\n_Synthesised by ai-memory._\n"
         );
 
-        let request = build_request(SessionId::new(), &[], &current_body);
+        let request = build_request(SessionId::new(), &[], &current_body, None);
         let prompt = &request.messages[0].content;
 
         assert!(prompt.contains("Keep this summary."));
@@ -930,7 +1019,7 @@ mod tests {
             "x".repeat(CURRENT_BODY_BUDGET_CHARS + 10_000),
         );
 
-        let request = build_request(SessionId::new(), &[], &current_body);
+        let request = build_request(SessionId::new(), &[], &current_body, None);
         let prompt = &request.messages[0].content;
 
         assert!(prompt.contains("[current heuristic page body truncated]"));
@@ -1111,7 +1200,7 @@ mod tests {
             slot_kind: SlotKind::Invariant,
             body: "This is stable unless a later observation contradicts it.".into(),
         }];
-        let request = build_batch_request_with_slots(session_id, &[], &slots);
+        let request = build_batch_request_with_slots(session_id, &[], &slots, None);
         let prompt = &request.messages[0].content;
         assert!(prompt.contains("Current `_slots/` pages"));
         assert!(prompt.contains("_slots/project_context.md | slot_kind=invariant"));
@@ -1232,6 +1321,7 @@ mod tests {
                 true,
                 ai_memory_core::ActorContext::anonymous(),
                 None,
+                None,
             )
             .await
             .expect("dry_run plan should succeed without the LLM");
@@ -1257,6 +1347,7 @@ mod tests {
                 true,
                 ai_memory_core::ActorContext::anonymous(),
                 None,
+                None,
             )
             .await
             .expect("multi-page dry_run plan should succeed without the LLM");
@@ -1279,5 +1370,85 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(update.slot_kind, SlotKind::State);
+    }
+
+    #[test]
+    fn instructions_block_renders_delimited_and_stays_absent_without() {
+        let with = build_batch_request_with_slots(
+            SessionId::new(),
+            &[],
+            &[],
+            Some("Prefer Portuguese titles. Skip CI noise."),
+        );
+        let prompt = &with.messages[0].content;
+        assert!(prompt.contains("Project consolidation instructions (operator-provided)"));
+        assert!(prompt.contains("<<<\nPrefer Portuguese titles. Skip CI noise.\n>>>"));
+        assert!(
+            prompt.contains("those rules always win"),
+            "the schema-precedence framing must ride with the block",
+        );
+
+        let without = build_batch_request_with_slots(SessionId::new(), &[], &[], None);
+        assert!(
+            !without.messages[0]
+                .content
+                .contains("Project consolidation instructions"),
+            "no block without instructions",
+        );
+
+        let single = build_request(SessionId::new(), &[], "", Some("focus on API changes"));
+        assert!(
+            single.messages[0]
+                .content
+                .contains("<<<\nfocus on API changes\n>>>"),
+            "single-page prompt carries the block too",
+        );
+    }
+
+    /// `_prompts/consolidation.md` feeds the prompt when present; a
+    /// per-call override wins; oversized bodies are clipped.
+    #[tokio::test]
+    async fn resolve_instructions_reads_reserved_page_and_prefers_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_store, consolidator, _session, ws, proj) =
+            consolidator_with_panic_llm(tmp.path()).await;
+
+        assert!(
+            consolidator.resolve_instructions(ws, proj, None).is_none(),
+            "absent page → no instructions",
+        );
+
+        consolidator
+            .wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(PROJECT_INSTRUCTIONS_PATH).unwrap(),
+                frontmatter: serde_json::Value::Null,
+                body: format!("Always tag pages with `infra`.\n{}", "x".repeat(5_000)),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+            })
+            .await
+            .unwrap();
+
+        let from_page = consolidator
+            .resolve_instructions(ws, proj, None)
+            .expect("page body becomes instructions");
+        assert!(from_page.contains("Always tag pages with `infra`."));
+        assert!(
+            from_page.len() <= MAX_PROJECT_INSTRUCTIONS_CHARS + 64,
+            "oversized instructions must be clipped, got {} chars",
+            from_page.len(),
+        );
+
+        let overridden = consolidator
+            .resolve_instructions(ws, proj, Some("one-off: só este call"))
+            .expect("per-call override");
+        assert_eq!(overridden, "one-off: só este call");
     }
 }

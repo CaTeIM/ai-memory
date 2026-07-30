@@ -327,7 +327,7 @@ invariants below.
 | `memory_handoff_begin` | destructive | Open a handoff for the next agent. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
-| `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
+| `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the body of the reserved `_prompts/consolidation.md` page (per-project operator guidance, sanitized + ~2000-char cap, injected into the user message so the schema rules stay authoritative); a per-call `instructions` argument overrides the page for one call. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. `scope: "global"` writes into the reserved `_global` preferences scope instead of the current project. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |

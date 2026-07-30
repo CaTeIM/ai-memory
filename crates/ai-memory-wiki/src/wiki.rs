@@ -136,6 +136,15 @@ impl Wiki {
         self
     }
 
+    /// Borrow the configured sanitizer, so components holding a `Wiki`
+    /// (e.g. the consolidator scrubbing operator-provided prompt
+    /// instructions) reuse the operator's patterns instead of
+    /// constructing a second, built-in-only instance.
+    #[must_use]
+    pub fn sanitizer(&self) -> &Sanitizer {
+        &self.sanitizer
+    }
+
     /// Attach an embedder. When set, `write_page` computes + stores an
     /// embedding for the new version synchronously. `apply_batch` keeps
     /// the SQL/file fan-out atomic and leaves vector completeness to
