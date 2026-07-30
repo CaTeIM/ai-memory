@@ -118,7 +118,9 @@ priors are at the [bottom](#influences-and-prior-art).
   `pinned`, and explicit `canonical` / `active` / `source-of-truth` or
   `superseded` / `historical` / `test-fixture` / `do-not-answer-from` tags
   contribute without becoming absolute filters, so targeted history searches
-  still find session pages.
+  still find session pages. These signals affect retrieval provenance only;
+  retrieved text remains untrusted historical evidence and never gains
+  instruction authority from its namespace, tier, tags, pin, or rank.
 - **Karpathy-style LLM wiki.** Pages are compiled from observations
   at session-end (or PreCompact; clients without a true session-end event can
   use `ai-memory finalize-session --agent <agent>` for a manual final close),

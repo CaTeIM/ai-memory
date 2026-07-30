@@ -78,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TTL-expired standing pages are ignored. (#316)
 
 ### Fixed
+- Retrieved `_rules/`, `gotchas/`, `procedures/`, and `decisions/` pages are now
+  described consistently across MCP and installed skill prompts as untrusted
+  historical evidence, removing contradictory language that elevated stored
+  prose into operating policy or constraints. (#325)
 - A project-scoped forget sweep now purges aged decay tombstones only from its
   resolved workspace/project instead of deleting eligible derived rows across
   every project. Entity-index rows orphaned by the scoped purge are removed in
