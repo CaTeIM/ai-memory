@@ -567,8 +567,8 @@ pub(crate) fn upsert_page_in_tx(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
               frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14)",
+              created_at, updated_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -584,6 +584,7 @@ pub(crate) fn upsert_page_in_tx(
                 i64::from(page.pinned),
                 page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
+                page.expires_at.map(|ts| ts.as_microsecond()),
             ],
         )?;
         replace_links_in_tx(tx, &new_id, page)?;
@@ -605,8 +606,8 @@ pub(crate) fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at, expires_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13, ?14)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -621,6 +622,7 @@ pub(crate) fn upsert_page_in_tx(
             i64::from(page.pinned),
             page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
+            page.expires_at.map(|ts| ts.as_microsecond()),
         ],
     )?;
     replace_links_in_tx(tx, &new_id, page)?;
@@ -2188,7 +2190,7 @@ pub fn delete_stale_page_embeddings(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Focused unit tests for the load-bearing mutating SQL paths.
     //!
     //! `Store::open` exercises these incidentally through
@@ -2506,6 +2508,7 @@ mod tests {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         }
     }
 
@@ -4335,6 +4338,41 @@ mod tests {
         assert_eq!(scratch_handoffs, 1);
     }
 
+    /// Seed a minimal `pages` row against a pre-V36 schema. Migration-era
+    /// tests run old schemas, where current `upsert_page` — which writes
+    /// the V36 `expires_at` column — cannot be used to seed fixtures.
+    pub(crate) fn insert_page_pre_v36(conn: &Connection, page: &NewPage) -> PageId {
+        let id = PageId::new();
+        let now = Timestamp::now().as_microsecond();
+        let body_sha256: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(page.body.as_bytes());
+            hasher.finalize().into()
+        };
+        conn.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, \
+              body_sha256, frontmatter_json, is_latest, pinned, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?12)",
+            params![
+                id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                path_search_text(page.path.as_str()),
+                page.title,
+                page.tier.as_str(),
+                page.body,
+                body_sha256.as_slice(),
+                serde_json::to_string(&page.frontmatter_json).unwrap(),
+                i64::from(page.pinned),
+                now,
+            ],
+        )
+        .unwrap();
+        id
+    }
+
     #[test]
     fn v18_migration_refuses_existing_split_brain_rows() {
         let tmp = TempDir::new().unwrap();
@@ -4347,7 +4385,7 @@ mod tests {
         let proj = get_or_create_project(&mut conn, &src_ws, "scratch", None).unwrap();
         let mut bad_page = page(src_ws, proj, "notes/split.md", "body");
         bad_page.workspace_id = stale_ws;
-        upsert_page(&mut conn, &bad_page).unwrap();
+        insert_page_pre_v36(&conn, &bad_page);
 
         let err = crate::migrations::run_to(&mut conn, 18).unwrap_err();
         assert!(

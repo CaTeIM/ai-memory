@@ -943,7 +943,7 @@ async fn handle_search(
                 Ok((ws, proj)) => {
                     state
                         .reader
-                        .search_pages_for_project(ws, proj, query.q, limit)
+                        .search_pages_for_project(ws, proj, query.q, limit, None)
                         .await
                 }
                 Err(e) => return e,
@@ -1044,7 +1044,7 @@ async fn handle_read_page(
     } else if let Some(q) = query.q {
         let hits = match state
             .reader
-            .search_pages_for_project(ws, proj, q.clone(), 1)
+            .search_pages_for_project(ws, proj, q.clone(), 1, None)
             .await
         {
             Ok(h) => h,
@@ -2478,6 +2478,7 @@ async fn handle_forget_sweep(
     run_sweep(
         &state.reader,
         &state.writer,
+        Some(&state.wiki),
         ws,
         proj,
         &state.decay_params,

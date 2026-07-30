@@ -506,6 +506,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();

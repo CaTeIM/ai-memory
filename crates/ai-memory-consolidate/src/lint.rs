@@ -222,6 +222,29 @@ fn rule_based_findings(candidates: &[DecayCandidate]) -> Vec<LintFinding> {
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
+        // Pinned + expiring is contradictory: the pin says "never
+        // decay" but the TTL hard-deletes regardless of pin (an
+        // explicit expiry is the more explicit statement). Surface the
+        // combo so the operator resolves it before the sweep does.
+        let frontmatter_pinned = frontmatter
+            .as_ref()
+            .and_then(|fm| fm.get("pinned"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if c.expires_at_us.is_some() && (c.pinned || frontmatter_pinned) {
+            out.push(LintFinding {
+                kind: "pinned_expiring".into(),
+                severity: "warning".into(),
+                message: format!(
+                    "Page {} is pinned but carries an expires_at TTL; \
+                     the forget sweep will hard-delete it when the TTL \
+                     passes despite the pin. Remove one of the two.",
+                    c.path,
+                ),
+                pages: vec![c.path.as_str().to_string()],
+                detail: None,
+            });
+        }
     }
 
     for (title, paths) in titles {
@@ -365,6 +388,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            expires_at_us: None,
         }];
         let findings = rule_based_findings(&candidates);
         assert_eq!(findings.len(), 1);
@@ -382,6 +406,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki"}"#.into(),
+            expires_at_us: None,
         };
         let b = DecayCandidate {
             path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
@@ -407,6 +432,7 @@ mod tests {
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Never ship code without a test", "kind": "rule"}"#
                 .into(),
+            expires_at_us: None,
         };
         let findings = rule_based_findings(&[candidate]);
         let rules: Vec<_> = findings
@@ -431,6 +457,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            expires_at_us: None,
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
@@ -453,6 +480,7 @@ mod tests {
             access_count: 5,
             last_accessed_at_us: None,
             frontmatter_json: r#"{"title": "Karpathy Wiki", "kind": "fact"}"#.into(),
+            expires_at_us: None,
         };
         let findings = rule_based_findings(&[candidate]);
         assert!(
@@ -507,6 +535,7 @@ mod tests {
             access_count: 0,
             last_accessed_at_us: None,
             frontmatter_json: "{}".into(),
+            expires_at_us: None,
         }];
         // rule_based_findings is the exact code path that `use_llm=false`
         // keeps active. Confirm it still fires.

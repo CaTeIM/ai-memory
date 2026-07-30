@@ -36,6 +36,25 @@ use crate::maintenance::MaintenanceJob;
 use crate::users::TOKEN_HASH_LEN;
 use crate::workstream::{ManagedRunContext, StoredManagedRunStatus};
 
+/// TTL guard for retrieval surfaces (search / recent / embedding hits /
+/// graph neighbours / briefing lists): appended to a WHERE clause that
+/// already constrains `is_latest = 1`. `table` is the pages alias in
+/// that query; `now_param` is the positional placeholder bound to the
+/// current wall-clock in microseconds. One definition so the
+/// NULL-handling never drifts between queries. Exact-path/id reads and
+/// the decay-candidate walk deliberately do NOT use this — reads
+/// annotate expiry instead of hiding it, and the sweep must see
+/// expired rows to delete them.
+fn not_expired(table: &str, now_param: &str) -> String {
+    format!(" AND ({table}.expires_at IS NULL OR {table}.expires_at > {now_param})")
+}
+
+/// Current wall-clock in microseconds, for binding against
+/// [`not_expired`] fragments.
+fn now_us() -> i64 {
+    Timestamp::now().as_microsecond()
+}
+
 fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     format!(
         "COALESCE( \
@@ -688,6 +707,15 @@ pub struct PageMeta {
     /// NULL`); `Some` when JOIN resolves a `users` row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<PageAuthor>,
+    /// ISO-8601 TTL instant from the frontmatter `expires_at:` key.
+    /// Exact-path/id reads return expired pages (an explicit read is
+    /// not search); callers annotate expiry via [`PageMeta::expired`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// `true` when [`PageMeta::expires_at`] is in the past — the page
+    /// is hidden from retrieval and awaiting the next forget sweep.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 /// One resolved cross-project edge (a link whose endpoints live in
@@ -889,14 +917,15 @@ impl ReaderPool {
                         pages.frontmatter_json, {kind_expr} AS kind \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1 \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64],
+                params![fts_query, authority_candidate_limit(limit) as i64, now_us()],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
@@ -970,14 +999,15 @@ impl ReaderPool {
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1 \
+                 WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![fts_query, authority_candidate_limit(limit) as i64],
+                params![fts_query, authority_candidate_limit(limit) as i64, now_us()],
                 |row| {
                     let workspace_name: String = row.get(0)?;
                     let project_name: String = row.get(1)?;
@@ -1039,6 +1069,11 @@ impl ReaderPool {
 
     /// Run an authority-adjusted full-text search scoped to one project.
     ///
+    /// `expiry_cutoff_us`: `None` hides pages whose TTL has passed as of
+    /// now (the default retrieval behaviour); `Some(cutoff)` compares
+    /// against that instant instead — pass `i64::MIN` to include
+    /// expired pages.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn search_pages_for_project(
@@ -1047,6 +1082,7 @@ impl ReaderPool {
         project_id: ProjectId,
         query: String,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1057,6 +1093,7 @@ impl ReaderPool {
                 project_id,
                 query,
                 authority_candidate_limit(limit),
+                expiry_cutoff_us,
             )
             .await?;
         Ok(rerank_page_hits(candidates, limit))
@@ -1068,11 +1105,13 @@ impl ReaderPool {
         project_id: ProjectId,
         query: String,
         candidate_limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<(PageHit, PageAuthority)>> {
         let fts_query = normalize_fts_query(&query);
         if fts_query.is_empty() || candidate_limit == 0 {
             return Ok(Vec::new());
         }
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("pages.path", "pages.frontmatter_json");
             let sql = format!(
@@ -1085,9 +1124,10 @@ impl ReaderPool {
                  WHERE pages_fts MATCH ?1 \
                    AND pages.workspace_id = ?2 \
                    AND pages.project_id = ?3 \
-                   AND pages.is_latest = 1 \
+                   AND pages.is_latest = 1{not_expired} \
                  ORDER BY pages_fts.rank \
-                 LIMIT ?4"
+                 LIMIT ?4",
+                not_expired = not_expired("pages", "?5"),
             );
             let mut stmt = conn.prepare(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
@@ -1096,7 +1136,8 @@ impl ReaderPool {
                     fts_query,
                     workspace_id.as_bytes(),
                     project_id.as_bytes(),
-                    candidate_limit as i64
+                    candidate_limit as i64,
+                    cutoff
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
@@ -1228,17 +1269,19 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn recent_pages(&self, limit: usize) -> StoreResult<Vec<PageHit>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT id, path, title, \
                         substr(body, 1, 240) AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
-                 WHERE is_latest = 1 \
+                 WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
-            )?;
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![limit as i64], |row| {
+            let rows = stmt.query_map(params![limit as i64, now_us()], |row| {
                 let id_bytes: Vec<u8> = row.get(0)?;
                 let path: String = row.get(1)?;
                 let title: String = row.get(2)?;
@@ -1273,18 +1316,25 @@ impl ReaderPool {
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT id, path, title, \
                         substr(body, 1, 240) AS snip, \
                         CAST(updated_at AS REAL) AS rank \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
-            )?;
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
             let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), limit as i64],
+                params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit as i64,
+                    now_us()
+                ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
                     let path: String = row.get(1)?;
@@ -1324,19 +1374,21 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn recent_pages_global(&self, limit: usize) -> StoreResult<Vec<PageHitWithMeta>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         substr(pages.body, 1, 240) AS snip, \
                         CAST(pages.updated_at AS REAL) AS rank \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
-                 WHERE pages.is_latest = 1 \
+                 WHERE pages.is_latest = 1{not_expired} \
                  ORDER BY pages.updated_at DESC \
                  LIMIT ?1",
-            )?;
+                not_expired = not_expired("pages", "?2"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             #[allow(clippy::cast_possible_wrap)]
-            let rows = stmt.query_map(params![limit as i64], |row| {
+            let rows = stmt.query_map(params![limit as i64, now_us()], |row| {
                 let workspace_name: String = row.get(0)?;
                 let project_name: String = row.get(1)?;
                 let path: String = row.get(2)?;
@@ -1836,22 +1888,25 @@ impl ReaderPool {
         model: String,
         dim: u32,
         limit: usize,
+        expiry_cutoff_us: i64,
     ) -> StoreResult<Vec<(PageId, PagePath, f32)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
+            let sql = format!(
                 "SELECT page_embeddings.page_id, page_embeddings.vector, pages.path \
                  FROM page_embeddings \
                  JOIN pages ON pages.id = page_embeddings.page_id \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
-                   AND pages.is_latest = 1 \
+                   AND pages.is_latest = 1{not_expired} \
                    AND page_embeddings.provider = ?3 \
                    AND page_embeddings.model = ?4 \
                    AND page_embeddings.dim = ?5",
-            )?;
+                not_expired = not_expired("pages", "?6"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(
                 params![
                     workspace_id.as_bytes(),
@@ -1859,6 +1914,7 @@ impl ReaderPool {
                     provider,
                     model,
                     dim,
+                    expiry_cutoff_us,
                 ],
                 |row| {
                     let id_bytes: Vec<u8> = row.get(0)?;
@@ -1947,7 +2003,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, path, tier, pinned, updated_at, access_count, last_accessed_at, \
-                        frontmatter_json \
+                        frontmatter_json, expires_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1",
             )?;
@@ -1975,10 +2031,12 @@ impl ReaderPool {
         project_id: ProjectId,
         seed_ids: Vec<PageId>,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
         if seed_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let now = expiry_cutoff_us.unwrap_or_else(now_us);
         self.with_conn(move |conn| {
             let mut seen = std::collections::HashSet::new();
             let mut out = Vec::new();
@@ -1995,8 +2053,13 @@ impl ReaderPool {
             }
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(now));
             sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
             sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+            sql_params.push(Value::Integer(now));
+
+            let out_not_expired = not_expired("tp", "?");
+            let in_not_expired = not_expired("fp", "?");
 
             let mut sql = String::with_capacity(values_clause.len() + 1_400);
             write!(
@@ -2009,7 +2072,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.from_page_id = seeds.seed_id \
                    JOIN pages tp ON tp.id = l.to_page_id \
-                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1 \
+                   WHERE tp.workspace_id = ? AND tp.project_id = ? AND tp.is_latest = 1{out_not_expired} \
                    UNION ALL \
                    SELECT fp.id AS id, fp.path AS path, fp.title AS title, \
                           substr(fp.body, 1, 240) AS snippet, \
@@ -2017,7 +2080,7 @@ impl ReaderPool {
                    FROM seeds \
                    JOIN links l ON l.to_page_id = seeds.seed_id \
                    JOIN pages fp ON fp.id = l.from_page_id \
-                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1 \
+                   WHERE fp.workspace_id = ? AND fp.project_id = ? AND fp.is_latest = 1{in_not_expired} \
                  ) \
                  SELECT id, path, title, snippet \
                  FROM neighbors \
@@ -2125,6 +2188,10 @@ impl ReaderPool {
     ///
     /// k=60 is the canonical RRF constant.
     ///
+    /// `expiry_cutoff_us`: see [`Self::search_pages_for_project`]. Every
+    /// stream shares one cutoff so a page cannot be filtered out of one
+    /// ranker while still seeding another.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_arguments)]
@@ -2138,7 +2205,9 @@ impl ReaderPool {
         model: String,
         dim: u32,
         limit: usize,
+        expiry_cutoff_us: Option<i64>,
     ) -> StoreResult<Vec<PageHit>> {
+        let cutoff = expiry_cutoff_us.unwrap_or_else(now_us);
         // Authority is applied after RRF, so every stream needs the same
         // bounded candidate window used by FTS-only search. A `limit * 2`
         // window was too narrow at small limits for a canonical page to enter
@@ -2147,7 +2216,13 @@ impl ReaderPool {
 
         // Fetch FTS5 hits first.
         let fts_candidates = self
-            .search_page_candidates_for_project(workspace_id, project_id, query, candidate_limit)
+            .search_page_candidates_for_project(
+                workspace_id,
+                project_id,
+                query,
+                candidate_limit,
+                Some(cutoff),
+            )
             .await?;
         let mut authorities: std::collections::HashMap<PageId, PageAuthority> = fts_candidates
             .iter()
@@ -2168,6 +2243,7 @@ impl ReaderPool {
                     model,
                     dim,
                     candidate_limit,
+                    cutoff,
                 )
                 .await?;
         }
@@ -2184,7 +2260,13 @@ impl ReaderPool {
             }
         }
         let graph_hits = self
-            .graph_neighbors_for_project(workspace_id, project_id, seed_ids, candidate_limit)
+            .graph_neighbors_for_project(
+                workspace_id,
+                project_id,
+                seed_ids,
+                candidate_limit,
+                Some(cutoff),
+            )
             .await?;
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
@@ -2396,11 +2478,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?1"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map([], briefing_page_from_row)?
+                .query_map(params![now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2409,11 +2492,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?1"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map([], briefing_page_from_row)?
+                .query_map(params![now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2422,12 +2506,13 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE is_latest = 1 \
+                 WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?1"
+                 LIMIT ?1",
+                not_expired = not_expired("pages", "?2"),
             ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![recent_limit], briefing_page_from_row)?
+                .query_map(params![recent_limit, now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2520,11 +2605,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?3"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2533,11 +2619,12 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?3"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2546,12 +2633,13 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3"
+                 LIMIT ?3",
+                not_expired = not_expired("pages", "?4"),
             ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit], briefing_page_from_row)?
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit, now_us], briefing_page_from_row)?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2598,17 +2686,24 @@ impl ReaderPool {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
-            let mut core_stmt = conn.prepare_cached(
+            let core_sql = format!(
                 "SELECT path, title, body, pinned, updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                    AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
                  ORDER BY pinned DESC, path ASC \
                  LIMIT ?3",
-            )?;
+                not_expired = not_expired("pages", "?4"),
+            );
+            let mut core_stmt = conn.prepare_cached(&core_sql)?;
             let core: Vec<BriefPageBody> = core_stmt
                 .query_map(
-                    params![workspace_id.as_bytes(), project_id.as_bytes(), core_limit],
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        core_limit,
+                        now_us()
+                    ],
                     |row| {
                         let updated_us: i64 = row.get(4)?;
                         Ok((
@@ -2643,13 +2738,19 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?3"
+                 LIMIT ?3",
+                not_expired = not_expired("pages", "?4"),
             ))?;
             let recent: Vec<BriefingPage> = recent_stmt
                 .query_map(
-                    params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit],
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us()
+                    ],
                     briefing_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?
@@ -2807,11 +2908,15 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*' \
-                  ORDER BY updated_at DESC"
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_rules/*'{not_expired} \
+                  ORDER BY updated_at DESC",
+                not_expired = not_expired("pages", "?2"),
             ))?;
             let rules: Vec<BriefingPage> = rules_stmt
-                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .query_map(
+                    params![workspace_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2820,11 +2925,15 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*' \
-                  ORDER BY path ASC"
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  ORDER BY path ASC",
+                not_expired = not_expired("pages", "?2"),
             ))?;
             let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes()], briefing_page_from_row)?
+                .query_map(
+                    params![workspace_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2833,13 +2942,14 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND is_latest = 1 \
+                 WHERE workspace_id = ?1 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
-                 LIMIT ?2"
+                 LIMIT ?2",
+                not_expired = not_expired("pages", "?3"),
             ))?;
             let recent_pages: Vec<BriefingPage> = recent_stmt
                 .query_map(
-                    params![workspace_id.as_bytes(), recent_limit],
+                    params![workspace_id.as_bytes(), recent_limit, now_us],
                     briefing_page_from_row,
                 )?
                 .collect::<Result<Vec<_>, _>>()?
@@ -3114,7 +3224,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -3147,7 +3257,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -3642,7 +3752,7 @@ impl ReaderPool {
                         {kind_expr}, \
                         pg.tier, pg.pinned, pg.created_at, pg.updated_at, \
                         sp.path AS supersedes_path, \
-                        au.username, au.name, au.email \
+                        au.username, au.name, au.email, pg.expires_at \
                  FROM pages pg \
                  JOIN projects p ON p.id = pg.project_id \
                  JOIN workspaces w ON w.id = pg.workspace_id \
@@ -4666,6 +4776,7 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let author_username: Option<String> = row.get(12)?;
     let author_name: Option<String> = row.get(13)?;
     let author_email: Option<String> = row.get(14)?;
+    let expires_us: Option<i64> = row.get(15)?;
     let author = author_username.map(|username| PageAuthor {
         username,
         name: author_name,
@@ -4683,6 +4794,10 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
     let updated_at = jiff::Timestamp::from_microsecond(updated_us)
         .map(|ts| ts.to_string())
         .unwrap_or_default();
+    let expired = expires_us.is_some_and(|us| us <= now_us());
+    let expires_at = expires_us
+        .and_then(|us| jiff::Timestamp::from_microsecond(us).ok())
+        .map(|ts| ts.to_string());
 
     Ok(Ok(PageMeta {
         workspace_name,
@@ -4698,6 +4813,8 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
         updated_at,
         supersedes,
         author,
+        expires_at,
+        expired,
     }))
 }
 
@@ -4855,6 +4972,9 @@ pub struct DecayCandidate {
     /// Frontmatter JSON; the sweep peeks at it for an explicit
     /// `pinned: true` (which overrides the schema flag).
     pub frontmatter_json: String,
+    /// TTL instant in microseconds since epoch. The sweep hard-deletes
+    /// pages past this regardless of tier or pin.
+    pub expires_at_us: Option<i64>,
 }
 
 fn row_to_decay_candidate(
@@ -4868,6 +4988,7 @@ fn row_to_decay_candidate(
     let access_count: i64 = row.get(5)?;
     let last_accessed_at_us: Option<i64> = row.get(6)?;
     let frontmatter_json: String = row.get(7)?;
+    let expires_at_us: Option<i64> = row.get(8)?;
     Ok(materialise_decay_candidate(
         id_bytes,
         path,
@@ -4877,6 +4998,7 @@ fn row_to_decay_candidate(
         access_count,
         last_accessed_at_us,
         frontmatter_json,
+        expires_at_us,
     ))
 }
 
@@ -4890,6 +5012,7 @@ fn materialise_decay_candidate(
     access_count: i64,
     last_accessed_at_us: Option<i64>,
     frontmatter_json: String,
+    expires_at_us: Option<i64>,
 ) -> StoreResult<DecayCandidate> {
     Ok(DecayCandidate {
         id: PageId::from_slice(&id_bytes)?,
@@ -4902,6 +5025,7 @@ fn materialise_decay_candidate(
         access_count: u32::try_from(access_count.max(0)).unwrap_or(u32::MAX),
         last_accessed_at_us,
         frontmatter_json,
+        expires_at_us,
     })
 }
 

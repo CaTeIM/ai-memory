@@ -145,6 +145,7 @@ mod tests {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         }
     }
 
@@ -2177,7 +2178,7 @@ mod tests {
         let query = "what is the current decision about LLM embeddings";
         let scoped = store
             .reader
-            .search_pages_for_project(ws, proj, query.into(), 10)
+            .search_pages_for_project(ws, proj, query.into(), 10, None)
             .await
             .unwrap();
         let scoped_paths: Vec<&str> = scoped.iter().map(|hit| hit.path.as_str()).collect();
@@ -2193,7 +2194,7 @@ mod tests {
 
         let top_one = store
             .reader
-            .search_pages_for_project(ws, proj, query.into(), 1)
+            .search_pages_for_project(ws, proj, query.into(), 1, None)
             .await
             .unwrap();
         assert_eq!(top_one[0].path.as_str(), "decisions/embedding-policy.md");
@@ -2216,6 +2217,7 @@ mod tests {
                 String::new(),
                 0,
                 1,
+                None,
             )
             .await
             .unwrap();
@@ -2223,7 +2225,7 @@ mod tests {
 
         let session_evidence = store
             .reader
-            .search_pages_for_project(ws, proj, "chronicleonlytoken".into(), 10)
+            .search_pages_for_project(ws, proj, "chronicleonlytoken".into(), 10, None)
             .await
             .unwrap();
         assert_eq!(session_evidence.len(), 1);
@@ -2361,7 +2363,7 @@ mod tests {
 
         let hits = store
             .reader
-            .search_pages_for_project(ws, proj, "ai-memory".into(), 10)
+            .search_pages_for_project(ws, proj, "ai-memory".into(), 10, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -2403,6 +2405,7 @@ mod tests {
                 String::new(),
                 0,
                 10,
+                None,
             )
             .await
             .unwrap();
@@ -3366,11 +3369,12 @@ mod tests {
             let ws = super::ops::get_or_create_workspace(&mut conn, "default").unwrap();
             let proj =
                 super::ops::get_or_create_project(&mut conn, &ws, "ai-memory", None).unwrap();
-            let page_id = super::ops::upsert_page(
-                &mut conn,
+            // Raw-SQL seeding: the v19-era schema predates the V36
+            // `expires_at` column that current `upsert_page` writes.
+            let page_id = super::ops::tests::insert_page_pre_v36(
+                &conn,
                 &sample_page(ws, proj, "notes/v103.md", "v1.0.3 upgrade fixture"),
-            )
-            .unwrap();
+            );
             super::ops::begin_session(
                 &mut conn,
                 &NewSession {
@@ -3745,6 +3749,7 @@ mod tests {
             pinned: true,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 

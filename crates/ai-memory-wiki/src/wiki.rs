@@ -376,7 +376,7 @@ impl Wiki {
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -394,11 +394,12 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
                 author_id: None,
+                expires_at: meta.expires_at,
             })
             .await?;
         Ok(id)
@@ -766,6 +767,7 @@ impl Wiki {
         let title = self.sanitizer.scrub(&detail.summary.title);
         let links = extract_links(&markdown.body, &path);
         let emitted = emit(&markdown)?;
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let page = NewPage {
             workspace_id,
             project_id,
@@ -777,6 +779,7 @@ impl Wiki {
             pinned: is_slot_path(&path),
             links,
             author_id,
+            expires_at,
         };
 
         let result = {
@@ -856,7 +859,7 @@ impl Wiki {
         let links = extract_links(&md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -865,11 +868,11 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
-
+                expires_at: meta.expires_at,
                 author_id: None,
             })
             .await?;
@@ -1135,19 +1138,22 @@ impl Wiki {
             // Build NewPage batch with the precomputed titles.
             let pages: Vec<ai_memory_core::NewPage> = staged_files
                 .iter()
-                .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                    workspace_id: req.workspace_id,
-                    project_id: req.project_id,
-                    path: req.path.clone(),
-                    title: req.title.clone().unwrap_or_default(),
-                    body: req.body.clone(),
-                    tier: req.tier,
-                    frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned,
-                    links: extract_links(&req.body, &req.path),
-                    author_id: req.author_id,
+                .map(|(req, _, _, _)| {
+                    Ok(ai_memory_core::NewPage {
+                        workspace_id: req.workspace_id,
+                        project_id: req.project_id,
+                        path: req.path.clone(),
+                        title: req.title.clone().unwrap_or_default(),
+                        body: req.body.clone(),
+                        tier: req.tier,
+                        frontmatter_json: req.frontmatter.clone(),
+                        pinned: req.pinned,
+                        links: extract_links(&req.body, &req.path),
+                        author_id: req.author_id,
+                        expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
+                    })
                 })
-                .collect();
+                .collect::<WikiResult<Vec<_>>>()?;
 
             // Install files first so the DB is never ahead of markdown. If the
             // SQL batch fails below, rollback restores the prior disk state;
@@ -1269,6 +1275,7 @@ impl Wiki {
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links = extract_links(&markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1304,6 +1311,7 @@ impl Wiki {
                     pinned,
                     links,
                     author_id,
+                    expires_at,
                 })
                 .await
             {
@@ -1410,7 +1418,7 @@ fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
 fn derive_index_metadata(
     path: &PagePath,
     frontmatter: &serde_json::Value,
-) -> WikiResult<(Tier, bool)> {
+) -> WikiResult<IndexMetadata> {
     let tier = match frontmatter.get("tier") {
         None => Tier::Semantic,
         Some(serde_json::Value::String(s)) => s.parse::<Tier>().map_err(|e| {
@@ -1431,7 +1439,65 @@ fn derive_index_metadata(
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-    Ok((tier, pinned))
+    let expires_at = parse_expires_at(path, frontmatter)?;
+    Ok(IndexMetadata {
+        tier,
+        pinned,
+        expires_at,
+    })
+}
+
+/// Index-relevant metadata derived from a page's frontmatter. Markdown
+/// is the source of truth; every field here is rebuildable by a reindex.
+struct IndexMetadata {
+    tier: Tier,
+    pinned: bool,
+    expires_at: Option<jiff::Timestamp>,
+}
+
+/// Parse the frontmatter `expires_at:` key into a TTL instant.
+///
+/// Accepts RFC3339 (`2026-08-01T12:00:00Z`) or a bare `YYYY-MM-DD`,
+/// which means the *end* of that day in UTC — a date-only TTL that
+/// expired at midnight would surprise anyone who wrote "expires
+/// 2026-08-01" meaning "good through the 1st".
+pub(crate) fn parse_expires_at(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Option<jiff::Timestamp>> {
+    let raw = match frontmatter.get("expires_at") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.trim(),
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-string expires_at in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(Some(ts));
+    }
+    if let Ok(date) = raw.parse::<jiff::civil::Date>() {
+        let ts = date
+            .at(23, 59, 59, 999_999_000)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map_err(|e| {
+                ai_memory_wiki_error(&format!(
+                    "invalid expires_at date in frontmatter for {}: {e}",
+                    path.as_str()
+                ))
+            })?
+            .timestamp();
+        return Ok(Some(ts));
+    }
+    Err(ai_memory_wiki_error(&format!(
+        "invalid expires_at in frontmatter for {} (want RFC3339 or YYYY-MM-DD): {raw}",
+        path.as_str()
+    )))
 }
 
 fn canonicalize_index_frontmatter(
@@ -1888,7 +1954,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages_for_project(ws, proj, "proposed body".into(), 10)
+                .search_pages_for_project(ws, proj, "proposed body".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()

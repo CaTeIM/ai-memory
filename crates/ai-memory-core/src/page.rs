@@ -68,6 +68,12 @@ pub struct NewPage {
     /// gets the pre-multi-user behaviour.
     #[serde(default)]
     pub author_id: Option<crate::UserId>,
+    /// TTL derived from the frontmatter `expires_at:` key (markdown is
+    /// the source of truth; the wiki layer parses and validates it).
+    /// `None` = never expires. Expired pages are hidden from
+    /// search/recent/briefing and hard-deleted by the retention sweep.
+    #[serde(default)]
+    pub expires_at: Option<Timestamp>,
 }
 
 /// A link target discovered in a page body.
@@ -143,6 +149,8 @@ pub struct Page {
     pub created_at: Timestamp,
     /// Wall-clock last-update time of *this version*.
     pub updated_at: Timestamp,
+    /// TTL instant, if the page carries a frontmatter `expires_at:`.
+    pub expires_at: Option<Timestamp>,
 }
 
 impl Tier {

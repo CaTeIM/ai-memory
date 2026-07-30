@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
+  `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
+  `pages.expires_at` column (V36) and settable through a new optional
+  `expires_at` parameter on `memory_write_page`. Expired pages are hidden
+  from `memory_query`/`memory_recent`/briefing/session-brief surfaces —
+  `memory_query` gains `include_expired: true` to still see them — while
+  exact-path reads still return the page, annotated `expired: true`,
+  because an explicit read is not a search. The forget sweep hard-deletes
+  them through the wiki layer, so the markdown file goes too, not just
+  the rows. An explicit TTL outranks `pinned` (a pin means "don't decay
+  this", not "keep it past the date its author set"); `memory_lint`
+  flags pinned+expiring pages so the combination is visible rather than
+  silent.
 - New `openai-compat` embedding provider for self-hosted engines
   (Ollama, LM Studio, vLLM). Set
   `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` together with explicit
