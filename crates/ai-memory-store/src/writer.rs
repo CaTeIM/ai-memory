@@ -200,6 +200,8 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<usize>>,
     },
     HardDeleteDecayed {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         hard_delete_after_days: i64,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
@@ -913,14 +915,21 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Hard-delete pages soft-deleted by the sweep more than
-    /// `hard_delete_after_days` ago.
+    /// Hard-delete pages in one workspace/project that were soft-deleted by
+    /// the sweep more than `hard_delete_after_days` ago.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn hard_delete_decayed(&self, hard_delete_after_days: i64) -> StoreResult<usize> {
+    pub async fn hard_delete_decayed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        hard_delete_after_days: i64,
+    ) -> StoreResult<usize> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::HardDeleteDecayed {
+            workspace_id,
+            project_id,
             hard_delete_after_days,
             reply: tx,
         })
@@ -1749,10 +1758,17 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "soft_delete_for_decay");
             }
             WriteCmd::HardDeleteDecayed {
+                workspace_id,
+                project_id,
                 hard_delete_after_days,
                 reply,
             } => {
-                let result = ops::hard_delete_decayed_pages(&mut conn, hard_delete_after_days);
+                let result = ops::hard_delete_decayed_pages(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    hard_delete_after_days,
+                );
                 send_or_warn(reply, result, "hard_delete_decayed_pages");
             }
             WriteCmd::HealCatchAllRepoPaths { home, reply } => {

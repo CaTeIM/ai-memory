@@ -188,7 +188,7 @@ pub async fn run_sweep(
             writer.soft_delete_for_decay(to_evict_ids).await?;
         }
         hard_deleted = writer
-            .hard_delete_decayed(params.hard_delete_after_days)
+            .hard_delete_decayed(workspace_id, project_id, params.hard_delete_after_days)
             .await?;
     }
 

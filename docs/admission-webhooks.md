@@ -105,9 +105,13 @@ terminal `purge_project` notification is unchanged.
   per-event log is a local audit artifact; back it up out-of-band (batched
   rsync), not per-line.
 - **Handoffs** — SQLite rows, transient cross-agent state, not wiki pages.
-- **Forget-sweep soft/hard-delete** — DB-only (`is_latest=0` / row delete);
-  the markdown file stays on disk, so there is nothing for a file mirror to
-  do. (Only `purge_project` removes files in bulk.)
+- **Forget-sweep decay soft-delete and aged-tombstone cleanup** —
+  project-scoped and DB-only (`is_latest=0` / row delete); the markdown file
+  stays on disk, so there is nothing for a file mirror to do. This exemption
+  does not include frontmatter TTL expiry: that path uses the wiki's normal
+  conditional page delete, removes the file and rows, and runs the
+  `delete_page` admission chain. (`purge_project` remains the bulk-removal
+  path.)
 - **`rename-project`** — a `projects.name` column update; the on-disk path
   is the stable UUID, so no file moves and nothing to propagate.
 - **`rename-workspace`** — a `workspaces.name` column update plus refreshed

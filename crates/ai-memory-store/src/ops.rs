@@ -1328,24 +1328,41 @@ fn delete_page_inner(
     Ok(rows > 0)
 }
 
-/// Hard-delete rows that were soft-deleted by an earlier sweep at
-/// least `hard_delete_after_days` ago AND received zero subsequent
-/// accesses. Safe: M7 supersedes-chain pages have a non-null
-/// `supersedes` so they never match.
+/// Hard-delete rows in one workspace/project that were soft-deleted by an
+/// earlier sweep at least `hard_delete_after_days` ago AND received zero
+/// subsequent accesses. Safe: M7 supersedes-chain pages have a non-null
+/// `supersedes` so they never match. Orphaned entity-index rows from those
+/// page deletions are removed in the same transaction.
 pub fn hard_delete_decayed_pages(
     conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
     hard_delete_after_days: i64,
 ) -> StoreResult<usize> {
     let cutoff = Timestamp::now().as_microsecond() - hard_delete_after_days * 86_400_000_000;
-    let n = conn.execute(
+    let tx = conn.transaction()?;
+    let n = tx.execute(
         "DELETE FROM pages \
-         WHERE is_latest = 0 \
+         WHERE workspace_id = ?1 \
+           AND project_id = ?2 \
+           AND is_latest = 0 \
            AND supersedes IS NULL \
            AND superseded_at IS NOT NULL \
-           AND superseded_at < ?1 \
+           AND superseded_at < ?3 \
            AND access_count = 0",
-        params![cutoff],
+        params![workspace_id.as_bytes(), project_id.as_bytes(), cutoff],
     )?;
+    if n > 0 {
+        tx.execute(
+            "DELETE FROM entities \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
+               )",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+        )?;
+    }
+    tx.commit()?;
     Ok(n)
 }
 

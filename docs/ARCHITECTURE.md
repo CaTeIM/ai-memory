@@ -137,7 +137,9 @@ from hook paths.
    hard-deleted through the wiki layer (file + rows, pin or not);
    pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
-   access get purged. Semantic / pinned / freshly-touched pages survive.
+   access get purged only within that sweep's resolved workspace/project,
+   together with entity-index rows orphaned by the purge. Semantic / pinned /
+   freshly-touched pages survive.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
    enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A

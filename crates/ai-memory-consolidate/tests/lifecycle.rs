@@ -661,6 +661,136 @@ async fn ttl_expiry_lifecycle_end_to_end() {
     assert!(after_paths.contains(&"notes/refreshed.md"));
 }
 
+#[tokio::test]
+async fn aged_decay_cleanup_stays_within_the_requested_scope() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("workspace");
+    let target = store
+        .writer
+        .get_or_create_project(ws, "target", None)
+        .await
+        .expect("target project");
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling", None)
+        .await
+        .expect("sibling project");
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other")
+        .await
+        .expect("other workspace");
+    let other_project = store
+        .writer
+        .get_or_create_project(other_ws, "target", None)
+        .await
+        .expect("other workspace project");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+
+    for (workspace_id, project_id, path, entity) in [
+        (ws, target, "sessions/target.md", "target-entity"),
+        (ws, sibling, "sessions/sibling.md", "sibling-entity"),
+        (
+            other_ws,
+            other_project,
+            "sessions/other-workspace.md",
+            "other-workspace-entity",
+        ),
+    ] {
+        wiki.write_page(WritePageRequest {
+            workspace_id,
+            project_id,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({"entities": [entity]}),
+            body: format!("# Tombstone\n{path}"),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: Some("Tombstone".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .expect("write tombstone fixture");
+    }
+
+    // All three rows represent sweep-evicted pages old enough for immediate
+    // cleanup. The sweep below targets only `(default, target)`.
+    let conn = rusqlite::Connection::open(store.db_path()).expect("open aux conn");
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    conn.execute(
+        "UPDATE pages SET is_latest = 0, superseded_at = 1, access_count = 0",
+        [],
+    )
+    .expect("age tombstone fixtures");
+    drop(conn);
+
+    let params = DecayParams {
+        hard_delete_after_days: 0,
+        ..DecayParams::default()
+    };
+    let report = run_sweep(
+        &store.reader,
+        &store.writer,
+        None,
+        ws,
+        target,
+        &params,
+        false,
+    )
+    .await
+    .expect("targeted sweep");
+    assert_eq!(
+        report.hard_deleted, 1,
+        "the report must count only tombstones deleted from the target scope"
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).expect("reopen aux conn");
+    let remaining = |workspace_id: WorkspaceId, project_id: ProjectId| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(remaining(ws, target), 0, "target tombstone is deleted");
+    assert_eq!(remaining(ws, sibling), 1, "sibling project is preserved");
+    assert_eq!(
+        remaining(other_ws, other_project),
+        1,
+        "same-named project in another workspace is preserved"
+    );
+    let remaining_entities = |workspace_id: WorkspaceId, project_id: ProjectId| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM entities WHERE workspace_id = ?1 AND project_id = ?2",
+            params![workspace_id.as_bytes(), project_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        remaining_entities(ws, target),
+        0,
+        "the target entity orphan is removed in the page-delete transaction"
+    );
+    assert_eq!(
+        remaining_entities(ws, sibling),
+        1,
+        "sibling entity index is preserved"
+    );
+    assert_eq!(
+        remaining_entities(other_ws, other_project),
+        1,
+        "other workspace entity index is preserved"
+    );
+}
+
 fn ws_dir_for(tmp: &TempDir, ws: WorkspaceId, proj: ProjectId) -> std::path::PathBuf {
     tmp.path()
         .join("wiki")
