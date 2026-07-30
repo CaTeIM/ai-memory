@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the rows. An explicit TTL outranks `pinned` (a pin means "don't decay
   this", not "keep it past the date its author set"); `memory_lint`
   flags pinned+expiring pages so the combination is visible rather than
-  silent.
+  silent ([#309]).
 - New `openai-compat` embedding provider for self-hosted engines
   (Ollama, LM Studio, vLLM). Set
   `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` together with explicit
