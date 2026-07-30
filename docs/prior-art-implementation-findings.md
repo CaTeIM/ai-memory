@@ -309,7 +309,7 @@ These items previously drifted from the code. Their current status is:
 
 | Area | Current status |
 |---|---|
-| MCP tool count/list | Fixed: architecture and design docs list the current 16-tool surface. |
+| MCP tool count/list | Fixed: architecture and design docs list the current 17-tool surface. |
 | Lint scope | Fixed: lint covers stale episodic pages, duplicate titles, rule suggestions, broken cross-project links, and optional LLM contradictions. |
 | sqlite-vec status | Fixed: the vector policy documents packed vectors in SQLite with brute-force cosine as the current backend. |
 | raw archive status | Fixed: docs distinguish reserved `raw/` files from implemented observation-FTS fallback. |
