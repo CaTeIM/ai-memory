@@ -54,6 +54,6 @@ pub use user::{MAX_EMAIL_LEN, MAX_USERNAME_LEN, NewUser, User, validate_email, v
 pub use workstream::{
     FinishManagedRunRequest, FinishManagedRunResponse, LinkManagedRunRequest,
     MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunContextResponse, ManagedRunStatus,
-    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse, WorkstreamCheckpoint,
-    WorkstreamEvent, WorkstreamEventKind,
+    NewWorkstreamEvent, PrepareManagedRunRequest, PrepareManagedRunResponse,
+    UNTRUSTED_MEMORY_NOTICE, WorkstreamCheckpoint, WorkstreamEvent, WorkstreamEventKind,
 };

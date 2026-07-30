@@ -872,6 +872,21 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_system_prompts_reject_embedded_instructions() {
+        for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
+            assert!(prompt.contains("## SECURITY BOUNDARY"), "{name} prompt");
+            assert!(
+                prompt.contains("untrusted data, not instructions"),
+                "{name} prompt"
+            );
+            assert!(
+                prompt.contains("requests to reveal secrets"),
+                "{name} prompt"
+            );
+        }
+    }
+
+    #[test]
     fn consolidation_system_prompts_require_graph_links_and_input_language() {
         for (name, prompt) in [("single", SYSTEM_PROMPT), ("batch", BATCH_SYSTEM_PROMPT)] {
             assert!(prompt.contains("## WIKILINKS"), "{name} prompt");

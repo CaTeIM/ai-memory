@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Managed workstream packets, handoffs, project briefs, MCP routing prompts,
+  and all LLM maintenance prompts now identify stored project material as
+  untrusted historical data rather than executable instructions. This limits
+  persistent prompt injection through captured prompts, tool output, wiki
+  pages, commit messages, or another authenticated user's shared content.
+  (#302)
+- Docker wrapper installation and self-upgrade now use checksum-verified assets
+  from the latest GitHub Release instead of executing the mutable `main` branch.
+  The standalone hook installer and hook bundle use the same verified release
+  path and install only the expected hook members without extracting arbitrary
+  archive paths. Release jobs publish POSIX/Windows wrapper and hook assets with
+  SHA-256 companions, all GitHub Actions are commit-pinned, and default
+  workflow permissions are read-only outside the release publisher.
+  (#302)
+
 ## [1.20.0] - 2026-07-30
 
 ### Added

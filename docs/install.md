@@ -895,13 +895,27 @@ for Grok's (and Zero's) no-stdout SessionStart behavior (Antigravity CLI uses `P
 
 ## Installing hooks without docker
 
-If you only need to use ai-memory *from* a machine (i.e. that
-machine doesn't run the server), the curl installer pulls shell hook
-scripts straight from GitHub for shell-hook agents:
+If you only need to use ai-memory *from* a machine (i.e. that machine doesn't
+run the server), download and verify the release installer. The installer then
+downloads and verifies the release's hook archive before writing any scripts:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/scripts/install-hooks.sh \
-    | bash -s -- --agent claude-code
+installer_base=https://github.com/akitaonrails/ai-memory/releases/latest/download/ai-memory-install-hooks
+installer_tmp="$(mktemp -d)"
+trap 'rm -rf "$installer_tmp"' EXIT
+curl -fsSL "$installer_base" -o "$installer_tmp/ai-memory-install-hooks"
+curl -fsSL "$installer_base.sha256" -o "$installer_tmp/ai-memory-install-hooks.sha256"
+expected="$(awk 'NR == 1 { print $1 }' "$installer_tmp/ai-memory-install-hooks.sha256")"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$installer_tmp/ai-memory-install-hooks" | awk '{ print $1 }')"
+else
+    actual="$(shasum -a 256 "$installer_tmp/ai-memory-install-hooks" | awk '{ print $1 }')"
+fi
+[ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo "installer checksum mismatch" >&2; exit 1; }
+chmod +x "$installer_tmp/ai-memory-install-hooks"
+"$installer_tmp/ai-memory-install-hooks" --agent claude-code
+rm -rf "$installer_tmp"
+trap - EXIT
 
 # Then render the JSON config (still wants `ai-memory` somewhere —
 # either via docker as a one-shot, or installed locally):
@@ -1532,16 +1546,18 @@ one-line warning when a newer image is available. Upgrade with:
 ai-memory upgrade
 ```
 
-The command self-upgrades the wrapper script, pulls the latest Docker
+The command downloads the wrapper and its SHA-256 checksum from the latest
+GitHub Release, refuses an unverified update, pulls the latest Docker
 image, re-stages hook scripts under
 `~/.local/share/ai-memory/hooks/<agent>/` for configured agents, and
 prints how to restart the server container so the new binary is used.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 
-Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check, or
-`AI_MEMORY_WRAPPER_URL=<url>` to pin wrapper self-upgrades to a fork or
-tagged release.
+Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the daily check. To pin wrapper
+self-upgrades to a fork or tagged release, set `AI_MEMORY_WRAPPER_URL=<url>`;
+the wrapper requires `<url>.sha256` unless
+`AI_MEMORY_WRAPPER_SHA256_URL=<checksum-url>` is also set.
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database

@@ -257,9 +257,8 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
             "the `ai-memory` wrapper at ~/.local/bin/ai-memory looks stale \
              (it didn't pass AI_MEMORY_HOST_CWD into the container). Without \
              this, every project would land in `default/work` regardless of \
-             which host dir you ran from. Fix:\n  \
-             curl -fsSL https://raw.githubusercontent.com/akitaonrails/ai-memory/main/bin/ai-memory \\\n    \
-               -o ~/.local/bin/ai-memory && chmod +x ~/.local/bin/ai-memory\n  \
+             which host dir you ran from. Reinstall the checksum-verified \
+             wrapper from the latest GitHub Release as documented in README.md,\n  \
              (or run `ai-memory upgrade` if your existing wrapper is recent enough \
              to know that command)"
         );
