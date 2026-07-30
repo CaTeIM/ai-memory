@@ -385,7 +385,7 @@ impl Wiki {
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
         let links = extract_links(&md.body, &path);
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -403,11 +403,12 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
                 author_id: None,
+                expires_at: meta.expires_at,
             })
             .await?;
         Ok(id)
@@ -473,7 +474,69 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
+        self.delete_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            author_id,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
 
+    /// Delete a page only when `expected_latest_id` is still its latest
+    /// indexed version. Used by retention so a stale expiry candidate cannot
+    /// delete a page that was refreshed after the sweep selected it.
+    ///
+    /// The exclusive mutation guard keeps normal wiki writes out between the
+    /// pre-admission comparison and file quarantine; the writer repeats the
+    /// comparison in the delete transaction as the final authority check.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn delete_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("conditional page delete requires a store reader")
+        })?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        self.delete_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            None,
+            Some(expected_latest_id),
+        )
+        .await
+    }
+
+    async fn delete_page_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        admission_ctx: Option<AdmissionContext>,
+        author_id: Option<ai_memory_core::UserId>,
+        expected_latest_id: Option<PageId>,
+    ) -> WikiResult<bool> {
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
@@ -490,22 +553,28 @@ impl Wiki {
             Err(e) => return Err(crate::WikiError::Io(e)),
         };
 
-        let delete_result = self
-            .writer
-            .delete_page(workspace_id, project_id, path.clone(), author_id)
-            .await;
-        if let Err(e) = delete_result {
-            if let Some(quarantine) = &quarantined
-                && let Err(restore_err) = std::fs::rename(quarantine, &abs)
-            {
-                tracing::error!(
-                    path = %path.as_str(),
-                    quarantine = %quarantine.display(),
-                    error = %restore_err,
-                    "delete_page: DB delete failed and restoring quarantined file also failed"
-                );
+        let delete_result = match expected_latest_id {
+            Some(expected) => {
+                self.writer
+                    .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
+                    .await
             }
-            return Err(e.into());
+            None => self
+                .writer
+                .delete_page(workspace_id, project_id, path.clone(), author_id)
+                .await
+                .map(|()| true),
+        };
+        let deleted = match delete_result {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                restore_quarantined_file(&quarantined, &abs, path);
+                return Err(e.into());
+            }
+        };
+        if !deleted {
+            restore_quarantined_file(&quarantined, &abs, path);
+            return Ok(false);
         }
 
         if let Some(quarantine) = quarantined {
@@ -515,7 +584,7 @@ impl Wiki {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", ctx);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Purge a whole project's wiki directory. When an admission chain is
@@ -775,6 +844,7 @@ impl Wiki {
         let title = self.sanitizer.scrub(&detail.summary.title);
         let links = extract_links(&markdown.body, &path);
         let emitted = emit(&markdown)?;
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
         let page = NewPage {
             workspace_id,
             project_id,
@@ -786,6 +856,7 @@ impl Wiki {
             pinned: is_slot_path(&path),
             links,
             author_id,
+            expires_at,
         };
 
         let result = {
@@ -865,7 +936,7 @@ impl Wiki {
         let links = extract_links(&md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -874,11 +945,11 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
-
+                expires_at: meta.expires_at,
                 author_id: None,
             })
             .await?;
@@ -1144,19 +1215,22 @@ impl Wiki {
             // Build NewPage batch with the precomputed titles.
             let pages: Vec<ai_memory_core::NewPage> = staged_files
                 .iter()
-                .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                    workspace_id: req.workspace_id,
-                    project_id: req.project_id,
-                    path: req.path.clone(),
-                    title: req.title.clone().unwrap_or_default(),
-                    body: req.body.clone(),
-                    tier: req.tier,
-                    frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned,
-                    links: extract_links(&req.body, &req.path),
-                    author_id: req.author_id,
+                .map(|(req, _, _, _)| {
+                    Ok(ai_memory_core::NewPage {
+                        workspace_id: req.workspace_id,
+                        project_id: req.project_id,
+                        path: req.path.clone(),
+                        title: req.title.clone().unwrap_or_default(),
+                        body: req.body.clone(),
+                        tier: req.tier,
+                        frontmatter_json: req.frontmatter.clone(),
+                        pinned: req.pinned,
+                        links: extract_links(&req.body, &req.path),
+                        author_id: req.author_id,
+                        expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
+                    })
                 })
-                .collect();
+                .collect::<WikiResult<Vec<_>>>()?;
 
             // Install files first so the DB is never ahead of markdown. If the
             // SQL batch fails below, rollback restores the prior disk state;
@@ -1278,6 +1352,7 @@ impl Wiki {
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links = extract_links(&markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1313,6 +1388,7 @@ impl Wiki {
                     pinned,
                     links,
                     author_id,
+                    expires_at,
                 })
                 .await
             {
@@ -1419,7 +1495,7 @@ fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
 fn derive_index_metadata(
     path: &PagePath,
     frontmatter: &serde_json::Value,
-) -> WikiResult<(Tier, bool)> {
+) -> WikiResult<IndexMetadata> {
     let tier = match frontmatter.get("tier") {
         None => Tier::Semantic,
         Some(serde_json::Value::String(s)) => s.parse::<Tier>().map_err(|e| {
@@ -1440,7 +1516,65 @@ fn derive_index_metadata(
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-    Ok((tier, pinned))
+    let expires_at = parse_expires_at(path, frontmatter)?;
+    Ok(IndexMetadata {
+        tier,
+        pinned,
+        expires_at,
+    })
+}
+
+/// Index-relevant metadata derived from a page's frontmatter. Markdown
+/// is the source of truth; every field here is rebuildable by a reindex.
+struct IndexMetadata {
+    tier: Tier,
+    pinned: bool,
+    expires_at: Option<jiff::Timestamp>,
+}
+
+/// Parse the frontmatter `expires_at:` key into a TTL instant.
+///
+/// Accepts RFC3339 (`2026-08-01T12:00:00Z`) or a bare `YYYY-MM-DD`,
+/// which means the *end* of that day in UTC — a date-only TTL that
+/// expired at midnight would surprise anyone who wrote "expires
+/// 2026-08-01" meaning "good through the 1st".
+pub(crate) fn parse_expires_at(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Option<jiff::Timestamp>> {
+    let raw = match frontmatter.get("expires_at") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.trim(),
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-string expires_at in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(Some(ts));
+    }
+    if let Ok(date) = raw.parse::<jiff::civil::Date>() {
+        let ts = date
+            .at(23, 59, 59, 999_999_000)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map_err(|e| {
+                ai_memory_wiki_error(&format!(
+                    "invalid expires_at date in frontmatter for {}: {e}",
+                    path.as_str()
+                ))
+            })?
+            .timestamp();
+        return Ok(Some(ts));
+    }
+    Err(ai_memory_wiki_error(&format!(
+        "invalid expires_at in frontmatter for {} (want RFC3339 or YYYY-MM-DD): {raw}",
+        path.as_str()
+    )))
 }
 
 fn canonicalize_index_frontmatter(
@@ -1605,6 +1739,19 @@ fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
     }
 }
 
+fn restore_quarantined_file(quarantined: &Option<PathBuf>, path: &Path, page_path: &PagePath) {
+    if let Some(quarantine) = quarantined
+        && let Err(error) = std::fs::rename(quarantine, path)
+    {
+        tracing::error!(
+            path = %page_path.as_str(),
+            quarantine = %quarantine.display(),
+            %error,
+            "delete_page: conditional/DB delete failed and restoring quarantined file also failed"
+        );
+    }
+}
+
 fn scrub_frontmatter_strings(value: &mut serde_json::Value, sanitizer: &Sanitizer) {
     match value {
         serde_json::Value::String(s) => {
@@ -1683,6 +1830,41 @@ mod tests {
         StageAutoImproveRun, Store,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn expires_at_accepts_rfc3339_and_date_only_utc() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        let rfc3339 = serde_json::json!({"expires_at": "2026-08-01T12:00:00-03:00"});
+        assert_eq!(
+            parse_expires_at(&path, &rfc3339).unwrap().unwrap(),
+            "2026-08-01T15:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
+
+        let date_only = serde_json::json!({"expires_at": "2026-08-01"});
+        assert_eq!(
+            parse_expires_at(&path, &date_only).unwrap().unwrap(),
+            "2026-08-01T23:59:59.999999Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expires_at_fails_closed_for_invalid_values() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({"expires_at": "  "}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": "soon"})).is_err());
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": 7})).is_err());
+    }
 
     #[cfg(windows)]
     fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
@@ -1897,7 +2079,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages_for_project(ws, proj, "proposed body".into(), 10)
+                .search_pages_for_project(ws, proj, "proposed body".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()

@@ -140,6 +140,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             "bag-of-words-v1".into(),
             64,
             5,
+            None,
         )
         .await
         .expect("hybrid search");
@@ -166,6 +167,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             "bag-of-words-v1".into(),
             64,
             5,
+            None,
         )
         .await
         .expect("hybrid (no query vec)");

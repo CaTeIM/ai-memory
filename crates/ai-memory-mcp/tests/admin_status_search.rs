@@ -61,6 +61,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         pinned: false,
         links: Vec::new(),
         author_id: None,
+        expires_at: None,
     };
     store.writer.upsert_page(page).await.unwrap();
 }
@@ -150,6 +151,7 @@ async fn list_projects_returns_workspace_project_pairs() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();

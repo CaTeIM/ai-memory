@@ -760,6 +760,7 @@ async fn start_maintenance_scheduler(
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
+        let wiki = wiki.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -783,10 +784,12 @@ async fn start_maintenance_scheduler(
                 move || {
                     let reader = reader.clone();
                     let writer = writer.clone();
+                    let wiki = wiki.clone();
                     let decay = decay;
                     async move {
                         let started = std::time::Instant::now();
-                        let outcome = run_scheduled_sweep_tick(&reader, &writer, &decay).await?;
+                        let outcome =
+                            run_scheduled_sweep_tick(&reader, &writer, &wiki, &decay).await?;
                         if outcome.errors > 0 {
                             anyhow::bail!(
                                 "scheduled forget sweep had {} scope errors",
@@ -797,6 +800,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
@@ -1007,6 +1011,7 @@ struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    expired: usize,
     hard_deleted: usize,
     errors: usize,
 }
@@ -1014,6 +1019,7 @@ struct ScheduledSweepTickOutcome {
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
+    wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
@@ -1026,6 +1032,7 @@ async fn run_scheduled_sweep_tick(
         match run_sweep(
             reader,
             writer,
+            Some(wiki),
             scope.workspace_id,
             scope.project_id,
             decay,
@@ -1036,6 +1043,7 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.len();
+                outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
             }
             Err(e) => {
@@ -2175,7 +2183,7 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &decay)
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay)
             .await
             .unwrap();
 

@@ -125,7 +125,9 @@ from hook paths.
    to at most once per page per minute, so a burst of overlapping searches
    does not flood the writer actor with redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
-   schedule: pages with `retention < cold_threshold` are soft-deleted;
+   schedule: pages past their frontmatter `expires_at:` TTL are
+   hard-deleted through the wiki layer (file + rows, pin or not);
+   pages with `retention < cold_threshold` are soft-deleted;
    soft-deletions older than `hard_delete_after_days` with no subsequent
    access get purged. Semantic / pinned / freshly-touched pages survive.
    Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
@@ -237,7 +239,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Table | What |
 |---|---|
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. |
-| `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. |
+| `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for opt-in SessionEnd LLM consolidation. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. |
@@ -318,7 +320,7 @@ invariants below.
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_status` | read-only | Counts, paths, version. |
@@ -329,9 +331,9 @@ invariants below.
 | `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the body of the reserved `_prompts/consolidation.md` page (per-project operator guidance, sanitized + ~2000-char cap, injected into the user message so the schema rules stay authoritative); a per-call `instructions` argument overrides the page for one call. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
-| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate something permanent. `scope: "global"` writes into the reserved `_global` preferences scope instead of the current project. |
+| `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
-| `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
+| `memory_forget_sweep` | destructive | Retention pass: soft-delete cold pages, purge aged tombstones, and hard-delete TTL-expired pages through the wiki layer. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
 | `memory_install_self_routing` | read-only | Return the canonical slim routing snippet plus managed Agent Skill payloads and target hints for CLAUDE.md / AGENTS.md installs. |
 

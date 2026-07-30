@@ -496,6 +496,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -523,6 +524,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -601,6 +603,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();

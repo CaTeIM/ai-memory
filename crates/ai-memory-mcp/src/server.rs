@@ -191,7 +191,9 @@ developer, user, and canonical project instructions.\n\
   know where the knowledge lives. Default-scoped calls also return \
   `global_scope_hits` — standing user/team preferences from the \
   reserved `_global` scope; treat them as context that applies to \
-  every project.\n\
+  every project. Expired pages are hidden by default; use \
+  `include_expired=true` only when the user explicitly wants to inspect \
+  expired historical memory.\n\
 - `memory_recent` — at session start, or when the user asks 'what's \
   been going on lately'. Returns the N most-recent pages.\n\
 - `memory_status` — when the user asks 'is ai-memory healthy' or \
@@ -245,7 +247,9 @@ should be proposed from a completed session, or at explicit wrap-up \
   fact is a standing user/team preference that should apply to EVERY \
   project ('always use pnpm', 'never force-push', code style rules), \
   pass `scope: \"global\"` so it lands in the reserved `_global` scope \
-  instead of the current project.\n\
+  instead of the current project. When the user explicitly wants a \
+  time-bounded note, pass `expires_at` as RFC3339 or `YYYY-MM-DD`; the \
+  TTL hides the page after expiry and outranks `pinned`.\n\
 - `memory_read_page` — when the user asks to read, open, or show the \
   full content of a specific page. Accepts a `query` (searches FTS5 and \
   returns the top hit's full body) or a `path` (direct lookup). Pass \
@@ -409,6 +413,10 @@ struct QueryArgs {
     /// workspace + project so you can tell where it came from.
     #[serde(default)]
     global: Option<bool>,
+    /// Also return pages whose `expires_at` TTL has passed (hidden by
+    /// default; they are deleted by the next forget sweep). Default false.
+    #[serde(default)]
+    include_expired: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -781,6 +789,12 @@ struct WritePageArgs {
     /// every project. Cannot be combined with `workspace`/`project`.
     #[serde(default)]
     scope: Option<String>,
+    /// Optional TTL: RFC3339 instant (`2026-09-01T12:00:00Z`) or bare
+    /// date (`2026-09-01` = end of that day, UTC). After this instant
+    /// the page is hidden from search/recent/briefing and hard-deleted
+    /// by the next forget sweep. Omit for pages that never expire.
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 #[tool_router]
@@ -1061,7 +1075,12 @@ impl AiMemoryServer {
         query: &str,
         query_vec: Option<&[f32]>,
         limit: usize,
+        include_expired: bool,
     ) -> ai_memory_store::StoreResult<Vec<PageHit>> {
+        // `i64::MIN` as the expiry cutoff makes every stored TTL pass
+        // the `expires_at > cutoff` guard, i.e. expired pages stay
+        // searchable when the caller opted in.
+        let expiry_cutoff = include_expired.then_some(i64::MIN);
         if let (Some(embedder), Some(qv)) = (&self.embedder, query_vec) {
             return self
                 .reader
@@ -1074,11 +1093,18 @@ impl AiMemoryServer {
                     embedder.model().to_string(),
                     embedder.dim(),
                     limit,
+                    expiry_cutoff,
                 )
                 .await;
         }
         self.reader
-            .search_pages_for_project(workspace_id, project_id, query.to_owned(), limit)
+            .search_pages_for_project(
+                workspace_id,
+                project_id,
+                query.to_owned(),
+                limit,
+                expiry_cutoff,
+            )
             .await
     }
 
@@ -1148,6 +1174,7 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
+        let include_expired = args.include_expired.unwrap_or(false);
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
         // behave as `global=true`. Precedence is strict: an explicit
@@ -1176,7 +1203,11 @@ impl AiMemoryServer {
             }
             let global_hits = self
                 .reader
-                .search_pages_with_meta(args.query.clone(), limit)
+                .search_pages_with_meta(
+                    args.query.clone(),
+                    limit,
+                    include_expired.then_some(i64::MIN),
+                )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             return ok_json(&MemoryQueryResponse {
@@ -1213,7 +1244,14 @@ impl AiMemoryServer {
             let mut hits_by_id: HashMap<PageId, PageHit> = HashMap::new();
             for &(ws, proj) in scopes {
                 let hits = self
-                    .search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
+                    .search_project(
+                        ws,
+                        proj,
+                        &args.query,
+                        query_vec.as_deref(),
+                        limit,
+                        include_expired,
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 for hit in hits {
@@ -1243,8 +1281,15 @@ impl AiMemoryServer {
                     &aps_actor,
                 )
                 .await?;
-            self.search_project(ws, proj, &args.query, query_vec.as_deref(), limit)
-                .await
+            self.search_project(
+                ws,
+                proj,
+                &args.query,
+                query_vec.as_deref(),
+                limit,
+                include_expired,
+            )
+            .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
@@ -1318,6 +1363,7 @@ impl AiMemoryServer {
                                 &args.query,
                                 query_vec.as_deref(),
                                 limit,
+                                include_expired,
                             )
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -1413,6 +1459,7 @@ impl AiMemoryServer {
         let report = run_sweep(
             &self.reader,
             &self.writer,
+            self.wiki.as_ref(),
             ws,
             proj,
             &self.decay_params,
@@ -1851,6 +1898,19 @@ impl AiMemoryServer {
         if args.pinned {
             fm.insert("pinned".into(), serde_json::Value::Bool(true));
         }
+        if let Some(expires_at) = args
+            .expires_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // The wiki layer validates the format on write; landing the
+            // raw string in frontmatter keeps markdown the source of truth.
+            fm.insert(
+                "expires_at".into(),
+                serde_json::Value::String(expires_at.to_string()),
+            );
+        }
         let frontmatter = if fm.is_empty() {
             serde_json::Value::Null
         } else {
@@ -1958,7 +2018,7 @@ impl AiMemoryServer {
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
-                .search_pages_for_project(ws, proj, query.clone(), 1)
+                .search_pages_for_project(ws, proj, query.clone(), 1, None)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             match hits.into_iter().next() {
@@ -2973,6 +3033,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -3388,6 +3449,29 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn prompts_document_time_bounded_pages_and_expired_retrieval() {
+        assert_detailed_prompt_surfaces(|label, prompt| {
+            assert!(
+                prompt.contains("expires_at"),
+                "{label} must document the TTL write argument"
+            );
+            assert!(
+                prompt.contains("include_expired"),
+                "{label} must document explicit expired-page retrieval"
+            );
+            assert!(
+                prompt.contains("TTL") && prompt.contains("pinned"),
+                "{label} must document TTL precedence over pinned"
+            );
+        });
+        assert!(
+            ai_memory_core::SNIPPET_BODY.contains("expires_at"),
+            "the installed base routing snippet must expose time-bounded writes"
+        );
+    }
+
     #[test]
     fn prompts_treat_retrieved_memory_as_actionable_guidance() {
         assert_detailed_prompt_surfaces(|label, prompt| {
@@ -3887,6 +3971,7 @@ mod tests {
                     project: Some("sibling".to_string()),
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts),
             )
@@ -3966,6 +4051,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -3999,6 +4085,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4010,6 +4097,7 @@ mod tests {
             scopes: Vec::new(),
             workspace: workspace.map(str::to_string),
             global: None,
+            include_expired: None,
         };
 
         let result = server
@@ -4060,6 +4148,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4095,6 +4184,7 @@ mod tests {
             project: project.map(str::to_string),
             workspace: None,
             scope: scope.map(str::to_string),
+            expires_at: None,
         };
 
         server
@@ -4183,6 +4273,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4258,6 +4349,7 @@ mod tests {
                     }],
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 test_optional_parts(),
             )
@@ -4350,6 +4442,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        include_expired: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4413,6 +4506,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        include_expired: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4452,6 +4546,7 @@ mod tests {
                     }],
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 test_optional_parts(),
             )
@@ -4490,6 +4585,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4521,6 +4617,7 @@ mod tests {
                         ],
                         workspace: None,
                         global: None,
+                        include_expired: None,
                     }),
                     test_optional_parts(),
                 )
@@ -4568,6 +4665,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4581,6 +4679,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: Some("practice".into()),
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -4779,6 +4878,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4897,6 +4997,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4913,6 +5014,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4929,6 +5031,7 @@ mod tests {
                 pinned: false,
                 links: Vec::new(),
                 author_id: None,
+                expires_at: None,
             })
             .await
             .unwrap();
@@ -4951,6 +5054,7 @@ mod tests {
                     ],
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5006,10 +5110,28 @@ mod tests {
                     pinned: false,
                     links: Vec::new(),
                     author_id: None,
+                    expires_at: None,
                 })
                 .await
                 .unwrap();
         }
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: other,
+                path: PagePath::new("expired.md").unwrap(),
+                title: "expired.md".into(),
+                body: "global_token expired historical context".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"expires_at": "2020-01-01"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: Some("2020-01-01T23:59:59Z".parse().unwrap()),
+            })
+            .await
+            .unwrap();
 
         let result = server
             .memory_query(
@@ -5020,6 +5142,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: Some(true),
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5040,6 +5163,36 @@ mod tests {
             "hit must carry project name: {text}"
         );
         assert!(text.contains("global_hits"), "global hits field: {text}");
+        assert!(
+            !text.contains("expired.md"),
+            "expired global hit must be hidden by default: {text}"
+        );
+
+        let include_expired = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    query: "global_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: Some(true),
+                    include_expired: Some(true),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let include_expired_text = include_expired
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            include_expired_text.contains("expired.md"),
+            "include_expired must apply to global queries: {include_expired_text}"
+        );
     }
 
     #[tokio::test]
@@ -5078,6 +5231,7 @@ mod tests {
                     pinned: false,
                     links: Vec::new(),
                     author_id: None,
+                    expires_at: None,
                 })
                 .await
                 .unwrap();
@@ -5099,6 +5253,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5128,6 +5283,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: Some("ops".into()),
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5161,6 +5317,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: Some(true),
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5355,6 +5512,7 @@ mod tests {
                     pinned: false,
                     links: Vec::new(),
                     author_id: None,
+                    expires_at: None,
                 })
                 .await
                 .unwrap();
@@ -5453,6 +5611,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts),
             )
@@ -5519,6 +5678,7 @@ mod tests {
                     project: None,
                     workspace: Some("default".into()),
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5585,6 +5745,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts),
             )
@@ -5633,6 +5794,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5696,6 +5858,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -5784,6 +5947,7 @@ mod tests {
                     project: None,
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -5876,6 +6040,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("alpha".into()),
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -5893,6 +6058,7 @@ mod tests {
                     project: Some("shared".into()),
                     workspace: Some("beta".into()),
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -5991,6 +6157,7 @@ mod tests {
                     project: Some("other".into()),
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -6613,6 +6780,7 @@ mod tests {
                     project: Some("audited".into()),
                     workspace: None,
                     scope: None,
+                    expires_at: None,
                 }),
                 OptionalParts(parts()),
             )
@@ -6709,6 +6877,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -6740,6 +6909,7 @@ mod tests {
                     scopes: Vec::new(),
                     workspace: None,
                     global: None,
+                    include_expired: None,
                 }),
                 OptionalParts(test_parts_default()),
             )

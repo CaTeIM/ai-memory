@@ -203,6 +203,13 @@ priors are at the [bottom](#influences-and-prior-art).
   auto-synthesised session page (rewritten on consolidation), a
   write-page note is yours: it shows up in `memory_query`, renders in
   `/web`, and stays until you change it.
+- **"Remember this, but only until the sprint ends."** Pass
+  `expires_at` to `memory_write_page` (RFC3339 or `YYYY-MM-DD` = end of
+  that day, UTC) — or put `expires_at:` in a page's frontmatter by
+  hand. Past the TTL the page disappears from search/recent/briefing
+  (pass `include_expired: true` to `memory_query` to still see it) and
+  the next forget sweep hard-deletes the file and its rows. A TTL beats
+  a pin; `memory_lint` warns about pinned+expiring combos.
 - **"This new project has months of history before ai-memory."**
   `cd /path/to/my-project && ai-memory bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and

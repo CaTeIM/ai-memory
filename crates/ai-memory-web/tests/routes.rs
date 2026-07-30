@@ -38,6 +38,7 @@ fn new_page(
         pinned: false,
         links: Vec::new(),
         author_id: None,
+        expires_at: None,
     }
 }
 
@@ -621,6 +622,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -640,6 +642,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             pinned: false,
             links: Vec::new(),
             author_id: None,
+            expires_at: None,
         })
         .await
         .unwrap();

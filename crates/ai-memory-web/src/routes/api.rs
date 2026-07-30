@@ -366,7 +366,13 @@ async fn search_scopes(
     for scope in scopes {
         let hits = state
             .reader
-            .search_pages_for_project(scope.workspace_id, scope.project_id, term.clone(), limit)
+            .search_pages_for_project(
+                scope.workspace_id,
+                scope.project_id,
+                term.clone(),
+                limit,
+                None,
+            )
             .await?;
         for hit in hits {
             hits_by_id

@@ -38,6 +38,10 @@ If a current-project search is empty or thin, do not conclude the knowledge was 
 - If you do not know where it lives, search globally across every project with `global=true`.
 - Do not combine `global=true` with `scopes`, `project`, or `workspace` arguments.
 
+Expired pages are excluded from project, sibling-scope, and global searches by
+default. Pass `include_expired: true` only when the user explicitly asks to
+inspect expired historical memory; do not broaden ordinary recall to stale data.
+
 ## Snippets are not full pages
 
 Search returns snippets, not complete bodies. An empty-looking or short snippet does not prove the page is empty because the match can be outside the snippet window. Fetch the full page when the path or title looks relevant, especially for rules, procedures, decisions, and gotchas.
