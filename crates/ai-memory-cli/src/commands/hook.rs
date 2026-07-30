@@ -1091,15 +1091,21 @@ mod tests {
             "source": "startup"
         });
 
+        // Absolute fake paths so `marker::find_marker`'s walk-up never falls
+        // back to the *real* process cwd (`absolute_normalized` only joins
+        // onto `std::env::current_dir()` for paths that fail to canonicalize
+        // AND are relative). A relative fixture path would leak whatever
+        // `.ai-memory.toml` happens to sit above the real directory `cargo
+        // test` runs from on a given machine.
         let suffix = cwd_query_suffix_with(
             "devin",
             &raw,
             None,
-            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
-            || Some(PathBuf::from("process-project")),
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "/env-project".into()),
+            || Some(PathBuf::from("/process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=env-project");
+        assert_eq!(suffix, "&cwd=%2Fenv-project");
     }
 
     #[test]
@@ -1114,10 +1120,10 @@ mod tests {
             &raw,
             None,
             |_| None,
-            || Some(PathBuf::from("process-project")),
+            || Some(PathBuf::from("/process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=process-project");
+        assert_eq!(suffix, "&cwd=%2Fprocess-project");
     }
 
     #[test]
@@ -1131,37 +1137,37 @@ mod tests {
             "devin",
             &raw,
             None,
-            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
-            || Some(PathBuf::from("process-project")),
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "/env-project".into()),
+            || Some(PathBuf::from("/process-project")),
         );
         let from_process = cwd_query_suffix_with(
             "devin",
             &raw,
             None,
             |_| None,
-            || Some(PathBuf::from("process-project")),
+            || Some(PathBuf::from("/process-project")),
         );
 
-        assert_eq!(from_env, "&cwd=env-project");
-        assert_eq!(from_process, "&cwd=process-project");
+        assert_eq!(from_env, "&cwd=%2Fenv-project");
+        assert_eq!(from_process, "&cwd=%2Fprocess-project");
     }
 
     #[test]
     fn devin_payload_cwd_wins_over_fallbacks() {
         let raw = serde_json::json!({
             "hook_event_name": "PostToolUse",
-            "cwd": "payload-project"
+            "cwd": "/payload-project"
         });
 
         let suffix = cwd_query_suffix_with(
             "devin",
             &raw,
             None,
-            |name| (name == "DEVIN_PROJECT_DIR").then(|| "env-project".into()),
-            || Some(PathBuf::from("process-project")),
+            |name| (name == "DEVIN_PROJECT_DIR").then(|| "/env-project".into()),
+            || Some(PathBuf::from("/process-project")),
         );
 
-        assert_eq!(suffix, "&cwd=payload-project");
+        assert_eq!(suffix, "&cwd=%2Fpayload-project");
     }
 
     #[test]
