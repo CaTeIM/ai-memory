@@ -1265,7 +1265,7 @@ fn configure_consolidator(
 ) -> Result<ConsolidatorSetup> {
     // Validate the reranker setting before the provider early-return, so
     // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
-    // looking enabled while every query runs plain RRF.
+    // looking enabled while eligible queries keep their normal ranking.
     let want_reranker = config.reranker_choice()?;
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
@@ -1316,7 +1316,7 @@ fn configure_consolidator(
         info!(
             provider = llm.name(),
             model = llm.model(),
-            "memory_query reranking enabled (adds LLM latency to every search)",
+            "project/scopes memory_query reranking enabled (adds LLM latency)",
         );
         server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
     }
@@ -2419,6 +2419,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reranker_without_llm_provider_fails_server_setup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let config = Config {
+            reranker: Some("llm".into()),
+            ..Config::default()
+        };
+
+        let result = configure_consolidator(
+            &config,
+            server,
+            &store,
+            &wiki,
+            ws,
+            proj,
+            &ProviderHealth::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("provider-less reranking must fail server setup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

@@ -310,8 +310,7 @@ pub struct SearchExplain {
     pub authority: Option<f64>,
     /// Relevance in `[0, 1]` assigned by the optional post-RRF
     /// reranker. `None` when no reranker is configured, when it
-    /// degraded, or when it skipped this candidate — in which case the
-    /// hit kept its authority-adjusted position.
+    /// degraded, or when the hit fell outside the bounded judged prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,
 }

@@ -35,6 +35,14 @@ log_level = "info"
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
 
+# Optional final LLM relevance pass for project/scopes memory_query calls.
+# Requires an LLM provider and adds at most one provider call per eligible
+# query. The bounded query, page titles, and search snippets are sent to that
+# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
+# the normal ranking. Concurrent provider calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# reranker = "llm"
+
 # M8 retention-sweep parameters.
 #
 # Formula:

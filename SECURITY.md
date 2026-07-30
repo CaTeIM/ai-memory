@@ -78,6 +78,17 @@ what the project is and is not designed to defend against.
   manipulated; operators and agents must verify security-sensitive claims
   against current instructions and the checkout.
 
+- **Search reranking is an outbound-data opt-in.** Setting
+  `AI_MEMORY_RERANKER=llm` sends each eligible live query plus bounded page
+  titles and search snippets to the configured LLM provider. Managed writes use
+  ai-memory's sanitizer, but manually edited wiki files can contain unsanitized
+  text; the live query is bounded but is not sanitized because redaction could
+  change its meaning. JSON encoding, an explicit untrusted-data prompt, strict
+  score validation, a timeout, and a four-call concurrency cap limit control and
+  availability impact, but they do not make a cloud provider private. Leave
+  reranking off or use a local provider when queries or recalled snippets must
+  not leave the server.
+
 - **Published executable integrity.** Docker wrapper and standalone hook
   installs use GitHub Release assets with SHA-256 companions. GitHub Actions
   are pinned to reviewed commits and release jobs default to read-only token
