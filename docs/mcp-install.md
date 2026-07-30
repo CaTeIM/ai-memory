@@ -38,7 +38,7 @@ ignore_paths`; legacy shell/PowerShell and remote-only/Docker script bundles do
 not. Reinstall/refresh an existing hook or plugin to gain it; see
 [Capture exclusions](marker-file.md#capture-exclusions).
 
-Claude Desktop and VS Code Copilot are **MCP-only** here: they expose
+Claude Desktop, VS Code Copilot, and Zed are **MCP-only** here: they expose
 long-term memory to their LLMs via ai-memory's MCP tools
 (`memory_query`, `memory_recent`, `memory_handoff_accept`, etc.), but
 they do not auto-capture session events into ai-memory's `/hook`
@@ -111,7 +111,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -275,6 +275,56 @@ Aliases: `copilot`, `github-copilot`.
 - Sources:
   <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
   <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
+
+---
+
+## Zed
+
+**Status:** MCP supported through Zed's native remote context-server
+configuration. No lifecycle hooks or managed-workstream adapter.
+
+**Config file:** Zed stores MCP servers in its user `settings.json`:
+
+- macOS: `~/.config/zed/settings.json`
+- Linux: `$XDG_CONFIG_HOME/zed/settings.json`, defaulting to
+  `~/.config/zed/settings.json`
+- Windows: `%APPDATA%\Zed\settings.json`
+
+The server map is the top-level `context_servers` key. Remote servers use a
+`url` and may include bearer authentication in `headers`:
+
+```json
+{
+  "context_servers": {
+    "ai-memory": {
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+Print or apply the configuration with:
+
+```bash
+ai-memory install-mcp --client zed
+ai-memory install-mcp --client zed --apply \
+  --server-url "http://homelab:49374/mcp" \
+  --auth-token "$TOKEN"
+```
+
+`--apply` preserves JSONC comments, trailing commas, unrelated Zed settings,
+and other context servers. Zed can call ai-memory's MCP tools, but it does not
+expose compatible session or tool lifecycle hooks. Automatic capture,
+automatic handoff injection, and
+`ai-memory run` continuity are therefore not available; ask the agent to call
+`memory_handoff_begin` before leaving and `memory_handoff_accept` when
+resuming when you need manual continuity.
+
+Sources: <https://zed.dev/docs/ai/mcp>,
+<https://zed.dev/docs/configuring-zed>.
 
 ---
 
