@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- OpenAI-compatible providers now send each structured operation's JSON Schema
+  through `response_format=json_schema` by default, so local models cannot
+  replace consolidation JSON with prose or omit required fields. Explicit
+  structured-output capability rejections fall back to the tolerant parser;
+  other HTTP failures still propagate, and
+  `AI_MEMORY_LLM_COMPAT_STRICT=false` remains the compatibility opt-out. (#292)
 - Recognized Antigravity CLI's native file/edit and search tools, applied path
   exclusions to its `TargetFile` operations, and captured bounded successful
   edit content from `toolCall.args` when the hook omits an output field. Generic
