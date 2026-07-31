@@ -44,14 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to publish a baton to the whole project on purpose; `memory_handoff_accept`
   gains `any_owner: true` for recovery. A NULL owner still means "shared", so
   every stored row and every caller without an authenticated actor behaves
-  exactly as before (#310).
+  exactly as before (#334).
 - Sessions record their operator (migration V40), and the open-session lookup
   behind `GET /admin/open-sessions` is scoped to the caller unless
   `all_owners=true`. `finalize-session` drives off that lookup and acts
   destructively on the result — ending the session, synthesising a page from its
   observations and minting a handoff carrying its raw prompts — so picking "the
   newest open session in the scope" could do all of that to a colleague's live
-  session. The new `--all-owners` flag exposes the server switch (#310).
+  session. The new `--all-owners` flag exposes the server switch (#334).
 - New `GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs` lists a
   project's handoffs, filtered by `state` and scoped by owner, backed by a new
   non-partial index (migration V41) since every pre-existing handoffs index is
@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history. Cross-owner reads are root-only. The metadata is served either way,
   which is what makes the listing useful; a server with no auth configured
   serves the bodies too, since it already serves every page body
-  unauthenticated (#310).
+  unauthenticated (#334).
 - New admission-chain operations `handoff_begin`, `handoff_accept` and
   `handoff_cancel`. Handoffs live in their own table, so their lifecycle never
   passed through `Wiki::write_page` and was invisible to admission webhooks —
@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declined: SessionEnd still writes the summary page, runs the opt-in
   consolidation and commits (a refusal skips the baton and is logged), and a
   refused, timed-out or unreachable claim leaves the handoff open for the next
-  session (#310).
+  session (#334).
 
 ### Fixed
 - Handoff and session ownership is stamped only where the deployment actually
@@ -96,11 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   With nobody to separate, the stamp is the pre-ownership `NULL` and both
   transports agree. Reads are deliberately not gated the same way, so rows
   stamped while a deployment did distinguish operators stay readable by that
-  operator afterwards (#310).
+  operator afterwards (#334).
 - The automatic SessionEnd handoff, the session page and both consolidation
   paths attribute to the operator recorded on the **session**, not to whoever
   delivered the event — a spool drain, a shared hook token or an operator
-  finalizing a stuck session all carry a different identity (#310).
+  finalizing a stuck session all carry a different identity (#334).
 - Briefings and both read-only overviews — workspace and project — scope
   handoffs to the requesting actor instead of showing only unowned ones, and
   `pending_handoff_count` applies the same filter as the fetch — otherwise a
@@ -109,7 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty while the count beside it kept reporting the row. The read-only
   `/api/v1` overview no longer surfaces handoffs that belong to a specific
   operator, including the raw prompt text an automatic handoff is synthesised
-  from, to a browser the server cannot attribute (#310).
+  from, to a browser the server cannot attribute (#334).
 - Retiring superseded automatic handoffs no longer crosses an operator
   boundary. Both sweeps — the same-cwd expiry on a new SessionEnd handoff and
   the post-claim cleanup after an accept — match on the acting handoff's
@@ -117,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot expire another person's pending baton. A shared handoff (no owner) is
   visible to everyone, so it is only ever superseded by another shared one; on
   a single-operator or unauthenticated server every row is unowned and the
-  sweeps behave exactly as they did (#310).
+  sweeps behave exactly as they did (#334).
 - `ops::accept_handoff` propagates whether the claim actually succeeded, so
   `memory_handoff_accept` no longer returns the handoff body when the atomic
   claim was lost — previously two agents could be handed the same baton. The
@@ -125,11 +125,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `memory_handoff_accept` and on `memory_handoff_cancel` (which previously had
   no recovery path at all, so a handoff whose owner no longer matched any
   reachable identity could not be discarded), and `--all-owners` on
-  `ai-memory finalize-session` (#310).
+  `ai-memory finalize-session` (#334).
 - The `[auto_scope] per_actor` active-project map is keyed by the qualified
   identity on both sides — the hook ingress that publishes and the MCP tools
   that read — so a sub-only proxied operator's writes and reads land on the
-  same slot instead of silently missing on every read (#310).
+  same slot instead of silently missing on every read (#334).
 
 ## [1.21.0] - 2026-07-31
 
