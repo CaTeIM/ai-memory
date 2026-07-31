@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a NULL-collapsing unique index, so one operator's pending suggestion stops
   blocking everybody else's for the same page while every unattributed caller
   — single-operator servers, the scheduler, the telemetry report, the curator
-  — keeps the original one-per-page rule unchanged (#310).
+  — keeps the original one-per-page rule unchanged (#336).
 - Page reinforcement is recorded per operator (V43 `page_access`, keyed on the
   identity storage key) beside the untouched shared counter, and the retention
   formula gains an opt-in breadth term: `[decay] breadth_weight` (default
@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinct readers under any weight, so no existing eviction decision moves
   until an operator deliberately turns it on; the per-operator access-bump
   throttle keys on (page, operator) so one reader cannot swallow a
-  colleague's reinforcement inside the cooldown window (#310).
+  colleague's reinforcement inside the cooldown window (#336).
 
 ### Fixed
 - A staged auto-improve proposal colliding with one already pending no longer
@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   staging surface — `memory_auto_improve`, `/admin/auto-improve`, the
   telemetry report, the curator, the CLI and the scheduler's log — names the
   skipped target and the reason instead of silently returning N-1 proposals
-  (#310).
+  (#336).
 
 ## [1.21.0] - 2026-07-31
 
