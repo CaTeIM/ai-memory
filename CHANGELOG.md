@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Trusted-proxy identity: a proxy that terminates SSO can name the real end
+  user by echoing `[auth].actor_proxy_secret` in
+  `X-Memory-Actor-Proxy-Secret` beside the root bearer. Asserted callers drop
+  to the user tier (only the configured `root_username` keeps root), a
+  duplicated actor header is refused with 400 rather than resolved to either
+  value, and headers without the secret are ignored as before. The server
+  refuses to start with a proxy secret but no `root_username`, because no
+  proxied request could ever reach a root-only capability again. Unset — the
+  default — nothing changes (#310).
+- Qualified identity keys: every ownership decision resolves a request to
+  `sub:<subject>` or `user:<name>` via one accessor
+  (`ActorContext::identity_key`), never a bare string, so a username equal to
+  somebody else's OIDC subject can no longer alias their identity. `sub`
+  outranks `user` because OIDC defines it as the stable identifier; the
+  filesystem-safe `path_segment` derivation ships alongside for per-operator
+  wiki paths. `OwnerFilter` / `owner_stamp` carry the read and write sides of
+  the same contract, with "absent = shared" as the compatibility rule
+  (#310).
+- The `/admin/*` route layer and the MCP `memory_forget_sweep` tool now ask
+  "does this deployment distinguish operators" instead of "do `users` rows
+  exist", so a trusted-proxy deployment — which never writes a `users` row —
+  gets root-only admin gating instead of waving every proxied caller through
+  the single-operator escape hatch (#310).
+
 ## [1.21.0] - 2026-07-31
 
 ### Added

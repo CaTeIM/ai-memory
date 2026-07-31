@@ -390,6 +390,17 @@ pub struct AiMemoryServer {
     /// actor with redundant reinforcement writes. Shared across `Clone`s
     /// so every request handler consults the same clock.
     access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
+    /// True when a trusted authenticating proxy is configured to assert end-user
+    /// identities (`[auth].actor_proxy_secret`).
+    ///
+    /// Distinct operators reach this server by two independent routes: rows in
+    /// `users` (rung 2) and proxy-asserted usernames (rung 1b). Only the first
+    /// is visible to `users_exist()`, so the admin gates need this flag too —
+    /// see [`AiMemoryServer::require_admin_capability`]. Static config, set
+    /// once at startup; `false` for stdio and for every deployment that never
+    /// configures a proxy secret, which is what keeps single-operator servers
+    /// on their historical behaviour.
+    trusted_proxy_identity: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -959,8 +970,20 @@ impl AiMemoryServer {
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_identity: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Declare that a trusted proxy may assert end-user identities — mirror of
+    /// `AuthState::with_trusted_proxy`, which is where the secret itself lives.
+    ///
+    /// Without this the admin gates cannot tell a proxied deployment apart from
+    /// a single-operator one; see [`Self::trusted_proxy_identity`].
+    #[must_use]
+    pub fn with_trusted_proxy_identity(mut self, enabled: bool) -> Self {
+        self.trusted_proxy_identity = enabled;
+        self
     }
 
     /// Configure whether auto-improvement requires manual pending-writes approval.
@@ -1827,6 +1850,50 @@ impl AiMemoryServer {
         }
     }
 
+    /// Does this deployment tell its operators apart?
+    ///
+    /// "Several operators" is not the same question as "are there `users` rows".
+    /// A trusted proxy asserts usernames that never get a row, so a deployment
+    /// on that rung would report `users_exist() == false` forever.
+    ///
+    /// One notion, several call sites: the admin gates ask it, so a
+    /// single-operator server behaves exactly as it did before either route
+    /// existed.
+    async fn deployment_distinguishes_operators(&self) -> ai_memory_store::StoreResult<bool> {
+        self.reader
+            .distinguishes_operators(self.trusted_proxy_identity)
+            .await
+    }
+
+    /// Gate an operation behind [`ai_memory_core::Capability::Admin`].
+    ///
+    /// Mirrors the `/admin/*` middleware: operator topology is resolved per
+    /// call rather than cached, so committing a first user immediately tightens
+    /// access without a restart, and a deployment that distinguishes nobody
+    /// keeps its historical single-operator behaviour — see
+    /// [`Self::deployment_distinguishes_operators`].
+    async fn require_admin_capability(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<(), McpError> {
+        // An absent AuthLevel means no auth middleware ran at all — the stdio /
+        // in-process transport, where the caller already has the data directory.
+        // Over HTTP `require_bearer` always inserts a level (rung 0 inserts
+        // Anonymous), so this cannot mask a real unauthenticated request.
+        // Treating "absent" as Anonymous instead would make this tool
+        // permanently unusable over stdio the moment any user row exists.
+        let Some(level) = parts.extensions.get::<ai_memory_core::AuthLevel>().copied() else {
+            return Ok(());
+        };
+        let multi_user_enabled = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        level
+            .authorize(ai_memory_core::Capability::Admin, multi_user_enabled)
+            .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
+    }
+
     /// Run the M8 forget sweep over episodic pages.
     #[tool(description = "Run the retention sweep: walk is_latest=1 \
         episodic pages, score them with the agentmemory-style retention \
@@ -1839,6 +1906,10 @@ impl AiMemoryServer {
         Parameters(args): Parameters<SweepArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // The sweep permanently removes page versions. On a server with real
+        // operators that makes it an admin operation; with nobody to tell
+        // apart this is a no-op, preserving single-user behaviour.
+        self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(

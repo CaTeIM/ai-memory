@@ -87,6 +87,44 @@ fn validate_existing_users_auth(users_exist: bool, auth: &AuthSettings) -> Resul
     }
 }
 
+fn configured(value: Option<&String>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// A trusted proxy that asserts end-user identities needs an operator to be
+/// root.
+///
+/// `require_bearer` downgrades every proxy-named caller to `AuthLevel::User`
+/// unless the asserted username matches `[auth].root_username`. With no root
+/// username configured that comparison can never succeed, so no request through
+/// the proxy — the only ingress such a deployment has — could ever reach a
+/// root-only capability: `/admin/users` would 403, the first DB user could
+/// never be created, and the server would come up permanently locked out of its
+/// own administration. Refuse to start instead of failing later, per request.
+fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
+    if configured(auth.actor_proxy_secret.as_ref()) && !configured(auth.root_username.as_ref()) {
+        anyhow::bail!(
+            "[auth].actor_proxy_secret is set but [auth].root_username is not: every identity the \
+             proxy asserts is downgraded to a non-root user except the configured root operator, \
+             so with no root_username nothing could ever perform a root-only operation (user \
+             management, admin routes). Set [auth].root_username to the operator who administers \
+             this server, or unset [auth].actor_proxy_secret"
+        );
+    }
+    Ok(())
+}
+
+/// Can a trusted proxy actually assert identities on this server?
+///
+/// Both halves are required: the overlay only runs on requests that
+/// authenticated with the root bearer, so a proxy secret without
+/// `[auth].bearer_token` asserts nothing (and only warns, below). The MCP admin
+/// gates read this to know that distinct operators are in play even though a
+/// proxied deployment never writes a `users` row.
+fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
+    configured(auth.actor_proxy_secret.as_ref()) && configured(auth.bearer_token.as_ref())
+}
+
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
@@ -318,6 +356,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     }
 
     validate_existing_users_auth(store.reader.users_exist().await?, &config.auth)?;
+    validate_trusted_proxy_auth(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -417,7 +456,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             &config.auto_improve,
         ))
         .with_active_project(active_project.clone())
-        .with_sanitizer(sanitizer.clone());
+        .with_sanitizer(sanitizer.clone())
+        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth));
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -585,6 +625,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
                 active_project: active_project.clone(),
                 scope_invalidator: Some(scope_invalidator),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -604,6 +645,30 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     email: config.auth.root_email.clone(),
                     ..ai_memory_core::ActorContext::default()
                 });
+            }
+            if let Some(secret) = config
+                .auth
+                .actor_proxy_secret
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                // The overlay is only reachable from the root-bearer rung, so
+                // a proxy secret without a bearer token silently does nothing.
+                // Say so rather than leaving the operator believing per-user
+                // attribution is on.
+                if config
+                    .auth
+                    .bearer_token
+                    .as_deref()
+                    .is_none_or(|token| token.trim().is_empty())
+                {
+                    tracing::warn!(
+                        "[auth].actor_proxy_secret is set but [auth].bearer_token is not; \
+                         trusted-proxy identity is inactive because it only applies to \
+                         requests authenticated with the root bearer token"
+                    );
+                }
+                auth_state = auth_state.with_trusted_proxy(secret.clone());
             }
             if let Some(pepper) = config
                 .auth

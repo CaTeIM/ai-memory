@@ -372,6 +372,20 @@ pub struct AuthSettings {
     /// token resolution even during first-user bootstrap; operational admin
     /// access becomes root-only once a user row exists.
     pub token_pepper: Option<String>,
+    /// Shared secret proving a request came from a trusted authenticating
+    /// proxy, allowing it to name the real end user in `X-Memory-Actor-*`
+    /// headers.
+    ///
+    /// A proxy that terminates SSO usually cannot forward the user's own
+    /// credential upstream — it authenticates with [`Self::bearer_token`] and
+    /// describes the human in headers. Those headers are ignored unless this
+    /// secret is set AND the proxy echoes it in `X-Memory-Actor-Proxy-Secret`,
+    /// because anything able to reach the port could otherwise claim any
+    /// identity. Leave unset (the default) and every proxied caller is
+    /// attributed to [`Self::root_username`], as before.
+    ///
+    /// Only set this when the server is reachable *only* through that proxy.
+    pub actor_proxy_secret: Option<String>,
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active
