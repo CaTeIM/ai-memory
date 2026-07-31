@@ -42,18 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still curate any namespace). What the flag scopes is injection, not access:
   an exact-path read still returns anyone's slot, and with the flag off — the
   default — a nested slot path carries no ownership meaning and every slot
-  reaches every brief exactly as before (#310).
+  reaches every brief exactly as before (#335).
 - A `docker/multiuser-test/` acceptance harness: one server behind an
   SSO-terminating nginx that names three operators (two by username, one by
   OIDC subject alone), driven end to end by `drive.sh` against
   `/handoff?briefing=1` — the surface that carries slot bodies — plus the
-  unproxied port for the header-forgery negatives (#310).
+  unproxied port for the header-forgery negatives (#335).
 
 ### Changed
 - Consolidation outcomes now surface a `skipped_reason` when a page was
   deliberately not written (a high-resistance `slot_kind: invariant` slot, or
   a slot path the per-operator placement rule refuses), instead of silently
-  dropping the update from the result (#310).
+  dropping the update from the result (#335).
 
 ## [1.21.0] - 2026-07-31
 
