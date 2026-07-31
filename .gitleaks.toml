@@ -52,10 +52,3 @@ regexes = [
     '''sk-REPLACE_ME''',
     '''REPLACE_WITH_OUTPUT_OF_GENERATE_AUTH_TOKEN''',
 ]
-
-# Path-based exemptions — kept minimal. tests/e2e/ uses a few canary
-# strings we want to ship intentionally; the regexes above already
-# cover them but excluding the path is cheap defence-in-depth.
-paths = [
-    '''tests/e2e/.*\.sh''',
-]
