@@ -150,7 +150,7 @@ impl Wiki {
     /// the SQL/file fan-out atomic and leaves vector completeness to
     /// admin or scheduled embedding backfill. Without an embedder,
     /// vector search is skipped and `ReaderPool::hybrid_search` uses
-    /// FTS5 + graph expansion.
+    /// FTS5 + entity + graph expansion.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);

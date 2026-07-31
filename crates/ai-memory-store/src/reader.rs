@@ -320,7 +320,7 @@ struct GraphNeighbor {
 /// direction. Part of [`SearchExplain`].
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphVia {
-    /// Path of the FTS/vector seed page the link was followed from.
+    /// Path of the FTS/entity/vector seed page the link was followed from.
     pub seed_path: String,
     /// `outgoing` = seed links to the hit; `incoming` = hit links to
     /// the seed (backlink).

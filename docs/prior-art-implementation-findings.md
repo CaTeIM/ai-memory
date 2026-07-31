@@ -35,7 +35,7 @@ The follow-up implementation landed the pragmatic subset of this roadmap:
 | Links / graph | Markdown and wikilinks are parsed into `links`; unresolved forward links resolve when targets appear; query uses graph-neighbor RRF. |
 | Raw fallback | `observations_fts` provides bounded raw fallback when compiled wiki search misses. |
 | Diagnostics | `status` includes FTS row counts, missing embeddings, embedding triples, and unresolved/stale link counts. |
-| Retrieval evals | Recall harness now covers FTS/vector, graph expansion, and raw fallback. |
+| Retrieval evals | Recall harness now covers FTS/entity/vector, graph expansion, and raw fallback. |
 | Procedural learning | Consolidation can classify procedural memory; auto-improvement creates or patches bounded `procedures/` pages. |
 | SessionEnd consolidation | The deterministic summary/handoff completes before optional provider work enters a durable, retryable queue outside hook latency. |
 

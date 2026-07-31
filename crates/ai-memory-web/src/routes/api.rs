@@ -256,13 +256,14 @@ async fn search_post_handler(
 }
 
 // NOTE (deferred): vector/semantic search. `ReaderPool::hybrid_search` already
-// RRF-fuses FTS5 + cosine over stored embeddings + link-graph expansion, but it
-// needs a query embedding — and `WebState` is read-only (reader + wiki), with no
-// embedder. Wiring true semantic search means injecting an embedding client into
-// `WebState` (touching `lib.rs`/`serve.rs`/`Cargo.toml`) and confirming the
-// embedding provider (Ollama) is reachable from the deployment. Until then this
-// handler stays FTS5-only. Link-graph "related pages" already ship via the
-// page-view `links`/`backlinks` (`ReaderPool::page_links`).
+// RRF-fuses FTS5 + entity matching + cosine over stored embeddings + link-graph
+// expansion, but it needs a query embedding — and `WebState` is read-only
+// (reader + wiki), with no embedder. Wiring true semantic search means injecting
+// an embedding client into `WebState` (touching `lib.rs`/`serve.rs`/`Cargo.toml`)
+// and confirming the embedding provider (Ollama) is reachable from the
+// deployment. Until then this handler stays FTS5-only. Link-graph "related
+// pages" already ship via the page-view `links`/`backlinks`
+// (`ReaderPool::page_links`).
 async fn search_with_request(
     state: &WebState,
     request: SearchRequest,

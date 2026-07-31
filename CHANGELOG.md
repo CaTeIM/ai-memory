@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
+  `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
+  `pages.expires_at` column (V36) and settable through a new optional
+  `expires_at` parameter on `memory_write_page`. Expired pages are hidden
+  from `memory_query`/`memory_recent`/briefing/session-brief surfaces —
+  `memory_query` gains `include_expired: true` to still see them — while
+  exact-path reads still return the page, annotated `expired: true`,
+  because an explicit read is not a search. The forget sweep hard-deletes
+  them through the wiki layer, so the markdown file goes too, not just
+  the rows. An explicit TTL outranks `pinned` (a pin means "don't decay
+  this", not "keep it past the date its author set"); `memory_lint`
+  flags pinned+expiring pages so the combination is visible rather than
+  silent. (#309)
 - Zed editor as an MCP-only client. `install-mcp --client zed` renders,
   and `--apply` idempotently merges, a native remote HTTP entry under the
   top-level `context_servers` map in Zed's platform user `settings.json`,
@@ -60,9 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feedback call; agents treat it as untrusted data. (#318)
 - `memory_query` gained an optional `explain: true` mode for project and
   explicit-scope searches. Each compiled-page hit then includes its 1-based
-  FTS5, vector, and graph ranks; raw BM25/cosine values; graph seed and link
-  direction; per-stream RRF contributions; fused score; and bounded authority
-  multiplier. `streams_active` makes vector degradation visible. Global
+  FTS5, entity, vector, and graph ranks; raw BM25/cosine/entity values; matched
+  entity names; graph seed and link direction; per-stream RRF contributions;
+  fused score; and bounded authority multiplier. `streams_active` makes vector
+  degradation visible. Global
   cross-project search reports its distinct FTS-only stream but does not attach
   RRF details to `global_hits`. Explain provenance is computed only when
   requested. (#317)
@@ -78,6 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TTL-expired standing pages are ignored. (#316)
 
 ### Fixed
+- Zero-embedding startup and current retrieval descriptions now include the
+  entity-match stream, and release notes attribute per-page TTL to the release
+  where it shipped. (#329)
 - Retrieved `_rules/`, `gotchas/`, `procedures/`, and `decisions/` pages are now
   described consistently across MCP and installed skill prompts as untrusted
   historical evidence, removing contradictory language that elevated stored
@@ -126,19 +143,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.20.0] - 2026-07-30
 
 ### Added
-- Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
-  `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
-  `pages.expires_at` column (V36) and settable through a new optional
-  `expires_at` parameter on `memory_write_page`. Expired pages are hidden
-  from `memory_query`/`memory_recent`/briefing/session-brief surfaces —
-  `memory_query` gains `include_expired: true` to still see them — while
-  exact-path reads still return the page, annotated `expired: true`,
-  because an explicit read is not a search. The forget sweep hard-deletes
-  them through the wiki layer, so the markdown file goes too, not just
-  the rows. An explicit TTL outranks `pinned` (a pin means "don't decay
-  this", not "keep it past the date its author set"); `memory_lint`
-  flags pinned+expiring pages so the combination is visible rather than
-  silent ([#309]).
 - New `openai-compat` embedding provider for self-hosted engines
   (Ollama, LM Studio, vLLM). Set
   `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` together with explicit

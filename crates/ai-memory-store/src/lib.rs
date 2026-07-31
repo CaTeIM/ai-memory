@@ -2477,7 +2477,12 @@ mod tests {
                 "rank must equal -(fused * authority): {hit:?} {details:?}"
             );
             assert!(
-                (details.fused - (details.rrf.fts + details.rrf.vector + details.rrf.graph)).abs()
+                (details.fused
+                    - (details.rrf.fts
+                        + details.rrf.entity
+                        + details.rrf.vector
+                        + details.rrf.graph))
+                    .abs()
                     < f64::EPSILON
             );
         }
@@ -5529,6 +5534,13 @@ mod tests {
         assert!(explain.entity_weight.is_some_and(|weight| weight > 0.0));
         assert_eq!(explain.matched_entities, vec!["turbopuffer".to_string()]);
         assert!(explain.rrf.entity > 0.0);
+        assert!(
+            (explain.fused
+                - (explain.rrf.fts + explain.rrf.entity + explain.rrf.vector + explain.rrf.graph))
+                .abs()
+                < f64::EPSILON,
+            "fused score must include the entity stream: {explain:?}",
+        );
         assert!(
             explain.fts_rank.is_none(),
             "the body has no query term, so FTS must miss it",

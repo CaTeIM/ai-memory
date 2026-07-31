@@ -1,6 +1,6 @@
 //! Optional post-retrieval reranking.
 //!
-//! Hybrid RRF fuses independent FTS5, cosine, and graph ranks without
+//! Hybrid RRF fuses independent FTS5, entity, cosine, and graph ranks without
 //! jointly judging the query against each candidate snippet. A reranker
 //! adds that final comparison, which can recover a relevant page below
 //! the caller's requested cut.
