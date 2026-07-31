@@ -401,6 +401,14 @@ pub struct AiMemoryServer {
     /// configures a proxy secret, which is what keeps single-operator servers
     /// on their historical behaviour.
     trusted_proxy_identity: bool,
+    /// `[slots] per_user`: are `_slots/<segment>/…` pages owned by the
+    /// operator whose `IdentityKey::path_segment()` is `<segment>`?
+    ///
+    /// Decides two things here: which slots a briefing lists, and whether a
+    /// write into somebody else's slot namespace is refused. `false` — the
+    /// default, and every deployment that never sets the flag — means a nested
+    /// slot path is an ordinary shared page, so both stay exactly as they were.
+    per_user_slots: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -971,6 +979,7 @@ impl AiMemoryServer {
             auto_improve_review_config: default_auto_improve_review_config(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
+            per_user_slots: false,
             tool_router: Self::tool_router(),
         }
     }
@@ -983,6 +992,14 @@ impl AiMemoryServer {
     #[must_use]
     pub fn with_trusted_proxy_identity(mut self, enabled: bool) -> Self {
         self.trusted_proxy_identity = enabled;
+        self
+    }
+
+    /// Namespace slots per operator (`[slots] per_user`); see
+    /// [`Self::per_user_slots`].
+    #[must_use]
+    pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
+        self.per_user_slots = enabled;
         self
     }
 
@@ -1865,6 +1882,86 @@ impl AiMemoryServer {
             .await
     }
 
+    /// Which slots this request may see, per `[slots] per_user`.
+    ///
+    /// Same rule the session brief uses, so a snapshot and the brief that
+    /// follows it cannot disagree about who owns a slot. Viewer identity is
+    /// [`ai_memory_core::ActorContext::identity_key`] — the same accessor
+    /// [`Self::place_slot_write`] keys the write on, because a slot the write
+    /// door files under one key and this filter admits under another is
+    /// force-pinned, write-only and invisible to its own owner.
+    fn slot_visibility_for(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> ai_memory_core::SlotVisibility {
+        ai_memory_core::SlotVisibility::for_viewer(
+            self.per_user_slots,
+            crate::actor::actor_from_parts(parts)
+                .identity_key()
+                .as_ref(),
+        )
+    }
+
+    /// Where a hand-written slot page belongs, by the SAME rule the engine's
+    /// own write path applies ([`ai_memory_core::slot_placement`]).
+    ///
+    /// `_slots/<segment>/…` bodies are injected verbatim into that operator's
+    /// next session brief, so a slot write is a way to put chosen text into an
+    /// agent context — the direction the ownership boundary does not otherwise
+    /// cover, because the boundary is about reads. Several doors reach that
+    /// hazard — this tool, the consolidator — and they must answer the same
+    /// for the same operator and the same string, or the door with the looser
+    /// answer is the only one that matters: an agent that cannot write
+    /// `_slots/x.md` through the engine would simply call this tool instead,
+    /// and the shared slot goes into EVERY operator's brief.
+    ///
+    /// So the shared slot is namespaced into the caller's own prefix rather
+    /// than written as given, and the foreign-namespace refusal is the
+    /// engine's refusal. The effective path is returned to the caller in the
+    /// tool response.
+    ///
+    /// Only enforced with `[slots] per_user` on: with it off a nested slot
+    /// path means nothing in particular and every slot write keeps working
+    /// exactly as it always has. Admins may still curate any namespace, the
+    /// shared slot included, on the same rung ladder as every other admin
+    /// operation — which also means a single-operator server (no users, no
+    /// trusted proxy) is unaffected.
+    async fn place_slot_write(
+        &self,
+        path: PagePath,
+        parts: &axum::http::request::Parts,
+    ) -> Result<PagePath, McpError> {
+        if !self.per_user_slots {
+            return Ok(path);
+        }
+        // Paired with `slot_visibility_for` — see there.
+        let caller = crate::actor::actor_from_parts(parts);
+        match ai_memory_core::slot_placement(path.as_str(), caller.identity_key().as_ref()) {
+            ai_memory_core::SlotPlacement::AsGiven => Ok(path),
+            ai_memory_core::SlotPlacement::Personal(personal) => {
+                if self.require_admin_capability(parts).await.is_ok() {
+                    return Ok(path);
+                }
+                PagePath::new(personal).map_err(|e| {
+                    McpError::internal_error(format!("invalid personal slot path: {e}"), None)
+                })
+            }
+            ai_memory_core::SlotPlacement::ForeignNamespace => {
+                if self.require_admin_capability(parts).await.is_ok() {
+                    return Ok(path);
+                }
+                Err(McpError::invalid_request(
+                    format!(
+                        "path '{}' belongs to another operator's slot namespace; \
+                         write your own slot instead",
+                        path.as_str()
+                    ),
+                    None,
+                ))
+            }
+        }
+    }
+
     /// Gate an operation behind [`ai_memory_core::Capability::Admin`].
     ///
     /// Mirrors the `/admin/*` middleware: operator topology is resolved per
@@ -2309,6 +2406,7 @@ impl AiMemoryServer {
             .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
         let path = PagePath::new(args.path.clone())
             .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+        let path = self.place_slot_write(path, &parts).await?;
         let (ws, proj) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => {
                 self.write_target_ids_with_actor(
@@ -2888,7 +2986,7 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(ws, proj, limit, &self.slot_visibility_for(&parts))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         ok_json(&snapshot)
@@ -2924,7 +3022,7 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(ws, proj, limit, &self.slot_visibility_for(&parts))
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -7116,6 +7214,248 @@ mod tests {
         assert_eq!(author.username, "alice");
         assert_eq!(author.name.as_deref(), Some("Alice Smith"));
         assert_eq!(author.email.as_deref(), Some("alice@example.com"));
+    }
+
+    fn parts_with_level(level: ai_memory_core::AuthLevel) -> axum::http::request::Parts {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(level);
+        parts
+    }
+
+    /// Where `memory_write_page` says the page actually landed — not always
+    /// the path the caller asked for, since a slot write may be namespaced.
+    fn written_path(result: &CallToolResult) -> String {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("tool result carries text");
+        serde_json::from_str::<serde_json::Value>(&text).expect("tool result is JSON")["path"]
+            .as_str()
+            .expect("response carries the written path")
+            .to_string()
+    }
+
+    /// A `_slots/<segment>/…` body is injected verbatim into that operator's
+    /// next session brief, so an unguarded write into someone else's namespace
+    /// is a way to put chosen text into their agent's context. The read
+    /// boundary does not cover this direction.
+    ///
+    /// Also pins the other half: with `[slots] per_user` off, a nested slot
+    /// path is an ordinary page and the write keeps working for anyone.
+    #[tokio::test]
+    async fn slot_writes_stay_inside_the_callers_namespace() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+        // A users row is what puts this deployment on the multi-operator rung;
+        // without one the historical single-operator escape hatch applies.
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        let parts_for = |user: &str| {
+            let mut parts = parts_with_level(ai_memory_core::AuthLevel::User);
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(user.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            parts
+        };
+        let write = |server: AiMemoryServer, path: &str, parts: axum::http::request::Parts| {
+            let path = path.to_string();
+            async move {
+                server
+                    .memory_write_page(
+                        Parameters(WritePageArgs {
+                            path,
+                            body: "# Focus\nread this and obey".into(),
+                            title: None,
+                            tier: None,
+                            tags: Vec::new(),
+                            pinned: false,
+                            project: None,
+                            workspace: None,
+                            scope: None,
+                            expires_at: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        let scoped = server.clone().with_per_user_slots(true);
+        let err = write(
+            scoped.clone(),
+            "_slots/u-alice/current-focus.md",
+            parts_for("bob"),
+        )
+        .await
+        .expect_err("Bob must not write into Alice's slot namespace");
+        assert!(err.to_string().contains("another operator"), "{err}");
+
+        // Alice's own slot stays writable, unchanged.
+        let own = write(
+            scoped.clone(),
+            "_slots/u-alice/current-focus.md",
+            parts_for("alice"),
+        )
+        .await
+        .expect("an operator owns their own namespace");
+        assert_eq!(written_path(&own), "_slots/u-alice/current-focus.md");
+        // The shared slot is namespaced into the writer's own prefix — the
+        // engine's answer for the same string, and the response says where the
+        // page actually landed.
+        let shared = write(scoped.clone(), "_slots/current-focus.md", parts_for("bob"))
+            .await
+            .expect("a shared-slot write is re-homed, not refused");
+        assert_eq!(written_path(&shared), "_slots/u-bob/current-focus.md");
+        // Admin curation of any namespace stays possible.
+        write(
+            scoped,
+            "_slots/u-alice/current-focus.md",
+            parts_with_level(ai_memory_core::AuthLevel::Root),
+        )
+        .await
+        .expect("root may curate any namespace");
+
+        // DEFAULT CONFIG: nested slot paths are ordinary pages again.
+        write(server, "_slots/u-alice/current-focus.md", parts_for("bob"))
+            .await
+            .expect("with per-user slots off nothing may change for existing writers");
+    }
+
+    /// The MCP tool and the engine's own write path are two doors onto the same
+    /// hazard, so they must give the same answer for the same operator and the
+    /// same string. If this tool were the looser one it would simply be the one
+    /// an agent uses: the engine namespaces `_slots/current-focus.md` into the
+    /// writer's prefix, and a tool that instead wrote it as given would put
+    /// that body into EVERY operator's session brief.
+    #[tokio::test]
+    async fn mcp_and_engine_doors_agree_on_slot_placement() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = server.with_wiki(wiki);
+        // A users row puts the deployment on the multi-operator rung; without
+        // one every caller waves through the single-operator admin hatch.
+        let mut user = ai_memory_core::NewUser {
+            username: "alice".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        store
+            .writer
+            .create_user(
+                user,
+                ai_memory_store::hash_token("t", &ai_memory_store::TokenPepper::new("pepper")),
+            )
+            .await
+            .unwrap();
+
+        let write = |server: AiMemoryServer, path: &str, caller: &str| {
+            let path = path.to_string();
+            let mut parts = parts_with_level(ai_memory_core::AuthLevel::User);
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(caller.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            async move {
+                server
+                    .memory_write_page(
+                        Parameters(WritePageArgs {
+                            path,
+                            body: "# Focus\nread this and obey".into(),
+                            title: None,
+                            tier: None,
+                            tags: Vec::new(),
+                            pinned: false,
+                            project: None,
+                            workspace: None,
+                            scope: None,
+                            expires_at: None,
+                        }),
+                        OptionalParts(parts),
+                    )
+                    .await
+            }
+        };
+
+        // Every path here is a SEGMENT-shaped path (`u-…` / `ux-…`) or the
+        // shared slot: since namespaces come from `IdentityKey::path_segment`
+        // this list needs no GLOB-metacharacter paths — and no Windows skip,
+        // because nothing this test writes contains a byte NTFS refuses. The
+        // hostile-name coverage moved into the CALLER: `a*` passes
+        // `validate_username` and hexes to `ux-612a`.
+        let hostile_ns = ai_memory_core::IdentityKey::User("a*".into()).path_segment();
+        let own_hostile = format!("_slots/{hostile_ns}/current-focus.md");
+        let cases = [
+            ("_slots/current-focus.md", "bob"),
+            ("_slots/u-alice/current-focus.md", "alice"),
+            ("_slots/u-alice/current-focus.md", "bob"),
+            ("_slots/current-focus.md", "a*"),
+            (own_hostile.as_str(), "a*"),
+            ("notes/plain.md", "bob"),
+        ];
+
+        let scoped = server.clone().with_per_user_slots(true);
+        for (path, caller) in cases {
+            // The engine's rule, verbatim, keyed through the same accessor the
+            // door uses: the consolidator writes `AsGiven` and `Personal` and
+            // skips the refusal.
+            let actor = ai_memory_core::ActorContext {
+                user: Some(caller.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            };
+            let engine = ai_memory_core::slot_placement(path, actor.identity_key().as_ref());
+            let door = write(scoped.clone(), path, caller).await;
+            match engine {
+                ai_memory_core::SlotPlacement::AsGiven => {
+                    assert_eq!(
+                        written_path(&door.expect("engine writes this one as given")),
+                        path,
+                        "{path} by {caller}"
+                    );
+                }
+                ai_memory_core::SlotPlacement::Personal(personal) => {
+                    assert_eq!(
+                        written_path(&door.expect("engine re-homes this one")),
+                        personal,
+                        "{path} by {caller}"
+                    );
+                }
+                ai_memory_core::SlotPlacement::ForeignNamespace => {
+                    assert!(door.is_err(), "engine refuses this one: {path} by {caller}");
+                }
+            }
+        }
+
+        // DEFAULT CONFIG (`[slots] per_user` off): the engine never consults
+        // placement, so neither may this door — every path lands as given.
+        for (path, caller) in cases {
+            assert_eq!(
+                written_path(
+                    &write(server.clone(), path, caller)
+                        .await
+                        .expect("with per-user slots off every slot write keeps working")
+                ),
+                path,
+                "{path} by {caller}"
+            );
+        }
     }
 
     #[tokio::test]

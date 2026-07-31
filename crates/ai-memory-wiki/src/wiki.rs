@@ -75,6 +75,14 @@ pub struct Wiki {
     /// the directory rename and SQLite re-stamp so stale writes cannot land
     /// files under the old workspace while the project is in flight.
     mutation_lock: Arc<RwLock<()>>,
+    /// `[slots] per_user`: are `_slots/<segment>/…` pages owned by the
+    /// operator whose `IdentityKey::path_segment()` is `<segment>`?
+    ///
+    /// Off unless the server enables it, and off is the pre-feature rule: a
+    /// nested slot path carries no ownership meaning and every slot write
+    /// lands exactly where it always did. Set via
+    /// [`Wiki::with_per_user_slots`].
+    per_user_slots: bool,
 }
 
 impl Wiki {
@@ -97,6 +105,7 @@ impl Wiki {
             admission_chain: None,
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
+            per_user_slots: false,
         })
     }
 
@@ -126,6 +135,27 @@ impl Wiki {
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
         self
+    }
+
+    /// Namespace slot pages per operator (`[slots] per_user`); see
+    /// [`Self::per_user_slots`].
+    #[must_use]
+    pub fn with_per_user_slots(mut self, enabled: bool) -> Self {
+        self.per_user_slots = enabled;
+        self
+    }
+
+    /// Is `[slots] per_user` on?
+    ///
+    /// Exposed so the doors that write slot pages through a `Wiki` — the
+    /// auto-improve approval path builds its own `NewPage` and reaches
+    /// neither `write_page` nor `apply_batch` — decide slot destinations from
+    /// the same flag the MCP server and the consolidator enforce. A second
+    /// copy of the flag threaded through their own state would be a second
+    /// thing to forget to wire up.
+    #[must_use]
+    pub fn per_user_slots(&self) -> bool {
+        self.per_user_slots
     }
 
     /// Replace the default built-in-only sanitizer with one carrying

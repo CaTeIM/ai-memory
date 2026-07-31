@@ -385,6 +385,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .context("compiling sanitizer.extra_patterns from config")?;
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())?
         .with_sanitizer(sanitizer.clone())
+        // Same switch the MCP server and the consolidator get: the wiki has a
+        // slot writer of its own (auto-improve approval), and a feature that
+        // holds at two of three doors holds nowhere.
+        .with_per_user_slots(config.slots.per_user)
         // Reader attached unconditionally: admission name-resolution uses it
         // when a chain is configured, and the startup scope-manifest backfill
         // (below) always needs it to enumerate scopes.
@@ -457,7 +461,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         ))
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone())
-        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth));
+        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
+        .with_per_user_slots(config.slots.per_user);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -579,6 +584,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 capture_assistant_enabled: config.capture_assistant,
+                per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
                     ai_memory_hooks::SubagentSessionSet::default(),
                 )),
@@ -1366,14 +1372,17 @@ fn configure_consolidator(
         model = llm.model(),
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let consolidator = Arc::new(Consolidator::new(
-        store.reader.clone(),
-        store.writer.clone(),
-        wiki.clone(),
-        llm.clone(),
-        workspace_id,
-        project_id,
-    ));
+    let consolidator = Arc::new(
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            workspace_id,
+            project_id,
+        )
+        .with_per_user_slots(config.slots.per_user),
+    );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
     // Optional post-RRF reranking rides on the same provider, so it is
     // only reachable once an LLM is configured at all. Off unless the

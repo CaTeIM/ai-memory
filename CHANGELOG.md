@@ -31,6 +31,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exist", so a trusted-proxy deployment — which never writes a `users` row —
   gets root-only admin gating instead of waving every proxied caller through
   the single-operator escape hatch (#333).
+- Per-operator memory slots behind `[slots] per_user` (default off): with the
+  flag on, engine-written slots are namespaced under the writing operator's
+  `IdentityKey::path_segment()` (`_slots/u-alice/…`, `_slots/s-<sub>/…` —
+  never a raw name, so a path-hostile OIDC subject hex-encodes instead of
+  failing), session briefs and consolidation prompts carry the shared slots
+  plus the requesting operator's own — pointer lists included — and writing
+  into another operator's namespace is refused at both the MCP
+  `memory_write_page` door and the consolidator's own write path (admins may
+  still curate any namespace). What the flag scopes is injection, not access:
+  an exact-path read still returns anyone's slot, and with the flag off — the
+  default — a nested slot path carries no ownership meaning and every slot
+  reaches every brief exactly as before (#310).
+- A `docker/multiuser-test/` acceptance harness: one server behind an
+  SSO-terminating nginx that names three operators (two by username, one by
+  OIDC subject alone), driven end to end by `drive.sh` against
+  `/handoff?briefing=1` — the surface that carries slot bodies — plus the
+  unproxied port for the header-forgery negatives (#310).
+
+### Changed
+- Consolidation outcomes now surface a `skipped_reason` when a page was
+  deliberately not written (a high-resistance `slot_kind: invariant` slot, or
+  a slot path the per-operator placement rule refuses), instead of silently
+  dropping the update from the result (#310).
 
 ## [1.21.0] - 2026-07-31
 

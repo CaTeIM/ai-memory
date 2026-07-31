@@ -1721,7 +1721,7 @@ mod tests {
 
         let (core, recent) = store
             .reader
-            .session_brief_pages(ws, proj, 24, 10)
+            .session_brief_pages(ws, proj, 24, 10, ai_memory_core::SlotVisibility::default())
             .await
             .unwrap();
 
@@ -1802,12 +1802,16 @@ mod tests {
         assert_eq!(edges[0].to_project, "infra");
 
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
-        let app_brief = store.reader.briefing_for_project(ws, app, 5).await.unwrap();
+        let app_brief = store
+            .reader
+            .briefing_for_project(ws, app, 5, &ai_memory_core::SlotVisibility::default())
+            .await
+            .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5)
+            .briefing_for_project(ws, infra, 5, &ai_memory_core::SlotVisibility::default())
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -3733,18 +3737,25 @@ mod tests {
             "explicit kind must win"
         );
 
-        assert_briefing_kinds(&store.reader.briefing(100).await.unwrap().recent_pages);
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100)
+                .briefing(100, &ai_memory_core::SlotVisibility::default())
+                .await
+                .unwrap()
+                .recent_pages,
+        );
+        assert_briefing_kinds(
+            &store
+                .reader
+                .briefing_for_workspace(ws, 100, &ai_memory_core::SlotVisibility::default())
                 .await
                 .unwrap()
                 .recent_pages,
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100)
+            .briefing_for_project(ws, proj, 100, &ai_memory_core::SlotVisibility::default())
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -3752,7 +3763,13 @@ mod tests {
         assert_eq!(project_briefing.slots[0].kind, "slot");
         let (_, session_recent) = store
             .reader
-            .session_brief_pages(ws, proj, 100, 100)
+            .session_brief_pages(
+                ws,
+                proj,
+                100,
+                100,
+                ai_memory_core::SlotVisibility::default(),
+            )
             .await
             .unwrap();
         assert_briefing_kinds(&session_recent);

@@ -2996,11 +2996,24 @@ impl ReaderPool {
     /// small number (5-20) — this is meant to be skimmed, not paged
     /// through.
     ///
+    /// `slot_visibility` decides which `_slots/…` pages the snapshot lists;
+    /// the default rule lists every one of them, as it always did.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_lines)]
-    pub async fn briefing(&self, recent_pages_limit: usize) -> StoreResult<BriefingSnapshot> {
+    pub async fn briefing(
+        &self,
+        recent_pages_limit: usize,
+        slot_visibility: &ai_memory_core::SlotVisibility,
+    ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // The slot GLOB is the only OPTIONAL bind in these statements, so it
+        // goes LAST in every one of them: a fixed parameter placed after it
+        // would shift by one whenever the visibility rule needs no pattern —
+        // an InvalidParameterCount at runtime the compiler cannot see.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 2);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 3);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3052,12 +3065,21 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?1"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![now_us], briefing_page_from_row)?
+            // A slot must clear BOTH gates: unexpired, and visible to this
+            // operator. The two rules are independent — an expired slot of
+            // your own is still gone, a live slot of somebody else's is still
+            // not yours.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => {
+                    slots_stmt.query_map(params![now_us, glob], briefing_page_from_row)?
+                }
+                None => slots_stmt.query_map(params![now_us], briefing_page_from_row)?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3066,13 +3088,19 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE is_latest = 1{not_expired} \
+                 WHERE is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?1",
                 not_expired = not_expired("pages", "?2"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![recent_limit, now_us], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt
+                    .query_map(params![recent_limit, now_us, glob], briefing_page_from_row)?,
+                None => {
+                    recent_stmt.query_map(params![recent_limit, now_us], briefing_page_from_row)?
+                }
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3095,6 +3123,11 @@ impl ReaderPool {
 
     /// Assemble a project-scoped [`BriefingSnapshot`].
     ///
+    /// `slot_visibility` decides which `_slots/…` pages the snapshot lists.
+    /// Callers that feed a per-operator surface — a session brief, an LLM
+    /// prompt — must pass the rule for that operator; the default lists every
+    /// slot, as it always did.
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     #[allow(clippy::too_many_lines)]
@@ -3103,8 +3136,12 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         recent_pages_limit: usize,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Glob last, after the expiry cutoff: see `briefing`.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 4);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3179,12 +3216,27 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?3"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), now_us], briefing_page_from_row)?
+            // Unexpired AND visible to this operator — independent gates.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => slots_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        now_us,
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => slots_stmt.query_map(
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), now_us],
+                    briefing_page_from_row,
+                )?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3193,13 +3245,34 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes(), recent_limit, now_us], briefing_page_from_row)?
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us,
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us
+                    ],
+                    briefing_page_from_row,
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3241,40 +3314,79 @@ impl ReaderPool {
         project_id: ProjectId,
         core_pages_limit: usize,
         recent_pages_limit: usize,
+        slots: ai_memory_core::SlotVisibility,
     ) -> StoreResult<(Vec<BriefPageBody>, Vec<BriefingPage>)> {
         let core_limit = core_pages_limit.clamp(1, 100) as i64;
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Slots namespaced under `_slots/<segment>/` belong to that operator
+        // once `[slots] per_user` is on; an unprefixed slot is shared and stays
+        // visible to everyone. With the feature off nothing is filtered at all
+        // — see `slot_visibility_sql`.
+        //
+        // The `pinned = 1` arm has to exclude slots explicitly: every write
+        // path force-pins slot pages, so filtering only the `_slots/*` arm
+        // would change nothing — the personal slots would come straight back
+        // through `pinned`. The slot arm then puts back exactly what the
+        // visibility rule admits, which for the default rule is every slot.
+        //
+        // Both statements bind the expiry cutoff at ?4 and put the optional
+        // glob last, at ?5: the glob disappears from the SQL entirely when the
+        // visibility rule needs no pattern, so a fixed parameter after it would
+        // silently shift by one.
+        let (slot_sql, mine) = slot_visibility_sql(&slots, 5);
+        // The `recent` pointer list below is a separate statement with its own
+        // parameter numbering, so its glob is ?5 there too.
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(&slots, 5);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let core_sql = format!(
                 "SELECT path, title, body, pinned, updated_at \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
-                   AND (pinned = 1 OR path GLOB '_rules/*' OR path GLOB '_slots/*') \
+                   AND ( \
+                         path GLOB '_rules/*' \
+                      OR (pinned = 1 AND path NOT GLOB '_slots/*') \
+                      OR ({slot_sql}) \
+                   ) \
                  ORDER BY pinned DESC, path ASC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             );
             let mut core_stmt = conn.prepare_cached(&core_sql)?;
-            let core: Vec<BriefPageBody> = core_stmt
-                .query_map(
+            // The `?5` placeholder only exists when there is a viewer to match,
+            // so the bindings branch with it.
+            let core_row = |row: &rusqlite::Row<'_>| {
+                let updated_us: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    updated_us,
+                ))
+            };
+            let core_rows = match mine.as_deref() {
+                Some(mine) => core_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        core_limit,
+                        now_us(),
+                        mine
+                    ],
+                    core_row,
+                )?,
+                None => core_stmt.query_map(
                     params![
                         workspace_id.as_bytes(),
                         project_id.as_bytes(),
                         core_limit,
                         now_us()
                     ],
-                    |row| {
-                        let updated_us: i64 = row.get(4)?;
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)? != 0,
-                            updated_us,
-                        ))
-                    },
-                )?
+                    core_row,
+                )?,
+            };
+            let core: Vec<BriefPageBody> = core_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(|(path, title, body, pinned, updated_us)| {
@@ -3298,13 +3410,24 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
+                   AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?3",
                 not_expired = not_expired("pages", "?4"),
             ))?;
-            let recent: Vec<BriefingPage> = recent_stmt
-                .query_map(
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        recent_limit,
+                        now_us(),
+                        glob
+                    ],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
                     params![
                         workspace_id.as_bytes(),
                         project_id.as_bytes(),
@@ -3312,7 +3435,9 @@ impl ReaderPool {
                         now_us()
                     ],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let recent: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3403,7 +3528,8 @@ impl ReaderPool {
     /// workspace.
     ///
     /// Mirrors [`ReaderPool::briefing_for_project`] but scopes every query
-    /// to the workspace only (no `project_id` filter).
+    /// to the workspace only (no `project_id` filter), including the same
+    /// `slot_visibility` rule.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3411,8 +3537,12 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         recent_pages_limit: usize,
+        slot_visibility: &ai_memory_core::SlotVisibility,
     ) -> StoreResult<BriefingSnapshot> {
         let recent_limit = recent_pages_limit.clamp(1, 100) as i64;
+        // Glob last, after the expiry cutoff: see `briefing`.
+        let (slot_sql, slot_glob) = slot_visibility_sql(slot_visibility, 3);
+        let (recent_slot_sql, recent_glob) = slot_exclusion_sql(slot_visibility, 4);
         self.with_conn(move |conn| {
             let kind_expr = page_kind_expr("path", "frontmatter_json");
             let now_us = jiff::Timestamp::now().as_microsecond();
@@ -3485,15 +3615,22 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                  WHERE workspace_id = ?1 AND is_latest = 1 AND path GLOB '_slots/*'{not_expired} \
+                  WHERE workspace_id = ?1 AND is_latest = 1 AND ({slot_sql}){not_expired} \
                   ORDER BY path ASC",
                 not_expired = not_expired("pages", "?2"),
             ))?;
-            let slots: Vec<BriefingPage> = slots_stmt
-                .query_map(
+            // Unexpired AND visible to this operator — independent gates.
+            let slot_rows = match slot_glob.as_deref() {
+                Some(glob) => slots_stmt.query_map(
+                    params![workspace_id.as_bytes(), now_us, glob],
+                    briefing_page_from_row,
+                )?,
+                None => slots_stmt.query_map(
                     params![workspace_id.as_bytes(), now_us],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let slots: Vec<BriefingPage> = slot_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3502,16 +3639,22 @@ impl ReaderPool {
                 "SELECT path, title, {kind_expr} AS kind, \
                         updated_at \
                  FROM pages \
-                 WHERE workspace_id = ?1 AND is_latest = 1{not_expired} \
+                 WHERE workspace_id = ?1 AND is_latest = 1 AND ({recent_slot_sql}){not_expired} \
                  ORDER BY updated_at DESC \
                  LIMIT ?2",
                 not_expired = not_expired("pages", "?3"),
             ))?;
-            let recent_pages: Vec<BriefingPage> = recent_stmt
-                .query_map(
+            let recent_rows = match recent_glob.as_deref() {
+                Some(glob) => recent_stmt.query_map(
+                    params![workspace_id.as_bytes(), recent_limit, now_us, glob],
+                    briefing_page_from_row,
+                )?,
+                None => recent_stmt.query_map(
                     params![workspace_id.as_bytes(), recent_limit, now_us],
                     briefing_page_from_row,
-                )?
+                )?,
+            };
+            let recent_pages: Vec<BriefingPage> = recent_rows
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
@@ -5816,6 +5959,77 @@ pub(crate) fn cwd_within(ancestor: &str, descendant: &str) -> bool {
     // Byte-prefix plus a `/` boundary right after it. `starts_with` is
     // byte-exact and `/` is ASCII, so this is UTF-8 safe.
     d.starts_with(a.as_ref()) && d.as_bytes().get(a.len()) == Some(&b'/')
+}
+
+/// SQL predicate selecting the slot pages `visibility` admits over a `path`
+/// column, plus the `GLOB` pattern it expects bound at `?{param_index}` — the
+/// first free positional parameter of the statement it is spliced into.
+///
+/// One rule, one implementation: the session brief and every briefing snapshot
+/// go through this, so a viewer predicate cannot be right on one read path and
+/// missing on the next. Note what [`ai_memory_core::SlotVisibility::All`]
+/// produces — the bare pre-feature pattern, with no nesting exclusion —
+/// because with `[slots] per_user` off a page like `_slots/backend/context.md`
+/// is an ordinary shared slot that a brief must keep showing.
+///
+/// The viewer pattern is built from `own_namespace()`, which is an
+/// `IdentityKey::path_segment()`: `[A-Za-z0-9._-]` by construction (hostile
+/// values hex-encode), so no GLOB metacharacter can appear in it and the
+/// pattern needs no escaping. It is still BOUND rather than interpolated —
+/// parameters are the norm here, and binding costs nothing.
+fn slot_visibility_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("path GLOB '_slots/*'".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(namespace) => (
+            format!(
+                "path GLOB '_slots/*' AND (path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"
+            ),
+            Some(format!("{}{namespace}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        // Nobody to attribute the request to: the shared slots, and nothing
+        // that belongs to a named operator.
+        None => (
+            "path GLOB '_slots/*' AND path NOT GLOB '_slots/*/*'".to_string(),
+            None,
+        ),
+    }
+}
+
+/// The same visibility rule as [`slot_visibility_sql`], phrased for a query
+/// that selects pages GENERALLY rather than slots specifically.
+///
+/// The briefing queries return two lists: a `slots` array, filtered by
+/// [`slot_visibility_sql`], and a `recent_pages` pointer list of every recently
+/// touched page. Filtering only the first leaks the second: a personal slot is
+/// still a page, so another operator's `_slots/<segment>/…` path and title
+/// arrive in the pointer list and get rendered into the session brief. Bodies
+/// stay withheld, but a path and a title are already somebody's working
+/// context.
+///
+/// So this admits everything that is not a slot at all, plus the slots the
+/// viewer may see — i.e. it excludes exactly the namespaced slots belonging to
+/// somebody else. With the feature off it admits everything, so the pointer
+/// list is byte-identical to what it was before slots could be namespaced.
+fn slot_exclusion_sql(
+    visibility: &ai_memory_core::SlotVisibility,
+    param_index: usize,
+) -> (String, Option<String>) {
+    if !visibility.hides_other_namespaces() {
+        return ("1".to_string(), None);
+    }
+    match visibility.own_namespace() {
+        Some(namespace) => (
+            format!("(path NOT GLOB '_slots/*/*' OR path GLOB ?{param_index})"),
+            Some(format!("{}{namespace}/*", ai_memory_core::SLOT_PREFIX)),
+        ),
+        // Nobody to attribute the request to: no namespaced slot is theirs.
+        None => ("path NOT GLOB '_slots/*/*'".to_string(), None),
+    }
 }
 
 fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>) -> bool {

@@ -412,6 +412,16 @@ async fn recent_handler(
     Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE))
 }
 
+/// Slot rule for the browser's snapshots: every slot, whoever is looking.
+///
+/// This surface is a whole-wiki reader — it lists every page and serves every
+/// body through `/page` and `/search` with no per-operator filtering — so
+/// hiding namespaced slots from one JSON endpoint would narrow nothing while
+/// making the snapshot disagree with the page list beside it. Per-operator
+/// scoping belongs to the surfaces that feed an agent's context: the session
+/// brief and the consolidation prompt.
+const BROWSER_SLOT_VISIBILITY: ai_memory_core::SlotVisibility = ai_memory_core::SlotVisibility::All;
+
 async fn briefing_handler(
     State(state): State<Arc<WebState>>,
     Path((workspace, project)): Path<(String, String)>,
@@ -420,7 +430,12 @@ async fn briefing_handler(
     let (workspace_id, project_id) = lookup_project(&state, &workspace, &project).await?;
     let briefing = state
         .reader
-        .briefing_for_project(workspace_id, project_id, query.limit.clamp(1, 100))
+        .briefing_for_project(
+            workspace_id,
+            project_id,
+            query.limit.clamp(1, 100),
+            &BROWSER_SLOT_VISIBILITY,
+        )
         .await
         .map_err(internal_error)?;
     Ok(with_cache(
@@ -468,7 +483,11 @@ async fn overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_workspace(workspace_id, query.limit.clamp(1, 100))
+        .briefing_for_workspace(
+            workspace_id,
+            query.limit.clamp(1, 100),
+            &BROWSER_SLOT_VISIBILITY,
+        )
         .await
         .map_err(internal_error)?;
 
@@ -528,7 +547,7 @@ async fn project_overview_handler(
 
     let briefing = state
         .reader
-        .briefing_for_project(workspace_id, project_id, limit)
+        .briefing_for_project(workspace_id, project_id, limit, &BROWSER_SLOT_VISIBILITY)
         .await
         .map_err(internal_error)?;
 
