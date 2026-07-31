@@ -691,6 +691,7 @@ mod tests {
                 project_id: other,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1590,6 +1591,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -1802,12 +1804,16 @@ mod tests {
         assert_eq!(edges[0].to_project, "infra");
 
         // Briefing degree: app depends on 1 project; infra has 1 dependent.
-        let app_brief = store.reader.briefing_for_project(ws, app, 5).await.unwrap();
+        let app_brief = store
+            .reader
+            .briefing_for_project(ws, app, 5, ai_memory_core::OwnerFilter::Any)
+            .await
+            .unwrap();
         assert_eq!(app_brief.cross_project_dependencies, 1);
         assert_eq!(app_brief.cross_project_dependents, 0);
         let infra_brief = store
             .reader
-            .briefing_for_project(ws, infra, 5)
+            .briefing_for_project(ws, infra, 5, ai_memory_core::OwnerFilter::Any)
             .await
             .unwrap();
         assert_eq!(infra_brief.cross_project_dependents, 1);
@@ -1938,6 +1944,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2534,6 +2541,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2593,6 +2601,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2663,6 +2672,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2776,6 +2786,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -2820,6 +2831,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -2834,6 +2846,7 @@ mod tests {
             open_questions: Vec::new(),
             next_steps: Vec::new(),
             files_touched: Vec::new(),
+            owner_user: None,
         };
 
         assert!(
@@ -2910,6 +2923,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3047,6 +3061,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3077,6 +3092,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3151,6 +3167,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3225,6 +3242,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3251,6 +3269,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3293,6 +3312,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3339,6 +3359,7 @@ mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -3412,6 +3433,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3469,15 +3491,20 @@ mod tests {
                 &conn,
                 &sample_page(ws, proj, "notes/v103.md", "v1.0.3 upgrade fixture"),
             );
-            super::ops::begin_session(
-                &mut conn,
-                &NewSession {
-                    id: session_id,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::OpenCode,
-                    cwd: None,
-                },
+            // Era-appropriate raw insert: this fixture stops at V19 on
+            // purpose, while `begin_session` writes whatever columns the
+            // CURRENT schema has — including V40's `actor_user`, which a
+            // v19-era `sessions` table does not have.
+            conn.execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, 'open-code', NULL, ?4)",
+                params![
+                    session_id.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes(),
+                    jiff::Timestamp::now().as_microsecond(),
+                ],
             )
             .unwrap();
             super::ops::insert_observation(
@@ -3733,18 +3760,25 @@ mod tests {
             "explicit kind must win"
         );
 
-        assert_briefing_kinds(&store.reader.briefing(100).await.unwrap().recent_pages);
         assert_briefing_kinds(
             &store
                 .reader
-                .briefing_for_workspace(ws, 100)
+                .briefing(100, ai_memory_core::OwnerFilter::Any)
+                .await
+                .unwrap()
+                .recent_pages,
+        );
+        assert_briefing_kinds(
+            &store
+                .reader
+                .briefing_for_workspace(ws, 100, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .recent_pages,
         );
         let project_briefing = store
             .reader
-            .briefing_for_project(ws, proj, 100)
+            .briefing_for_project(ws, proj, 100, ai_memory_core::OwnerFilter::Any)
             .await
             .unwrap();
         assert_briefing_kinds(&project_briefing.recent_pages);
@@ -4923,6 +4957,7 @@ mod tests {
             open_questions: Vec::new(),
             next_steps: Vec::new(),
             files_touched: Vec::new(),
+            owner_user: None,
         };
 
         let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
@@ -4932,6 +4967,8 @@ mod tests {
                 Some(first_handoff),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 None,
             )
@@ -4947,7 +4984,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .latest_open_handoff(ws, proj, None)
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .is_none()
@@ -4960,6 +4997,8 @@ mod tests {
                 Some(second_handoff),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 None,
             )
@@ -4973,7 +5012,7 @@ mod tests {
         assert_eq!(
             store
                 .reader
-                .latest_open_handoff(ws, proj, None)
+                .latest_open_handoff(ws, proj, None, ai_memory_core::OwnerFilter::Any)
                 .await
                 .unwrap()
                 .map(|handoff| handoff.id),
@@ -4996,6 +5035,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -5012,6 +5052,7 @@ mod tests {
                     open_questions: Vec::new(),
                     next_steps: Vec::new(),
                     files_touched: Vec::new(),
+                    owner_user: None,
                 })
                 .await
                 .unwrap()
@@ -5026,6 +5067,8 @@ mod tests {
                 Some(selected_auto),
                 AgentKind::Codex,
                 None,
+                None,
+                ai_memory_core::OwnerFilter::Any,
                 Some(run.run_id),
                 Some("/repo/api/src".into()),
             )

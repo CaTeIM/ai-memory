@@ -70,6 +70,51 @@ Webhooks fire on these `op` values today (extensible enum):
   `ctx.destination_workspace` / `ctx.destination_project`, and no page path;
   fired before the directory rename + DB re-stamp so a mirror can rename or
   reject the project move.
+- `handoff_begin` / `handoff_accept` / `handoff_cancel` — a handoff is created,
+  consumed, or discarded. Carries the workspace / project and the acting
+  operator, no page path (handoffs live in their own table, not the wiki tree).
+  Fired by the MCP tools **and** by the automatic hook paths: the SessionEnd
+  baton (`handoff_begin`) and the session-start claim (`handoff_accept`).
+
+The three handoff lifecycle ops are dispatched in one fixed order, the same
+from every path that raises them: the webhooks that can refuse — `blocking`
+with `failure_policy = "reject"` — are awaited **before** the operation, the
+operation then runs, and every other subscriber (observers, blocking or not) is
+dispatched fire-and-forget **after** it, only if it happened. So no observer is
+told about an `accept` that found no pending handoff or a `cancel` another
+operator's ownership refused — an `accept` with nothing pending is not
+announced to a decider either, since the engine knows there is nothing to
+accept before it asks — and an observer subscribed to one of these ops sees the
+same event whether it came from an MCP tool or the hook ingress. (`write_page`
+and the notification ops below are unchanged: there, a `blocking` webhook is
+awaited up front whatever its `failure_policy` — on `write_page` because it can
+still mutate the page.)
+
+What a `reject` costs the caller depends on **which path** raised the op, and
+the difference is deliberate. On the MCP tools — `memory_handoff_begin`,
+`memory_handoff_accept`, `memory_handoff_cancel` — a refusal aborts the tool
+call and is returned to the caller as a JSON-RPC error, exactly like
+`write_page`: there is a caller who asked for the operation, so it is told the
+operation did not happen. On the automatic paths there is no such caller, so a
+refusal degrades the lifecycle event instead of failing it:
+
+- SessionEnd asks before `end_session` commits; a refusal skips the baton, is
+  logged, and the session page / opt-in consolidation / auto-commit still run.
+  The session ends without a handoff rather than ending with no summary at all.
+- The session-start claim is served by the hook path, whose script hard-timeouts
+  at ≤200 ms — which is why only the deciding webhooks are awaited there. A
+  refusal, a timeout or an unreachable host leaves the handoff **open** for the
+  next session; it never fails the session start.
+
+Budgeting the session-start claim: the deciding webhooks are awaited
+**sequentially**, and the chain stops at the first refusal, so what the operator
+waits for in the worst case is the **sum** of the `timeout_ms` of every
+`reject`-policy webhook subscribed to `handoff_accept` — not the largest of them.
+`timeout_ms` **defaults to 2000 ms**, ten times the hook budget, so each such
+webhook needs an explicit value and the values have to add up to the budget: one
+hook can have `150`, but two need roughly `75` each. The engine does not enforce
+the budget for you — nothing server-side knows about the hook script's deadline —
+so a chain that overshoots it is the operator's own configuration to fix.
 
 `delete` / `purge_project` / `purge_workspace` / `move_project` are notifications — there is no
 body to mutate; a `Reject`-policy webhook still aborts the operation
@@ -104,7 +149,10 @@ terminal `purge_project` notification is unchanged.
   HTTP POST per observation, violating the fire-and-forget hook budget. The
   per-event log is a local audit artifact; back it up out-of-band (batched
   rsync), not per-line.
-- **Handoffs** — SQLite rows, transient cross-agent state, not wiki pages.
+- **The page bodies behind a handoff** — the `handoff_*` ops above carry only
+  the scope and the acting operator. A handoff is SQLite rows, so a file mirror
+  has no file change to reconcile from one; what it gets is the lifecycle
+  event, not a page.
 - **Forget-sweep decay soft-delete and aged-tombstone cleanup** —
   project-scoped and DB-only (`is_latest=0` / row delete); the markdown file
   stays on disk, so there is nothing for a file mirror to do. This exemption
@@ -128,7 +176,11 @@ terminal `purge_project` notification is unchanged.
 POST <webhook.url>
 Content-Type: application/json
 X-Memory-Op: write_page | consolidate | delete | purge_project | purge_workspace | move_project
+             | handoff_begin | handoff_accept | handoff_cancel
 ```
+
+(The header is one of those nine values; the second line is a continuation of
+the list, not a second header.)
 
 ```jsonc
 {
@@ -191,7 +243,8 @@ non-2xx:
   for persistence (e.g. a future `validate-no-secrets` enforcer).
 
 A webhook that subscribes to multiple ops uses the same policy across
-all of them.
+all of them — including the handoff lifecycle ops above, where "abort" means
+"decline this handoff", not "fail the event".
 
 ## 5. Workspace / project names
 
@@ -212,7 +265,8 @@ webhook fan-out if you wire one.
 ## 6. Loop prevention
 
 A webhook that turns around and writes back to the engine (e.g. via
-`/admin/write-page` or `memory_write_page`) must include the header
+`/admin/write-page`, `memory_write_page`, or the hook ingress) must include the
+header
 
 ```
 X-Memory-Skip-Admission-Chain: <name>[,<name>...]
@@ -279,6 +333,17 @@ A webhook is either **blocking** or **non-blocking**:
 
 Since the blocking chain is sequential, total worst-case write latency is
 `Σ timeout_ms` over the **blocking** webhooks only; non-blocking ones add none.
+
+Fire-and-forget dispatch is bounded: **256** such requests may be in flight per
+process, and beyond that the request is dropped and logged rather than queued
+(the durable operation has already completed, so the caller is never stalled).
+On the handoff lifecycle ops — `handoff_begin`, `handoff_accept`,
+`handoff_cancel` — only a `reject`-policy webhook is awaited, so a
+`blocking = true` hook with `failure_policy = "ignore"` is dispatched
+fire-and-forget there and shares that budget: under sustained load it too can be
+dropped. Such a drop is logged at ERROR (a non-blocking one at WARN). A hook that
+must not be dropped on those ops needs `failure_policy = "reject"`, which makes
+it a decider — awaited before the operation, and able to refuse it.
 
 Env override:
 

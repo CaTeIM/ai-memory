@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use ai_memory_core::{
     AgentKind, EntityId, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
-    ObservationId, ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
+    ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
+    WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -858,8 +859,9 @@ pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
     conn.execute(
-        "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+        "INSERT INTO sessions \
+         (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
          ON CONFLICT(id) DO NOTHING",
         params![
             session.id.as_bytes(),
@@ -868,6 +870,7 @@ pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult
             agent,
             cwd,
             now,
+            session.actor_user.as_deref(),
         ],
     )?;
     Ok(())
@@ -1441,14 +1444,23 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     // A newer automatic handoff from the exact same cwd is the only one that
     // can ever win there, even before a SessionStart occurs. Bound abandoned
     // same-directory sessions without touching deliberate manual handoffs or
-    // independent parent/sibling cwd scopes.
+    // independent parent/sibling cwd scopes — and without crossing an operator
+    // boundary: the same directory inside a shared container is the norm, so
+    // owner equality is the only thing keeping one operator's SessionEnd from
+    // retiring another's pending baton.
     if from_session.is_some() {
         let expired = conn.execute(
             "UPDATE handoffs SET state = 'expired' \
              WHERE workspace_id = ?1 AND project_id = ?2 \
                AND state = 'open' AND from_session_id IS NOT NULL \
-               AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL))",
-            params![h.workspace_id.as_bytes(), h.project_id.as_bytes(), cwd],
+               AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
+               AND owner_user IS ?4",
+            params![
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes(),
+                cwd,
+                h.owner_user.as_deref()
+            ],
         )?;
         if expired > 0 {
             audit(
@@ -1468,8 +1480,8 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
-          open_questions, next_steps, files_touched, state, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)",
+          open_questions, next_steps, files_touched, state, created_at, owner_user) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13)",
         params![
             id.as_bytes(),
             h.workspace_id.as_bytes(),
@@ -1483,6 +1495,9 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             next_s,
             files,
             now,
+            // NULL owner = shared with the whole project: what a caller with no
+            // actor writes, and what every pre-V39 row already looks like.
+            h.owner_user.as_deref(),
         ],
     )?;
     audit(
@@ -1524,23 +1539,36 @@ fn handoff_scope(
 }
 
 /// Mark a handoff accepted by `accepting_agent` / `accepting_session`.
+///
+/// Returns whether this call is the one that actually claimed it: `false` means
+/// the row was already accepted/expired, or its owner does not admit this
+/// caller. Callers must not hand the body to the agent on `false`, or a lost
+/// race delivers the same baton twice.
+///
+/// `receiving_cwd` is where the *claiming* session is starting, not where the
+/// claimed handoff came from; it bounds the post-claim sweep of stale automatic
+/// handoffs.
 pub fn accept_handoff(
     conn: &mut Connection,
     handoff_id: &HandoffId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
+    accepting_user: Option<&str>,
+    owner_filter: &OwnerFilter,
     receiving_cwd: Option<&str>,
-) -> StoreResult<()> {
+) -> StoreResult<bool> {
     let tx = conn.transaction()?;
-    accept_handoff_in_transaction(
+    let claimed = accept_handoff_in_transaction(
         &tx,
         handoff_id,
         accepting_agent,
         accepting_session,
+        accepting_user,
+        owner_filter,
         receiving_cwd,
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(claimed)
 }
 
 pub(crate) fn accept_handoff_in_transaction(
@@ -1548,6 +1576,8 @@ pub(crate) fn accept_handoff_in_transaction(
     handoff_id: &HandoffId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
+    accepting_user: Option<&str>,
+    owner_filter: &OwnerFilter,
     receiving_cwd: Option<&str>,
 ) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
@@ -1555,7 +1585,8 @@ pub(crate) fn accept_handoff_in_transaction(
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
     let metadata = tx
         .query_row(
-            "SELECT workspace_id, project_id, from_session_id IS NOT NULL, cwd, created_at \
+            "SELECT workspace_id, project_id, from_session_id IS NOT NULL, cwd, created_at, \
+             owner_user \
              FROM handoffs WHERE id = ?1 AND state = 'open'",
             params![handoff_id.as_bytes()],
             |row| {
@@ -1565,20 +1596,46 @@ pub(crate) fn accept_handoff_in_transaction(
                     row.get::<_, bool>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workspace_id, project_id, automatic, cwd, created_at)) = metadata else {
+    let Some((workspace_id, project_id, automatic, cwd, created_at, owner_user)) = metadata else {
         return Ok(false);
     };
     let (ws, proj) = handoff_scope(tx, handoff_id)?;
-    let changed = tx.execute(
+    // The ownership check rides along in the UPDATE's WHERE rather than being a
+    // separate read: the claim stays a single atomic compare-and-set (only one
+    // racing session can flip 'open' -> 'accepted'), and a caller who is not
+    // allowed to take this baton simply changes 0 rows.
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?6)",
+        OwnerFilter::Unattributed => " AND owner_user IS NULL",
+    };
+    let sql = format!(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
-         accepted_by_session = ?3 \
-         WHERE id = ?4 AND state = 'open'",
-        params![agent, now, session, handoff_id.as_bytes()],
-    )?;
+         accepted_by_session = ?3, accepted_by_user = ?5 \
+         WHERE id = ?4 AND state = 'open'{owner_clause}"
+    );
+    let changed = match owner_filter {
+        OwnerFilter::User(user) => tx.execute(
+            &sql,
+            params![
+                agent,
+                now,
+                session,
+                handoff_id.as_bytes(),
+                accepting_user,
+                user
+            ],
+        )?,
+        _ => tx.execute(
+            &sql,
+            params![agent, now, session, handoff_id.as_bytes(), accepting_user],
+        )?,
+    };
     // Only a real state transition ('open' -> 'accepted') is audited.
     if changed > 0 {
         audit(
@@ -1591,6 +1648,11 @@ pub(crate) fn accept_handoff_in_transaction(
             now,
         )?;
         if automatic {
+            // The sweep inherits the claimed handoff's owner: retiring stale
+            // batons must never reach across an operator boundary, or one
+            // person's session start silently destroys another's pending
+            // handoff — a worse failure than the misdelivery ownership exists
+            // to prevent, because nothing is delivered at all.
             let expired = expire_superseded_auto_handoffs(
                 tx,
                 handoff_id,
@@ -1599,6 +1661,7 @@ pub(crate) fn accept_handoff_in_transaction(
                 cwd.as_deref(),
                 created_at,
                 receiving_cwd,
+                owner_user.as_deref(),
             )?;
             if expired > 0 {
                 audit(
@@ -1618,7 +1681,12 @@ pub(crate) fn accept_handoff_in_transaction(
 
 /// Expire older automatic handoffs that were eligible for the same receiving
 /// cwd as the accepted handoff. Manual and sibling-directory handoffs are
-/// deliberately excluded.
+/// deliberately excluded, and so is every handoff belonging to a different
+/// operator: a NULL owner is visible to *everyone*, so expiring one on Alice's
+/// behalf would take it away from Bob too. Equality on `owner_user` keeps the
+/// unattributed single-operator case (every row NULL) behaving exactly as it
+/// does without ownership.
+#[allow(clippy::too_many_arguments)]
 fn expire_superseded_auto_handoffs(
     tx: &Transaction<'_>,
     accepted_id: &HandoffId,
@@ -1627,6 +1695,7 @@ fn expire_superseded_auto_handoffs(
     accepted_cwd: Option<&str>,
     accepted_created_at: i64,
     receiving_cwd: Option<&str>,
+    accepted_owner: Option<&str>,
 ) -> StoreResult<usize> {
     let receiving_cwd = receiving_cwd.or(accepted_cwd);
     let accepted_key = crate::reader::handoff_selection_key(
@@ -1638,9 +1707,10 @@ fn expire_superseded_auto_handoffs(
     let mut stmt = tx.prepare(
         "SELECT id, cwd, created_at FROM handoffs \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL",
+           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND owner_user IS ?3",
     )?;
-    let rows = stmt.query_map(params![workspace_id, project_id], |row| {
+    let rows = stmt.query_map(params![workspace_id, project_id, accepted_owner], |row| {
         Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -1677,14 +1747,29 @@ fn expire_superseded_auto_handoffs(
 }
 
 /// Mark an open handoff expired so it will no longer be consumed.
-pub fn cancel_handoff(conn: &mut Connection, handoff_id: &HandoffId) -> StoreResult<bool> {
+pub fn cancel_handoff(
+    conn: &mut Connection,
+    handoff_id: &HandoffId,
+    owner_filter: &OwnerFilter,
+) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let (ws, proj) = handoff_scope(&tx, handoff_id)?;
-    let changed = tx.execute(
-        "UPDATE handoffs SET state = 'expired' WHERE id = ?1 AND state = 'open'",
-        params![handoff_id.as_bytes()],
-    )?;
+    // Same reasoning as the accept path: the owner predicate lives in the
+    // UPDATE so cancelling somebody else's baton is a 0-row no-op instead of a
+    // read-then-write race.
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?2)",
+        OwnerFilter::Unattributed => " AND owner_user IS NULL",
+    };
+    let sql = format!(
+        "UPDATE handoffs SET state = 'expired' WHERE id = ?1 AND state = 'open'{owner_clause}"
+    );
+    let changed = match owner_filter {
+        OwnerFilter::User(user) => tx.execute(&sql, params![handoff_id.as_bytes(), user])?,
+        _ => tx.execute(&sql, params![handoff_id.as_bytes()])?,
+    };
     if changed > 0 {
         audit(
             &tx,
@@ -2445,6 +2530,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: kind,
                 cwd: None,
+                actor_user: None,
             };
             begin_session(&mut conn, &session).unwrap_or_else(|e| {
                 panic!(
@@ -3211,6 +3297,7 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let id = insert_handoff(&mut conn, &new).unwrap();
 
@@ -3225,7 +3312,16 @@ pub(crate) mod tests {
         assert_eq!(state, "open");
         assert!(accepted_by.is_none());
 
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
+        accept_handoff(
+            &mut conn,
+            &id,
+            AgentKind::Codex,
+            None,
+            None,
+            &OwnerFilter::Any,
+            None,
+        )
+        .unwrap();
         let (state, accepted_by): (String, Option<String>) = conn
             .query_row(
                 "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
@@ -3240,7 +3336,15 @@ pub(crate) mod tests {
         // either succeed silently or fail clearly, never corrupt
         // the row. (Current impl is a no-op UPDATE with a state
         // guard.)
-        let second = accept_handoff(&mut conn, &id, AgentKind::Codex, None, None);
+        let second = accept_handoff(
+            &mut conn,
+            &id,
+            AgentKind::Codex,
+            None,
+            None,
+            &OwnerFilter::Any,
+            None,
+        );
         assert!(second.is_ok(), "double-accept must not error");
     }
 
@@ -3256,6 +3360,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo".into()),
+                actor_user: None,
             },
         )
         .unwrap();
@@ -3270,6 +3375,7 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let first = insert_handoff(&mut conn, &handoff(first_session)).unwrap();
 
@@ -3311,11 +3417,21 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let id = insert_handoff(&mut conn, &new()).unwrap();
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
+        accept_handoff(
+            &mut conn,
+            &id,
+            AgentKind::Codex,
+            None,
+            None,
+            &OwnerFilter::Any,
+            None,
+        )
+        .unwrap();
         let id2 = insert_handoff(&mut conn, &new()).unwrap();
-        assert!(cancel_handoff(&mut conn, &id2).unwrap());
+        assert!(cancel_handoff(&mut conn, &id2, &OwnerFilter::Any).unwrap());
 
         for op in ["insert_handoff", "accept_handoff", "cancel_handoff"] {
             let (count, author) = audit_row_for(&conn, op);
@@ -3329,8 +3445,17 @@ pub(crate) mod tests {
         );
         // Idempotent misses stay out of the trail: a double-accept and a
         // cancel of an already-accepted handoff change no row, audit nothing.
-        accept_handoff(&mut conn, &id, AgentKind::Codex, None, None).unwrap();
-        assert!(!cancel_handoff(&mut conn, &id).unwrap());
+        accept_handoff(
+            &mut conn,
+            &id,
+            AgentKind::Codex,
+            None,
+            None,
+            &OwnerFilter::Any,
+            None,
+        )
+        .unwrap();
+        assert!(!cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap());
         assert_eq!(
             audit_row_for(&conn, "accept_handoff").0,
             1,
@@ -3373,6 +3498,7 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let id = insert_handoff(&mut conn, &new).unwrap();
         let cwd: Option<String> = conn
@@ -3395,6 +3521,7 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let id = insert_handoff(&mut conn, &windows).unwrap();
         let cwd: Option<String> = conn
@@ -3421,10 +3548,11 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         let id = insert_handoff(&mut conn, &new).unwrap();
 
-        assert!(cancel_handoff(&mut conn, &id).unwrap());
+        assert!(cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap());
         let state: String = conn
             .query_row(
                 "SELECT state FROM handoffs WHERE id = ?1",
@@ -3435,7 +3563,7 @@ pub(crate) mod tests {
         assert_eq!(state, "expired");
 
         assert!(
-            !cancel_handoff(&mut conn, &id).unwrap(),
+            !cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap(),
             "double-cancel should be a no-op"
         );
     }
@@ -3455,6 +3583,7 @@ pub(crate) mod tests {
                     project_id: proj,
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from(r"C:\GIT\ai-memory")),
+                    actor_user: None,
                 },
             )
             .unwrap();
@@ -3484,6 +3613,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             },
         )
         .unwrap();
@@ -3526,6 +3656,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             },
         )
         .unwrap();
@@ -3811,6 +3942,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             },
         )
         .unwrap();
@@ -3997,7 +4129,7 @@ pub(crate) mod tests {
     /// on a repaired DB updates / deletes nothing.
     #[test]
     fn v19_repairs_orphan_observation_attribution_and_purges_empty_projects() {
-        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+        use ai_memory_core::{NewObservation, ObservationKind, SessionId};
 
         // Apply migrations through V18 (not V19) so we can seed the
         // orphaned-attribution state V19 is designed to repair. If we
@@ -4031,17 +4163,16 @@ pub(crate) mod tests {
         .unwrap();
 
         let sid = SessionId::new();
-        begin_session(
-            &mut conn,
-            &NewSession {
-                id: sid,
-                workspace_id: ws,
-                project_id: parent,
-                agent_kind: AgentKind::ClaudeCode,
-                cwd: Some("/mnt/data/Projects/manga-plus".into()),
-            },
-        )
-        .unwrap();
+        // Era-appropriate raw insert: this fixture stops at an older
+        // schema on purpose (see `seed_historical_session`).
+        seed_historical_session(
+            &conn,
+            &sid,
+            &ws,
+            &parent,
+            ai_memory_core::AgentKind::ClaudeCode,
+            Some("/mnt/data/Projects/manga-plus"),
+        );
 
         // Three misattributed observations on the fragment.
         for i in 0..3 {
@@ -4137,6 +4268,7 @@ pub(crate) mod tests {
                 project_id: with_data,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             },
         )
         .unwrap();
@@ -4183,6 +4315,35 @@ pub(crate) mod tests {
         assert!(sweep_hollow_projects(&mut conn, 7).unwrap().is_empty());
     }
 
+    /// Insert a `sessions` row using only the columns that have existed since
+    /// V01, for fixtures that deliberately stop at an older schema version.
+    /// The production `begin_session` writes whatever columns the CURRENT
+    /// schema has — including V40's `actor_user`, which these fixtures'
+    /// `sessions` tables do not have yet.
+    fn seed_historical_session(
+        conn: &Connection,
+        id: &ai_memory_core::SessionId,
+        workspace_id: &WorkspaceId,
+        project_id: &ProjectId,
+        agent_kind: ai_memory_core::AgentKind,
+        cwd: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                agent_kind.as_str(),
+                cwd,
+                Timestamp::now().as_microsecond(),
+            ],
+        )
+        .unwrap();
+    }
+
     /// V27 re-runs the V19 repair for the fragments that accumulated
     /// after V19: non-git parents have no repo_path, so the v0.12.2
     /// prefix guard couldn't anchor subdirectory cwds and per-event
@@ -4190,7 +4351,7 @@ pub(crate) mod tests {
     /// a second pass repairs nothing.
     #[test]
     fn v27_reattributes_nongit_fragments_and_preserves_reserved_projects() {
-        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+        use ai_memory_core::{NewObservation, ObservationKind, SessionId};
 
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
@@ -4208,17 +4369,17 @@ pub(crate) mod tests {
         let global = get_or_create_project(&mut conn, &ws, "_global", None).unwrap();
 
         let sid = SessionId::new();
-        begin_session(
-            &mut conn,
-            &NewSession {
-                id: sid,
-                workspace_id: ws,
-                project_id: parent,
-                agent_kind: AgentKind::ClaudeCode,
-                cwd: Some("/home/user/tiktok_analysis".into()),
-            },
-        )
-        .unwrap();
+        // Seeded with era-appropriate SQL rather than `begin_session`: this
+        // fixture stops at an older schema on purpose, and the production
+        // helper writes whatever columns the CURRENT schema has.
+        seed_historical_session(
+            &conn,
+            &sid,
+            &ws,
+            &parent,
+            ai_memory_core::AgentKind::ClaudeCode,
+            Some("/home/user/tiktok_analysis"),
+        );
         for i in 0..4 {
             insert_observation(
                 &mut conn,
@@ -4286,7 +4447,7 @@ pub(crate) mod tests {
 
     #[test]
     fn v20_adds_grok_and_preserves_sessions_invariants_on_upgraded_db() {
-        use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+        use ai_memory_core::{NewObservation, ObservationKind, SessionId};
 
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
@@ -4301,17 +4462,16 @@ pub(crate) mod tests {
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
             ws = get_or_create_workspace(&mut conn, "default").unwrap();
             proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
-            begin_session(
-                &mut conn,
-                &NewSession {
-                    id: existing_sid,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::ClaudeCode,
-                    cwd: None,
-                },
-            )
-            .unwrap();
+            // Era-appropriate raw insert: this fixture stops at an older
+            // schema on purpose (see `seed_historical_session`).
+            seed_historical_session(
+                &conn,
+                &existing_sid,
+                &ws,
+                &proj,
+                ai_memory_core::AgentKind::ClaudeCode,
+                None,
+            );
             insert_observation(
                 &mut conn,
                 &NewObservation {
@@ -4334,17 +4494,17 @@ pub(crate) mod tests {
         crate::migrations::run_to(&mut conn, 20).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
-        begin_session(
-            &mut conn,
-            &NewSession {
-                id: SessionId::new(),
-                workspace_id: ws,
-                project_id: proj,
-                agent_kind: AgentKind::Grok,
-                cwd: None,
-            },
-        )
-        .unwrap();
+        // Era-appropriate raw insert (see `seed_historical_session`):
+        // this fixture asserts the migration's widened CHECK accepts the
+        // newly added agent kind on an upgraded database.
+        seed_historical_session(
+            &conn,
+            &SessionId::new(),
+            &ws,
+            &proj,
+            ai_memory_core::AgentKind::Grok,
+            None,
+        );
 
         let obs_count: i64 = conn
             .query_row(
@@ -4382,17 +4542,23 @@ pub(crate) mod tests {
         let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let other_proj =
             get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
-        let err = begin_session(
-            &mut conn,
-            &NewSession {
-                id: SessionId::new(),
-                workspace_id: ws,
-                project_id: other_proj,
-                agent_kind: AgentKind::Grok,
-                cwd: None,
-            },
-        )
-        .unwrap_err();
+        // Raw insert on purpose: the fixture sits on an older schema, and
+        // what is under test is the pairing TRIGGER rejecting a session
+        // whose workspace does not own its project.
+        let err = conn
+            .execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                params![
+                    SessionId::new().as_bytes(),
+                    ws.as_bytes(),
+                    other_proj.as_bytes(),
+                    ai_memory_core::AgentKind::Grok.as_str(),
+                    Timestamp::now().as_microsecond(),
+                ],
+            )
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("sessions.workspace_id does not match"),
@@ -4409,7 +4575,7 @@ pub(crate) mod tests {
 
     #[test]
     fn v25_adds_pi_and_preserves_sessions_invariants_on_upgraded_db() {
-        use ai_memory_core::{AgentKind, NewSession, SessionId};
+        use ai_memory_core::SessionId;
 
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
@@ -4424,17 +4590,16 @@ pub(crate) mod tests {
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
             ws = get_or_create_workspace(&mut conn, "default").unwrap();
             proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
-            begin_session(
-                &mut conn,
-                &NewSession {
-                    id: existing_sid,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::ClaudeCode,
-                    cwd: None,
-                },
-            )
-            .unwrap();
+            // Era-appropriate raw insert: this fixture stops at an older
+            // schema on purpose (see `seed_historical_session`).
+            seed_historical_session(
+                &conn,
+                &existing_sid,
+                &ws,
+                &proj,
+                ai_memory_core::AgentKind::ClaudeCode,
+                None,
+            );
         }
 
         let mut conn = Connection::open(&db_path).unwrap();
@@ -4442,17 +4607,17 @@ pub(crate) mod tests {
         crate::migrations::run_to(&mut conn, 25).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
-        begin_session(
-            &mut conn,
-            &NewSession {
-                id: SessionId::new(),
-                workspace_id: ws,
-                project_id: proj,
-                agent_kind: AgentKind::Pi,
-                cwd: None,
-            },
-        )
-        .unwrap();
+        // Era-appropriate raw insert (see `seed_historical_session`):
+        // this fixture asserts the migration's widened CHECK accepts the
+        // newly added agent kind on an upgraded database.
+        seed_historical_session(
+            &conn,
+            &SessionId::new(),
+            &ws,
+            &proj,
+            ai_memory_core::AgentKind::Pi,
+            None,
+        );
 
         let session_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -4506,7 +4671,7 @@ pub(crate) mod tests {
 
     #[test]
     fn v28_adds_devin_and_preserves_sessions_invariants_on_upgraded_db() {
-        use ai_memory_core::{AgentKind, NewSession, SessionId};
+        use ai_memory_core::SessionId;
 
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.sqlite");
@@ -4521,17 +4686,16 @@ pub(crate) mod tests {
             conn.pragma_update(None, "foreign_keys", "ON").unwrap();
             ws = get_or_create_workspace(&mut conn, "default").unwrap();
             proj = get_or_create_project(&mut conn, &ws, "scratch", None).unwrap();
-            begin_session(
-                &mut conn,
-                &NewSession {
-                    id: existing_sid,
-                    workspace_id: ws,
-                    project_id: proj,
-                    agent_kind: AgentKind::ClaudeCode,
-                    cwd: None,
-                },
-            )
-            .unwrap();
+            // Era-appropriate raw insert: this fixture stops at an older
+            // schema on purpose (see `seed_historical_session`).
+            seed_historical_session(
+                &conn,
+                &existing_sid,
+                &ws,
+                &proj,
+                ai_memory_core::AgentKind::ClaudeCode,
+                None,
+            );
         }
 
         // Run through V26 (Zero) and V27 (unrelated data repair) too, not
@@ -4542,17 +4706,17 @@ pub(crate) mod tests {
         crate::migrations::run_to(&mut conn, 28).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
 
-        begin_session(
-            &mut conn,
-            &NewSession {
-                id: SessionId::new(),
-                workspace_id: ws,
-                project_id: proj,
-                agent_kind: AgentKind::Devin,
-                cwd: None,
-            },
-        )
-        .unwrap();
+        // Era-appropriate raw insert (see `seed_historical_session`):
+        // this fixture asserts the migration's widened CHECK accepts the
+        // newly added agent kind on an upgraded database.
+        seed_historical_session(
+            &conn,
+            &SessionId::new(),
+            &ws,
+            &proj,
+            ai_memory_core::AgentKind::Devin,
+            None,
+        );
 
         let session_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -4606,17 +4770,23 @@ pub(crate) mod tests {
         let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
         let other_proj =
             get_or_create_project(&mut conn, &other_ws, "other-project", None).unwrap();
-        let err = begin_session(
-            &mut conn,
-            &NewSession {
-                id: SessionId::new(),
-                workspace_id: ws,
-                project_id: other_proj,
-                agent_kind: AgentKind::Devin,
-                cwd: None,
-            },
-        )
-        .unwrap_err();
+        // Raw insert on purpose: the fixture sits on an older schema, and
+        // what is under test is the pairing TRIGGER rejecting a session
+        // whose workspace does not own its project.
+        let err = conn
+            .execute(
+                "INSERT INTO sessions \
+                 (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                params![
+                    SessionId::new().as_bytes(),
+                    ws.as_bytes(),
+                    other_proj.as_bytes(),
+                    ai_memory_core::AgentKind::Devin.as_str(),
+                    Timestamp::now().as_microsecond(),
+                ],
+            )
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("sessions.workspace_id does not match"),
@@ -4692,6 +4862,7 @@ pub(crate) mod tests {
                 open_questions: vec![],
                 next_steps: vec![],
                 files_touched: vec![],
+                owner_user: None,
             },
         )
         .unwrap();
@@ -4807,6 +4978,7 @@ pub(crate) mod tests {
                     project_id: proj,
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
+                    actor_user: None,
                 },
             )
             .is_err(),
@@ -4822,6 +4994,7 @@ pub(crate) mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             },
         )
         .unwrap();
@@ -4867,6 +5040,7 @@ pub(crate) mod tests {
             open_questions: vec![],
             next_steps: vec![],
             files_touched: vec![],
+            owner_user: None,
         };
         assert!(
             insert_handoff(&mut conn, &mismatched_handoff).is_err(),

@@ -346,7 +346,14 @@ impl Consolidator {
     ) -> ConsolidatorResult<Vec<SlotSnapshot>> {
         let briefing = self
             .reader
-            .briefing_for_project(workspace_id, project_id, 100)
+            .briefing_for_project(
+                workspace_id,
+                project_id,
+                100,
+                // Internal slot snapshot: the pending-handoff count is not
+                // surfaced from here, so no owner scoping applies.
+                ai_memory_core::OwnerFilter::Any,
+            )
             .await?;
         let mut slots = Vec::with_capacity(briefing.slots.len());
         for slot in briefing.slots {

@@ -31,6 +31,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exist", so a trusted-proxy deployment — which never writes a `users` row —
   gets root-only admin gating instead of waving every proxied caller through
   the single-operator escape hatch (#333).
+- Handoffs now belong to the operator that created them (migration V39). On a
+  server shared by several people the open-handoff lookup was scoped by
+  `(workspace, project, state)` alone, so the next session to start — whoever it
+  belonged to — consumed the pending baton, and delivery is destructive, so the
+  author simply lost it. `cwd` did not help: a handoff created through
+  `memory_handoff_begin` is always manual (`from_session_id = NULL`), and manual
+  handoffs bypass the cwd check and outrank automatic ones, so the deliberate
+  artefact was exactly the one that crossed operators. Ownership is now checked
+  before those rules, and the owner column holds the qualified
+  `IdentityKey::storage_key()` TEXT. `memory_handoff_begin` gains `shared: true`
+  to publish a baton to the whole project on purpose; `memory_handoff_accept`
+  gains `any_owner: true` for recovery. A NULL owner still means "shared", so
+  every stored row and every caller without an authenticated actor behaves
+  exactly as before (#310).
+- Sessions record their operator (migration V40), and the open-session lookup
+  behind `GET /admin/open-sessions` is scoped to the caller unless
+  `all_owners=true`. `finalize-session` drives off that lookup and acts
+  destructively on the result — ending the session, synthesising a page from its
+  observations and minting a handoff carrying its raw prompts — so picking "the
+  newest open session in the scope" could do all of that to a colleague's live
+  session. The new `--all-owners` flag exposes the server switch (#310).
+- New `GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs` lists a
+  project's handoffs, filtered by `state` and scoped by owner, backed by a new
+  non-partial index (migration V41) since every pre-existing handoffs index is
+  partial on `state = 'open'`. There was no handoff listing anywhere in the
+  system: readers only ever fetched the single pending one and consumed it, so a
+  mis-delivered baton could not be inspected or recovered. On a server that
+  authenticates, the prompt-derived fields (`summary`, `open_questions`,
+  `next_steps`) are served to a caller the server can name and to the root
+  operator, and are omitted with `redacted: true` for a caller it can place as
+  neither — unowned rows are shared, so such a caller matches every one of them,
+  and unlike the overview's single newest card this returns the project's whole
+  history. Cross-owner reads are root-only. The metadata is served either way,
+  which is what makes the listing useful; a server with no auth configured
+  serves the bodies too, since it already serves every page body
+  unauthenticated (#310).
+- New admission-chain operations `handoff_begin`, `handoff_accept` and
+  `handoff_cancel`. Handoffs live in their own table, so their lifecycle never
+  passed through `Wiki::write_page` and was invisible to admission webhooks —
+  leaving the operations that move prompt-derived text between operators
+  unauthorizable. Every path raising one of them asks and announces in the same
+  order: only the webhooks that can refuse (blocking + reject policy) are
+  awaited before the operation, and observers are dispatched fire-and-forget
+  after it, only if it happened — so `memory_handoff_accept`, whose routine
+  answer is `{"handoff": null}`, never announces an accept that found nothing,
+  and a mirror is never told about a baton the engine then abandoned. The
+  automatic SessionEnd handoff and the session-start claim run through the same
+  chain as their operator-triggered counterparts, forwarding the caller's
+  webhook skip-list under the same root-only rule as every other transport.
+  Neither can cost an operator anything beyond the operation the webhook
+  declined: SessionEnd still writes the summary page, runs the opt-in
+  consolidation and commits (a refusal skips the baton and is logged), and a
+  refused, timed-out or unreachable claim leaves the handoff open for the next
+  session (#310).
+
+### Fixed
+- Handoff and session ownership is stamped only where the deployment actually
+  distinguishes operators. A server with `[auth].bearer_token` +
+  `[auth].root_username`, no `users` rows and no proxy has one operator and two
+  transports: stamping that one name on every HTTP write while the stdio /
+  in-process transport carries no actor would make one person's handoffs and
+  sessions invisible to their own other transport on the same data directory.
+  With nobody to separate, the stamp is the pre-ownership `NULL` and both
+  transports agree. Reads are deliberately not gated the same way, so rows
+  stamped while a deployment did distinguish operators stay readable by that
+  operator afterwards (#310).
+- The automatic SessionEnd handoff, the session page and both consolidation
+  paths attribute to the operator recorded on the **session**, not to whoever
+  delivered the event — a spool drain, a shared hook token or an operator
+  finalizing a stuck session all carry a different identity (#310).
+- Briefings and both read-only overviews — workspace and project — scope
+  handoffs to the requesting actor instead of showing only unowned ones, and
+  `pending_handoff_count` applies the same filter as the fetch — otherwise a
+  briefing advertises a pending baton the same caller can never retrieve, and on
+  any server that stamps owners the overview's handoff card would go permanently
+  empty while the count beside it kept reporting the row. The read-only
+  `/api/v1` overview no longer surfaces handoffs that belong to a specific
+  operator, including the raw prompt text an automatic handoff is synthesised
+  from, to a browser the server cannot attribute (#310).
+- Retiring superseded automatic handoffs no longer crosses an operator
+  boundary. Both sweeps — the same-cwd expiry on a new SessionEnd handoff and
+  the post-claim cleanup after an accept — match on the acting handoff's
+  `owner_user`, so one person starting or ending a session in a directory
+  cannot expire another person's pending baton. A shared handoff (no owner) is
+  visible to everyone, so it is only ever superseded by another shared one; on
+  a single-operator or unauthenticated server every row is unowned and the
+  sweeps behave exactly as they did (#310).
+- `ops::accept_handoff` propagates whether the claim actually succeeded, so
+  `memory_handoff_accept` no longer returns the handoff body when the atomic
+  claim was lost — previously two agents could be handed the same baton. The
+  cross-operator escape hatches require admin authority: `any_owner` on
+  `memory_handoff_accept` and on `memory_handoff_cancel` (which previously had
+  no recovery path at all, so a handoff whose owner no longer matched any
+  reachable identity could not be discarded), and `--all-owners` on
+  `ai-memory finalize-session` (#310).
+- The `[auto_scope] per_actor` active-project map is keyed by the qualified
+  identity on both sides — the hook ingress that publishes and the MCP tools
+  that read — so a sub-only proxied operator's writes and reads land on the
+  same slot instead of silently missing on every read (#310).
 
 ## [1.21.0] - 2026-07-31
 

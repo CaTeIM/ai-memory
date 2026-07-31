@@ -351,6 +351,47 @@ impl IdentityKey {
         }
     }
 
+    /// Inverse of [`Self::storage_key`], for reading a stored owner back into
+    /// the typed key.
+    ///
+    /// Rows persist the qualified TEXT form, and some paths must later act *as*
+    /// the operator that TEXT names — a SessionEnd delivered by a spool drain
+    /// attributes the session page to the session's recorded owner, not to
+    /// whoever flushed the event. Re-wrapping the stored string in a fresh
+    /// [`IdentityKey`] would double-qualify it (`user:sub:…`), so the parse
+    /// lives here, next to the encoding it inverts. `None` means the TEXT is
+    /// not a storage key at all — nothing this contract wrote.
+    #[must_use]
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        key.strip_prefix("sub:")
+            .map(|sub| Self::Subject(sub.to_owned()))
+            .or_else(|| {
+                key.strip_prefix("user:")
+                    .map(|user| Self::User(user.to_owned()))
+            })
+    }
+
+    /// The [`ActorContext`] this key names — `Subject` fills `sub`, `User`
+    /// fills `user` — so [`ActorContext::identity_key`] round-trips to `self`.
+    ///
+    /// For paths that act on a STORED owner (see [`Self::from_storage_key`])
+    /// and need to hand downstream code a real actor: stuffing the qualified
+    /// storage TEXT into `ActorContext::user` instead would present a subject
+    /// as a username and re-derive a different identity.
+    #[must_use]
+    pub fn to_actor_context(&self) -> ActorContext {
+        match self {
+            Self::Subject(sub) => ActorContext {
+                sub: Some(sub.clone()),
+                ..ActorContext::default()
+            },
+            Self::User(user) => ActorContext {
+                user: Some(user.clone()),
+                ..ActorContext::default()
+            },
+        }
+    }
+
     /// A filesystem-safe, injective encoding for per-operator wiki paths
     /// (`_slots/<segment>/…`).
     ///
@@ -647,6 +688,34 @@ mod tests {
 
         let names_filter = OwnerFilter::User(by_name.storage_key());
         assert!(!names_filter.admits(Some(&by_subject.storage_key())));
+    }
+
+    /// Storage keys must read back as the identity that wrote them — including
+    /// a subject that CONTAINS a colon (URLs are common subjects) — and a
+    /// stored value this contract never produced must parse to nobody rather
+    /// than to a guessed operator.
+    #[test]
+    fn storage_key_round_trips_through_from_storage_key() {
+        for key in [
+            IdentityKey::User("alice".into()),
+            IdentityKey::Subject("oidc-subject-123".into()),
+            IdentityKey::Subject("https://idp.example/id/42".into()),
+            // The aliasing case: a username that LOOKS like a subject key must
+            // come back as the username it is.
+            IdentityKey::User("sub:alice".into()),
+        ] {
+            assert_eq!(
+                IdentityKey::from_storage_key(&key.storage_key()).as_ref(),
+                Some(&key)
+            );
+            assert_eq!(
+                key.to_actor_context().identity_key().as_ref(),
+                Some(&key),
+                "to_actor_context must name the same operator"
+            );
+        }
+        assert_eq!(IdentityKey::from_storage_key("alice"), None);
+        assert_eq!(IdentityKey::from_storage_key(""), None);
     }
 
     /// Subjects are IdP-issued and often URLs; wiki paths are real files on

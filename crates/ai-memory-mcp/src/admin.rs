@@ -864,6 +864,17 @@ struct OpenSessionsQuery {
     /// When true, return every open session; otherwise just the newest.
     #[serde(default)]
     all: bool,
+    /// Include sessions belonging to OTHER operators.
+    ///
+    /// Off by default because the caller of this endpoint (`finalize-session`)
+    /// acts destructively on what it returns: it ends the session, synthesises
+    /// a page from its observations and mints a handoff carrying its raw
+    /// prompts. Picking "the newest open session in the scope" across everyone
+    /// would do all of that to a colleague's live session. Sessions with no
+    /// recorded operator stay visible either way, so a single-operator server
+    /// is unaffected.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 /// Wire shape for one open session in the `GET /admin/open-sessions`
@@ -881,6 +892,7 @@ fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
 
 async fn handle_open_sessions(
     State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Query(query): Query<OpenSessionsQuery>,
 ) -> impl IntoResponse {
     let Some(agent) = parse_agent_kind(&query.agent) else {
@@ -897,9 +909,16 @@ async fn handle_open_sessions(
         Err(e) => return e,
     };
     let limit = if query.all { None } else { Some(1) };
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
     match state
         .reader
-        .open_sessions_for_scope_agent(ws, proj, agent, limit)
+        .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
         .await
     {
         Ok(sessions) => {
@@ -5241,6 +5260,7 @@ mod tests {
                     project_id,
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -5675,6 +5695,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5805,6 +5826,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5903,6 +5925,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

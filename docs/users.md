@@ -121,6 +121,56 @@ derivation is `IdentityKey::path_segment()`: values made only of
 else hex-encodes under a distinct prefix (`sx-…`, `ux-…`) that keeps the
 encoding injective.
 
+## Ownership of handoffs and sessions
+
+Handoffs and sessions record the operator they belong to (`owner_user` /
+`actor_user`, holding the qualified `IdentityKey::storage_key()` TEXT). On a
+shared server this stops one operator's pending handoff from being delivered
+to — and consumed by — the next session to start, whoever it belongs to.
+
+- A `NULL` owner means **shared with the project**: every row written before
+  ownership existed, and anything written without an authenticated actor, stays
+  visible to everyone.
+- **An owner is only stamped where the deployment distinguishes operators.**
+  Single-operator servers are unaffected even when they name their operator via
+  `[auth].root_username`: with no `users` rows and no proxy secret there is
+  nobody to separate, and stamping the one name would separate that operator's
+  *transports* instead — HTTP requests carry the name, while the stdio /
+  in-process MCP transport and the local CLI carry no actor at all and would
+  stop seeing what the HTTP side wrote. Reads are deliberately **not** gated the
+  same way, so a row stamped while the deployment did distinguish operators
+  stays readable by that operator afterwards.
+- The owner is the qualified identity the request names —
+  `ActorContext::identity_key()`, so `sub:<subject>` when a subject claim is
+  asserted and `user:<name>` otherwise. It is the same rule that decides the
+  auth tier, so a proxy that forwards only `X-Memory-Actor-Sub` gets real
+  per-operator isolation rather than one shared bucket.
+- `memory_handoff_begin` takes `shared: true` to publish a baton deliberately.
+- `memory_handoff_accept` / `memory_handoff_cancel` take `any_owner: true` to
+  act on somebody else's baton; that opt-out requires admin authority in
+  multi-user mode.
+- `ai-memory finalize-session --all-owners` does the same for sessions, and
+  `GET /admin/open-sessions?all_owners=true` is the underlying switch.
+- The read-only handoff listing (`GET
+  /api/v1/workspaces/{ws}/projects/{p}/handoffs`) serves its prompt-derived
+  fields — `summary`, `open_questions`, `next_steps` — to a caller the server
+  can name (their own rows plus the shared ones) and to the root operator, who
+  reads every page body through the wiki API anyway. A caller an authenticating
+  server can place as neither gets the metadata with `redacted: true`. A server
+  with no auth configured is unaffected: it already serves every page body
+  unauthenticated.
+- Handoff lifecycle events raise admission ops (`handoff_begin`,
+  `handoff_accept`, `handoff_cancel`), so an admission webhook can observe or —
+  with `failure_policy = "reject"` — refuse them. Only reject-policy hooks are
+  awaited on these ops; observers are notified after the operation is durable.
+
+"Multi-user mode" here means *the deployment distinguishes operators*: either
+`users` rows exist, or `[auth].actor_proxy_secret` is configured. A trusted
+proxy never writes a `users` row, so counting only rows would leave every
+proxied caller on the single-operator escape hatch that waves admin through.
+One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
+the ownership stamped on handoffs and sessions all ask it.
+
 ## Implementation contract
 
 Request identity and authorization are separate:

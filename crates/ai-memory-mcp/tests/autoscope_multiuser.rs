@@ -168,6 +168,7 @@ impl MultiUserHarness {
                 ai_memory_hooks::IngestRateLimiter::disabled(),
             )),
             home_dir: None,
+            trusted_proxy_identity: false,
         });
 
         // Production-equivalent Bearer middleware. Pepper + reader are

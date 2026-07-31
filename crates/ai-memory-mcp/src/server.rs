@@ -729,10 +729,19 @@ struct HandoffBeginArgs {
     /// Files touched during the session.
     #[serde(default)]
     files_touched: Vec<String>,
-    /// Working directory at the time of handoff. Used to match the
-    /// next agent's `memory_handoff_accept` call.
+    /// Working directory at the time of handoff. Recorded on the handoff and
+    /// used to scope AUTOMATIC session-end handoffs by path boundary. A handoff
+    /// created through this tool is project-wide, so `cwd` does not narrow who
+    /// receives it — ownership does.
     #[serde(default)]
     cwd: Option<String>,
+    /// Publish the handoff to everyone in the project instead of keeping it for
+    /// you. By default a handoff belongs to the operator that created it, so on
+    /// a shared server a teammate's session cannot consume it by accident. Set
+    /// this when you deliberately want to pass the baton to whoever picks the
+    /// project up next.
+    #[serde(default)]
+    shared: Option<bool>,
     /// Project to scope the handoff to. Omit to target the project you're
     /// currently working in (resolved from recent hook activity). When set to a
     /// name that doesn't exist yet, the project is **created** — so the handoff
@@ -758,6 +767,12 @@ struct HandoffAcceptArgs {
     /// project (the SessionStart hook usually pre-fetches it into context).
     #[serde(default)]
     cwd: Option<String>,
+    /// Also consider handoffs that belong to OTHER operators. Off by default:
+    /// on a shared server you only see your own plus the ones published to the
+    /// whole project. Use this for recovery ("somebody left a baton here and
+    /// they are away"), knowing it consumes their handoff.
+    #[serde(default)]
+    any_owner: Option<bool>,
     /// Project to accept a handoff from. Omit to target the project you're
     /// currently working in (resolved from recent hook activity). **Omit unless the user explicitly names a *different* project.**
     #[serde(default)]
@@ -772,6 +787,10 @@ struct HandoffAcceptArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffCancelArgs {
+    /// Cancel even when the handoff belongs to another operator. Off by
+    /// default; requires the same authority as other cross-operator actions.
+    #[serde(default)]
+    any_owner: Option<bool>,
     /// Exact handoff id returned by `memory_handoff_begin`. Required so this
     /// tool only discards a handoff the agent can identify.
     handoff_id: String,
@@ -1051,7 +1070,14 @@ impl AiMemoryServer {
             return ai_memory_core::ActorKey::default();
         };
         let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
-        let user = ctx.and_then(|c| c.user.clone());
+        // Same identity rule as the hook ingress, which is the side that
+        // PUBLISHES into this map: keying on `user` here while the router keyed
+        // on the whole qualified identity would put a sub-only proxied
+        // operator's writes in one slot and their reads in another, so
+        // `[auto_scope] per_actor` would silently miss on every read.
+        let user = ctx
+            .and_then(ai_memory_core::ActorContext::identity_key)
+            .map(|key| key.storage_key());
         let header_session = |name: &str| {
             parts
                 .headers
@@ -1847,6 +1873,50 @@ impl AiMemoryServer {
                 ),
                 None,
             )),
+        }
+    }
+
+    /// Ask the admission chain's deciders about an operation that writes no
+    /// page, and hand back the context its observers are owed once the
+    /// operation has actually happened.
+    ///
+    /// The observers are deliberately NOT run here: these tools decide before
+    /// they know whether there is anything to do (an accept may find no
+    /// handoff, a cancel may be refused by ownership), and a mirror told about
+    /// an operation the engine then abandons has been lied to. Pass the context
+    /// to [`Self::notify_operation_observers`] on the success path only — the
+    /// same order the hook ingress uses for the same ops.
+    ///
+    /// A no-op when the server was built without a wiki handle (stdio/tests).
+    async fn authorize_operation(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        op: ai_memory_wiki::AdmissionOp,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<ai_memory_wiki::AdmissionContext>, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Ok(None);
+        };
+        // Forward the caller's webhook skip-list, exactly like the write and
+        // admin admission paths do. Dropping it breaks the documented
+        // loop-prevention header: a webhook that reacts to one of these ops by
+        // calling back into the engine would re-trigger itself forever.
+        wiki.authorize_operation(
+            ws,
+            proj,
+            op,
+            crate::actor::actor_from_parts(parts),
+            crate::actor::skip_webhooks_from_parts(parts),
+        )
+        .await
+        .map_err(|e| McpError::invalid_request(e.to_string(), None))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation that landed.
+    fn notify_operation_observers(&self, ctx: Option<&ai_memory_wiki::AdmissionContext>) {
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), ctx) {
+            wiki.notify_operation_observers(ctx);
         }
     }
 
@@ -2660,7 +2730,11 @@ impl AiMemoryServer {
         the next agent reads those first; long prose summaries make the \
         TUI rendering ugly. `files_touched` is a hint, not exhaustive. \
         \
-        Use `cwd` to scope the handoff to a specific working directory.")]
+        By default the handoff BELONGS TO YOU: on a server shared by several \
+        operators, a teammate's session will not consume it. Pass \
+        `shared: true` to hand the baton to whoever opens the project next. \
+        `cwd` is recorded for reference; it does not restrict who receives a \
+        handoff created here.")]
     async fn memory_handoff_begin(
         &self,
         Parameters(args): Parameters<HandoffBeginArgs>,
@@ -2706,6 +2780,11 @@ impl AiMemoryServer {
             "handoff file",
             "handoff files_touched",
         );
+        let creator = crate::actor::actor_from_parts(&parts);
+        let distinguishes = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
@@ -2721,12 +2800,27 @@ impl AiMemoryServer {
             open_questions,
             next_steps,
             files_touched,
+            // A handoff belongs to whoever created it unless it is explicitly
+            // published. With no actor, or on a deployment that does not tell
+            // its operators apart, this stays None and the handoff is
+            // project-wide, exactly as it behaved before ownership existed —
+            // see [`ai_memory_core::owner_stamp`] for why naming the single
+            // operator would split them across transports.
+            owner_user: if args.shared.unwrap_or(false) {
+                None
+            } else {
+                ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
+            },
         };
+        let admission = self
+            .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
+            .await?;
         let id = self
             .writer
             .insert_handoff(handoff)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({ "handoff_id": id.to_string() }))
     }
 
@@ -2762,20 +2856,68 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        let actor_user = crate::actor::actor_from_parts(&parts)
+            .identity_key()
+            .map(|key| key.storage_key());
+        let owner_filter = if args.any_owner.unwrap_or(false) {
+            // Reading another operator's baton consumes it and hands over text
+            // synthesised from their prompts, so this opt-out is an operator
+            // action — gated exactly like `all_owners` on /admin/open-sessions,
+            // rather than being a free argument any caller can set.
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            match actor_user.clone() {
+                Some(key) => ai_memory_core::OwnerFilter::User(key),
+                None => ai_memory_core::OwnerFilter::Unattributed,
+            }
+        };
         let receiving_cwd = args.cwd;
         let handoff = self
             .reader
-            .latest_open_handoff(ws, proj, receiving_cwd.clone())
+            .latest_open_handoff(ws, proj, receiving_cwd.clone(), owner_filter.clone())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match handoff {
             None => ok_json(&serde_json::json!({ "handoff": null })),
             Some(h) => {
-                self.writer
-                    .accept_handoff(h.id, AgentKind::Other, None, receiving_cwd)
+                // Admission is asked here, not before the lookup: the routine
+                // outcome of this tool is `{"handoff": null}` — the tool's own
+                // description says so, because the SessionStart hook has
+                // usually already consumed the baton — and asking up front
+                // announces an accept on every one of those calls. A webhook
+                // is only worth asking once there is a handoff to accept.
+                let admission = self
+                    .authorize_operation(
+                        ws,
+                        proj,
+                        ai_memory_wiki::AdmissionOp::HandoffAccept,
+                        &parts,
+                    )
+                    .await?;
+                // Deliver the body only when THIS call is the one that claimed
+                // it. The accept is an atomic compare-and-set, so a racing
+                // session (or a caller the owner does not admit) gets `false`
+                // here; returning the handoff anyway would hand the same baton
+                // to two agents.
+                let claimed = self
+                    .writer
+                    .accept_handoff(
+                        h.id,
+                        AgentKind::Other,
+                        None,
+                        actor_user.clone(),
+                        owner_filter,
+                        receiving_cwd,
+                    )
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                ok_json(&serde_json::json!({ "handoff": h }))
+                if claimed {
+                    self.notify_operation_observers(admission.as_ref());
+                    ok_json(&serde_json::json!({ "handoff": h }))
+                } else {
+                    ok_json(&serde_json::json!({ "handoff": null }))
+                }
             }
         }
     }
@@ -2823,16 +2965,46 @@ impl AiMemoryServer {
                 "state": handoff.state.as_str(),
             }));
         }
+        // Cancelling is scoped the same way as accepting: you can discard your
+        // own handoff or one published to the project, not a teammate's — with
+        // the same admin-gated opt-out, so a handoff whose owner no longer
+        // matches any reachable identity (renamed root_username, a stdio
+        // caller, a departed teammate) stays cancellable instead of becoming
+        // permanently stuck.
+        //
+        // Resolved BEFORE the chain is consulted, the order
+        // `memory_handoff_accept` uses: a caller refused this escape hatch has
+        // no operation to admit, so the server must not POST one out to every
+        // reject-policy webhook on their behalf.
+        let cancel_owner_filter = if args.any_owner.unwrap_or(false) {
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(&parts))
+        };
+        let admission = self
+            .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffCancel, &parts)
+            .await?;
         let cancelled = self
             .writer
-            .cancel_handoff(handoff_id)
+            .cancel_handoff(handoff_id, cancel_owner_filter)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({
+        if cancelled {
+            self.notify_operation_observers(admission.as_ref());
+        }
+        let mut result = serde_json::json!({
             "handoff_id": handoff_id.to_string(),
             "cancelled": cancelled,
             "state": if cancelled { "expired" } else { "open" },
-        }))
+        });
+        if !cancelled && handoff.owner_user.is_some() {
+            // Otherwise this reads as a plain no-op and the caller cannot tell
+            // that ownership is what refused it.
+            result["reason"] =
+                serde_json::json!("handoff belongs to another operator; retry with any_owner=true");
+        }
+        ok_json(&result)
     }
 
     /// Report aggregate counts (pages, sessions, observations).
@@ -2888,7 +3060,14 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(
+                ws,
+                proj,
+                limit,
+                ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(
+                    &parts,
+                )),
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         ok_json(&snapshot)
@@ -2924,7 +3103,14 @@ impl AiMemoryServer {
             .await?;
         let snapshot = self
             .reader
-            .briefing_for_project(ws, proj, limit)
+            .briefing_for_project(
+                ws,
+                proj,
+                limit,
+                ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(
+                    &parts,
+                )),
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -3459,7 +3645,9 @@ mod tests {
         assert_eq!(
             AiMemoryServer::actor_key_from_parts(Some(&parts)),
             ai_memory_core::ActorKey {
-                user: Some("alice".into()),
+                // Qualified: the same storage key the hook ingress publishes
+                // under, so set and get land on the same slot.
+                user: Some("user:alice".into()),
                 session_id: Some("session-from-header".into()),
             },
             "real HTTP request parts must preserve auth identity and routing session"
@@ -3883,6 +4071,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -3992,7 +4181,9 @@ mod tests {
 
         let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
 
-        assert_eq!(actor.user.as_deref(), Some("alice"));
+        // The map is keyed by the QUALIFIED identity — the same storage key
+        // the hook ingress publishes under — never the raw username.
+        assert_eq!(actor.user.as_deref(), Some("user:alice"));
         assert_eq!(actor.session_id.as_deref(), Some("context-session"));
     }
 
@@ -5548,6 +5739,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5622,6 +5814,7 @@ mod tests {
                 project_id: scoped,
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -7587,6 +7780,7 @@ mod tests {
                     cwd: Some(r"C:\GIT\ai-memory".into()),
                     project: None,
                     workspace: None,
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7629,6 +7823,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7649,6 +7844,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7670,6 +7866,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7697,6 +7894,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7709,6 +7907,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7741,6 +7940,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7753,6 +7953,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7800,6 +8001,7 @@ mod tests {
                     cwd: None,
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7813,6 +8015,7 @@ mod tests {
                     cwd: None,
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7836,6 +8039,7 @@ mod tests {
                     cwd: None,
                     project: Some("sibling-app".into()),
                     workspace: Some("djalmajr".into()),
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7866,6 +8070,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    shared: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7905,6 +8110,7 @@ mod tests {
                     handoff_id: handoff_id.clone(),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -7944,6 +8150,7 @@ mod tests {
                     cwd: Some("/tmp/aim".into()),
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -8196,6 +8403,7 @@ mod tests {
                     cwd: None,
                     project: None,
                     workspace: None,
+                    any_owner: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
