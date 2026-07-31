@@ -101,7 +101,11 @@ what the project is and is not designed to defend against.
 - **Published executable integrity.** Docker wrapper and standalone hook
   installs use GitHub Release assets with SHA-256 companions. GitHub Actions
   are pinned to reviewed commits and release jobs default to read-only token
-  permissions except the GitHub Release publisher.
+  permissions except the GitHub Release publisher. Gitleaks checks each pushed
+  or proposed commit range and a separate weekly/manual workflow checks the
+  complete reachable history. The full-history scan recognizes only reviewed,
+  exact fingerprints in `.gitleaksignore`; adding an entry never substitutes
+  for removing the value from the current tree and rotating a real credential.
 
 ### Out of scope for v1
 

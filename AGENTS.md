@@ -221,8 +221,9 @@ cargo deny check                                          # dependency policy (i
   `tests/e2e/handoff_smoke.sh`, `scripts/check-native-packaging.sh`.
 - CI additionally runs `cargo build --release --bin ai-memory` on
   Linux/macOS, a Docker image smoke test, `cargo audit` (with the ignores
-  listed in `ci.yml`), gitleaks secret scanning, and a non-gating Windows
-  test job.
+  listed in `ci.yml`), differential gitleaks scanning, and a non-gating
+  Windows test job. `.github/workflows/secret-scan.yml` runs the separate
+  weekly/manual full-history gitleaks scan.
 
 ## Code style guidelines
 
