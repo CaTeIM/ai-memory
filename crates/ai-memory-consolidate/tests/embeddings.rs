@@ -154,7 +154,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         "the karpathy page should be the top hybrid hit; got {top_path}",
     );
 
-    // 4. Without a query vector, FTS5 + graph still work through the
+    // 4. Without a query vector, FTS5 + entity + graph still work through the
     //    same method; only the vector stream is absent.
     let lexical_graph = store
         .reader
@@ -173,7 +173,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         .expect("hybrid (no query vec)");
     assert!(
         !lexical_graph.is_empty(),
-        "FTS5 + graph fallback should still return Karpathy page",
+        "FTS5 + entity + graph fallback should still return Karpathy page",
     );
 
     // 5. Re-writing a page produces a fresh embedding row (the

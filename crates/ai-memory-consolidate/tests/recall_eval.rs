@@ -1,9 +1,10 @@
 //! Recall@5 eval harness.
 //!
 //! Loads a small hand-crafted corpus + a probe set, measures recall@5
-//! against both the pure-FTS5 path and the hybrid (FTS5 + graph RRF +
-//! vector) path, and asserts a baseline. It also pins graph-neighbor
-//! expansion and raw observation fallback. The point is *the framework*: once the
+//! against both the pure-FTS5 path and the hybrid (FTS5 + entity + graph RRF +
+//! vector) path, and asserts a baseline. It also pins entity-only recall,
+//! graph-neighbor expansion, and raw observation fallback. The point is *the
+//! framework*: once the
 //! harness is in CI, anyone can drop in real embeddings (set the
 //! `AI_MEMORY_EMBEDDING_PROVIDER` env vars + plug in a real model) and
 //! watch the numbers move. The synthetic embedder shipped for tests is
