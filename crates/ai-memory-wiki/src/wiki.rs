@@ -2067,6 +2067,7 @@ mod tests {
                 warnings_json: serde_json::json!([]),
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({}),
+                staged_by_actor_user: None,
                 proposal_actor: ActorContext {
                     agent: Some("auto_improve".into()),
                     ..ActorContext::default()

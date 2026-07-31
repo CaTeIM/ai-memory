@@ -33,11 +33,12 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun, artifact_path_for,
+    RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
-    salience_after_feedback,
+    retention_score_with_breadth, salience_after_feedback,
 };
 pub use error::{StoreError, StoreResult};
 pub use maintenance::MaintenanceJob;
@@ -198,6 +199,7 @@ mod tests {
             warnings_json: serde_json::json!([]),
             rejected_candidates_json: serde_json::json!([]),
             config_json: serde_json::json!({"mode":"stage"}),
+            staged_by_actor_user: None,
             proposal_actor: ActorContext {
                 agent: Some("auto_improve".into()),
                 ..ActorContext::default()
@@ -551,20 +553,39 @@ mod tests {
         migrations::run_to(&mut conn, 23).unwrap();
         let ws = ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let proj = ops::get_or_create_project(&mut conn, &ws, "app", None).unwrap();
-        let id = auto_improve::stage_run(
-            &mut conn,
-            &stage_input(
-                ws,
-                proj,
-                vec![proposal(
-                    "notes/old.md",
-                    AutoImproveProposalOperation::Create,
-                    "old",
-                )],
-            ),
+        // Era-appropriate raw insert: this fixture stops at V23 on purpose,
+        // while `stage_run` writes whatever columns the CURRENT schema has, and
+        // every later migration that adds one would break a test about an older
+        // era.
+        let id = ai_memory_core::AutoImproveProposalId::new();
+        let run_id = ai_memory_core::AutoImproveRunId::new();
+        let now = jiff::Timestamp::now().as_microsecond();
+        conn.execute(
+            "INSERT INTO auto_improve_runs \
+             (id, workspace_id, project_id, warnings_json, rejected_candidates_json, \
+              config_json, proposal_actor_json, created_at) \
+             VALUES (?1, ?2, ?3, '[]', '[]', '{}', '{}', ?4)",
+            params![run_id.as_bytes(), ws.as_bytes(), proj.as_bytes(), now],
         )
-        .unwrap()
-        .proposal_ids[0];
+        .unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_proposals \
+             (id, run_id, workspace_id, project_id, status, operation, target_path, kind, \
+              title, confidence, rationale, evidence_json, body_markdown, body_sha256, \
+              artifact_path, staged_at) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'create', 'notes/old.md', 'note', 'old', \
+                     0.9, 'r', '[]', 'body', ?5, ?6, ?7)",
+            params![
+                id.as_bytes(),
+                run_id.as_bytes(),
+                ws.as_bytes(),
+                proj.as_bytes(),
+                &sha256("body")[..],
+                auto_improve::artifact_path_for(id),
+                now,
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         let store = Store::open(tmp.path()).unwrap();
@@ -3172,6 +3193,7 @@ mod tests {
                 warnings_json: serde_json::json!([]),
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({ "trigger": "scheduler" }),
+                staged_by_actor_user: None,
                 proposal_actor: ActorContext {
                     agent: Some("auto_improve".into()),
                     ..ActorContext::default()

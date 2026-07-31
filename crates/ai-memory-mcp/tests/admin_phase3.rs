@@ -102,6 +102,7 @@ fn telemetry_stage_input(
         warnings_json: serde_json::json!([]),
         rejected_candidates_json: serde_json::json!([]),
         config_json: serde_json::json!({}),
+        staged_by_actor_user: None,
         proposal_actor: ActorContext::default(),
         proposals: vec![NewAutoImproveProposal {
             operation: AutoImproveProposalOperation::Create,

@@ -2198,6 +2198,49 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the number of DISTINCT operators that reinforced each
+    /// `is_latest = 1` page of a project, for the sweep's breadth term.
+    ///
+    /// Scoped and grouped exactly like [`decay_candidates`](Self::decay_candidates)
+    /// so the sweep pays for one query per run, never one per candidate. Pages
+    /// with no per-operator rows (everything read anonymously, and everything
+    /// that predates `page_access`) are simply absent from the map, which the
+    /// caller reads as breadth 0 — scored identically to breadth 1 by
+    /// [`retention_score_with_breadth`](crate::retention_score_with_breadth).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn access_breadth_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT pa.page_id, COUNT(DISTINCT pa.actor) \
+                 FROM page_access pa \
+                 JOIN pages p ON p.id = pa.page_id \
+                 WHERE p.workspace_id = ?1 AND p.project_id = ?2 AND p.is_latest = 1 \
+                 GROUP BY pa.page_id",
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| {
+                    let id: Vec<u8> = row.get(0)?;
+                    let actors: i64 = row.get(1)?;
+                    Ok((id, u32::try_from(actors).unwrap_or(u32::MAX)))
+                },
+            )?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (id, actors) = r?;
+                out.insert(PageId::from_slice(&id)?, actors);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Rank pages by how many of the query's tokens match their indexed
     /// entities, weighting each match by inverse entity frequency — a
     /// query token matching an entity that appears on 2 pages is a much
@@ -4491,7 +4534,8 @@ impl ReaderPool {
                             target_body_sha256_at_stage, target_updated_at_at_stage, \
                             decision_reason, decided_by_author_id, decided_by_actor_json, \
                             applied_page_id, checkpoint, edit_mode, patch_json, \
-                            expected_base_body_sha256, materialized_base_body_sha256 \
+                            expected_base_body_sha256, materialized_base_body_sha256, \
+                            staged_by_actor_user \
                      FROM auto_improve_proposals \
                      WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
                     params![
@@ -4549,6 +4593,7 @@ impl ReaderPool {
                                 .map_err(to_sql_err)?,
                             expected_base_body_sha256: opt_bytes32(row.get(28)?)
                                 .map_err(to_sql_err)?,
+                            staged_by_actor_user: row.get(30)?,
                             materialized_base_body_sha256: opt_bytes32(row.get(29)?)
                                 .map_err(to_sql_err)?,
                             events: Vec::new(),
@@ -5355,9 +5400,10 @@ impl ReaderPool {
     /// visible from the store, so the caller passes the second in — a
     /// proxy-only deployment reports `users_exist() == false` forever.
     ///
-    /// One notion, several gates: the admin authorization boundaries all key
-    /// on this, so a single-operator server keeps the exact behaviour it had
-    /// before either route existed.
+    /// One notion, several gates: the admin authorization boundaries and the
+    /// per-author bucketing of pending auto-improve proposals all key on this,
+    /// so a single-operator server keeps the exact behaviour it had before
+    /// either route existed.
     ///
     /// # Errors
     /// Propagates any SQL or pool error so callers can fail closed.

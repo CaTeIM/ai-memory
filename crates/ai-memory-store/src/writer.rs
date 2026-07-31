@@ -183,6 +183,7 @@ pub(crate) enum WriteCmd {
     },
     BumpAccess {
         page_ids: Vec<PageId>,
+        actor: Option<String>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordPageFeedback {
@@ -857,12 +858,20 @@ impl WriterHandle {
 
     /// Bump access counters for a set of pages (M8 reinforcement term).
     ///
+    /// `actor` is the reading operator's qualified identity storage key
+    /// (`IdentityKey::storage_key()`); `None` records only the shared scalar.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn bump_access(&self, page_ids: Vec<PageId>) -> StoreResult<()> {
+    pub async fn bump_access(
+        &self,
+        page_ids: Vec<PageId>,
+        actor: Option<String>,
+    ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
             page_ids,
+            actor,
             reply: tx,
         })
         .await?;
@@ -1749,8 +1758,12 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_page_feedback");
             }
-            WriteCmd::BumpAccess { page_ids, reply } => {
-                let result = ops::bump_access_for_pages(&mut conn, &page_ids);
+            WriteCmd::BumpAccess {
+                page_ids,
+                actor,
+                reply,
+            } => {
+                let result = ops::bump_access_for_pages(&mut conn, &page_ids, actor.as_deref());
                 send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {

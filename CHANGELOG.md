@@ -31,6 +31,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exist", so a trusted-proxy deployment — which never writes a `users` row —
   gets root-only admin gating instead of waving every proxied caller through
   the single-operator escape hatch (#333).
+- Pending auto-improve proposals record who staged them (V42
+  `staged_by_actor_user`, the qualified identity key, surfaced on the proposal
+  detail), and the one-pending-per-target rule is scoped per operator through
+  a NULL-collapsing unique index, so one operator's pending suggestion stops
+  blocking everybody else's for the same page while every unattributed caller
+  — single-operator servers, the scheduler, the telemetry report, the curator
+  — keeps the original one-per-page rule unchanged (#310).
+- Page reinforcement is recorded per operator (V43 `page_access`, keyed on the
+  identity storage key) beside the untouched shared counter, and the retention
+  formula gains an opt-in breadth term: `[decay] breadth_weight` (default
+  `0.0`) lets a page read by many distinct operators outrank one read as often
+  by a single person. Provably identity at the default weight and at 0 or 1
+  distinct readers under any weight, so no existing eviction decision moves
+  until an operator deliberately turns it on; the per-operator access-bump
+  throttle keys on (page, operator) so one reader cannot swallow a
+  colleague's reinforcement inside the cooldown window (#310).
+
+### Fixed
+- A staged auto-improve proposal colliding with one already pending no longer
+  aborts its whole staging run (losing the run row, its sibling proposals and
+  the paid LLM review): the colliding proposal alone is skipped, and every
+  staging surface — `memory_auto_improve`, `/admin/auto-improve`, the
+  telemetry report, the curator, the CLI and the scheduler's log — names the
+  skipped target and the reason instead of silently returning N-1 proposals
+  (#310).
 
 ## [1.21.0] - 2026-07-31
 
