@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-07-31
+
 ### Added
 - Per-page TTL via a frontmatter `expires_at:` key (RFC3339, or a bare
   `YYYY-MM-DD` meaning end of that day UTC), mirrored into a new
@@ -2686,7 +2688,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.20.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.21.0...HEAD
+[1.21.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.21.0
 [1.20.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.2
 [1.20.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.1
 [1.20.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.0
