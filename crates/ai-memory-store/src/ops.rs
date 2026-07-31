@@ -1102,7 +1102,14 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
 /// Bump `access_count` + `last_accessed_at` for the pages whose ids
 /// appear in `page_ids`. Idempotent for unknown ids (no-op).
 /// Used by the read path to feed the M8 reinforcement term.
-pub fn bump_access_for_pages(conn: &mut Connection, page_ids: &[PageId]) -> StoreResult<()> {
+///
+/// `actor` is the reading operator's qualified identity storage key
+/// (`IdentityKey::storage_key()`), or `None` for an unattributed read.
+pub fn bump_access_for_pages(
+    conn: &mut Connection,
+    page_ids: &[PageId],
+    actor: Option<&str>,
+) -> StoreResult<()> {
     if page_ids.is_empty() {
         return Ok(());
     }
@@ -1116,6 +1123,30 @@ pub fn bump_access_for_pages(conn: &mut Connection, page_ids: &[PageId]) -> Stor
         )?;
         for id in page_ids {
             stmt.execute(params![now, id.as_bytes()])?;
+        }
+        // Per-operator reinforcement, recorded in the SAME transaction so the
+        // scalar and the breakdown cannot drift. Purely additive: the scalar
+        // above is what the retention formula still reads by default.
+        if let Some(actor) = actor.filter(|a| !a.trim().is_empty()) {
+            // The `WHERE EXISTS` guard is what keeps the documented idempotence
+            // for unknown ids: `page_access.page_id` REFERENCES `pages(id)` and
+            // the writer connection runs with `foreign_keys` ON, so a bare
+            // INSERT for a page deleted between the search and this (detached,
+            // post-response) bump would raise a FK violation and roll back the
+            // WHOLE batch — costing every other page in the result set its
+            // reinforcement. `INSERT OR IGNORE` does not help: it suppresses
+            // constraint conflicts, not FK violations. The predicate mirrors the
+            // UPDATE above so the scalar and the breakdown cannot drift.
+            let mut per_actor = tx.prepare(
+                "INSERT INTO page_access (page_id, actor, count, last_accessed_at) \
+                 SELECT ?1, ?2, 1, ?3 \
+                 WHERE EXISTS (SELECT 1 FROM pages WHERE id = ?1 AND is_latest = 1) \
+                 ON CONFLICT(page_id, actor) DO UPDATE \
+                 SET count = count + 1, last_accessed_at = excluded.last_accessed_at",
+            )?;
+            for id in page_ids {
+                per_actor.execute(params![id.as_bytes(), actor, now])?;
+            }
         }
     }
     tx.commit()?;

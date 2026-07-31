@@ -394,7 +394,12 @@ pub struct AiMemoryServer {
     /// repeated or overlapping queries from flooding the single writer
     /// actor with redundant reinforcement writes. Shared across `Clone`s
     /// so every request handler consults the same clock.
-    access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
+    ///
+    /// Keyed by operator as well as page: with a page-only key one operator's
+    /// read swallows everyone else's reinforcement for the whole window, so the
+    /// counter measures "distinct minutes in which SOMEBODY read this",
+    /// undercounting in proportion to team size.
+    access_bump_seen: Arc<Mutex<AccessBumpSeen>>,
     /// True when a trusted authenticating proxy is configured to assert end-user
     /// identities (`[auth].actor_proxy_bearer_token`).
     ///
@@ -1666,7 +1671,11 @@ impl AiMemoryServer {
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let hits = self.rerank_hits(&args.query, hits, limit).await;
-        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+        let bump_actor = Self::bump_actor_from_parts(&parts);
+        self.spawn_access_bump(
+            hits.iter().map(|(h, _)| h.id).collect(),
+            bump_actor.as_deref(),
+        );
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
         // for explicit `scopes` — the recommended scope-bleed mitigation —
@@ -1744,7 +1753,10 @@ impl AiMemoryServer {
                             )
                             .await
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        self.spawn_access_bump(hits.iter().map(|(h, _)| h.id).collect());
+                        self.spawn_access_bump(
+                            hits.iter().map(|(h, _)| h.id).collect(),
+                            bump_actor.as_deref(),
+                        );
                         hits.into_iter()
                             .map(|(hit, score_details)| QueryHit { hit, score_details })
                             .collect()
@@ -1823,7 +1835,10 @@ impl AiMemoryServer {
             .recent_pages_for_project(ws, proj, limit)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
+        self.spawn_access_bump(
+            hits.iter().map(|h| h.id).collect(),
+            Self::bump_actor_from_parts(&parts).as_deref(),
+        );
         ok_json(&MemoryRecentResponse {
             hits,
             global_hits: Vec::new(),
@@ -2290,6 +2305,26 @@ impl AiMemoryServer {
             run_auto_improve_review(&self.reader, &**llm, ws, proj, session_id, cfg.clone())
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        // Whose suggestion this is; it also scopes the one-pending-per-target
+        // rule (V42). Only meaningful where operators are actually told apart:
+        // on a single-operator server the caller would otherwise stage into
+        // bucket `user:<root_username>` while the scheduler and the report
+        // handlers stage into the unattributed one, so two proposals could be
+        // pending for the same page — the collision V42 promises cannot
+        // happen. The schema stays able to express per-author; this rule
+        // decides when that matters.
+        //
+        // Both halves go through the shared accessors — `identity_key` for
+        // "which human is this", `owner_stamp` for "does this deployment name
+        // them" — so this tool and its `/admin/auto-improve` sibling compute
+        // the SAME bucket for the same operator; a bucket computed two ways
+        // eventually disagrees with itself.
+        let staged_by_actor_user = ai_memory_core::owner_stamp(
+            request_actor.identity_key().as_ref(),
+            self.deployment_distinguishes_operators()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        );
         let mut proposals = Vec::with_capacity(report.proposals.len());
         for p in &report.proposals {
             let path = PagePath::new(p.path.clone()).map_err(|e| {
@@ -2373,6 +2408,7 @@ impl AiMemoryServer {
                     ..ai_memory_core::ActorContext::default()
                 },
                 proposals,
+                staged_by_actor_user,
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2439,6 +2475,14 @@ impl AiMemoryServer {
             "warnings": report.warnings,
             "rejected_candidates_count": report.rejected_candidates.len(),
             "proposals": outcomes,
+            // Proposals the reviewer produced but the store never staged —
+            // one-pending-per-target collisions — with the target path and the
+            // reason. Without this the agent sees a successful run of N-1
+            // proposals and nothing saying the Nth ever existed, the silent
+            // drop the per-proposal skip set out to end. Always present (empty
+            // on a clean run), and additive: a consumer that ignores the key
+            // reads the response exactly as before.
+            "skipped": staged.skipped,
         }))
     }
 
@@ -3420,6 +3464,12 @@ fn moonshot_safe_tool_list(tools: Vec<Tool>) -> Vec<Tool> {
 /// day/week-scale retention scoring.
 const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Throttle bookkeeping for access-count bumps, keyed by page AND operator.
+///
+/// The operator half is what stops one person's read from swallowing everyone
+/// else's reinforcement for the whole window.
+type AccessBumpSeen = HashMap<(PageId, Option<String>), Instant>;
+
 /// Pick the page ids due for an access bump, updating the cooldown clock in
 /// place: a page is due when it has not been bumped within `cooldown`.
 /// Entries that have aged past `cooldown` are pruned in the same pass, so the
@@ -3427,8 +3477,9 @@ const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
 /// distinct page ever searched. Kept pure and synchronous so the throttle
 /// policy is unit-testable without a store or async runtime.
 fn select_bumpable(
-    seen: &mut HashMap<PageId, Instant>,
+    seen: &mut AccessBumpSeen,
     ids: Vec<PageId>,
+    actor: Option<&str>,
     now: Instant,
     cooldown: Duration,
 ) -> Vec<PageId> {
@@ -3437,23 +3488,41 @@ fn select_bumpable(
     seen.retain(|_, last| now.duration_since(*last) < cooldown);
     let mut fresh = Vec::new();
     for id in ids {
+        let id = (id, actor.map(str::to_string));
         // After the prune, an occupied slot means "still within cooldown" —
         // skip it, and do not refresh its timestamp: refreshing would starve
         // a continuously-hot page of its once-per-window bump entirely.
-        if let Entry::Vacant(slot) = seen.entry(id) {
+        if let Entry::Vacant(slot) = seen.entry(id.clone()) {
             slot.insert(now);
-            fresh.push(id);
+            fresh.push(id.0);
         }
     }
     fresh
 }
 
 impl AiMemoryServer {
+    /// The caller's qualified identity storage key
+    /// ([`ai_memory_core::IdentityKey::storage_key`]), for keying the bump
+    /// throttle and the `page_access` rows it feeds. One derivation for both:
+    /// a throttle keyed one way and a table keyed another would throttle one
+    /// operator's reads against another's rows.
+    fn bump_actor_from_parts(parts: &axum::http::request::Parts) -> Option<String> {
+        parts
+            .extensions
+            .get::<ai_memory_core::ActorContext>()
+            .and_then(ai_memory_core::ActorContext::identity_key)
+            .map(|key| key.storage_key())
+    }
+
     /// Fire-and-forget access-counter bump for the M8 reinforcement term,
-    /// throttled to at most one bump per page per [`ACCESS_BUMP_COOLDOWN`]
-    /// (see [`select_bumpable`]). Failures are logged at warn but never
-    /// surfaced to the caller.
-    fn spawn_access_bump(&self, ids: Vec<PageId>) {
+    /// throttled to at most one bump per page PER OPERATOR per
+    /// [`ACCESS_BUMP_COOLDOWN`] (see [`select_bumpable`]). Keyed per operator
+    /// on purpose: a throttle keyed on the page alone would let whoever read
+    /// it first swallow everybody else's reinforcement inside the window, so
+    /// breadth — the signal `[decay] breadth_weight` exists to read — would
+    /// under-count exactly on the busy pages it matters for. Failures are
+    /// logged at warn but never surfaced to the caller.
+    fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&str>) {
         if ids.is_empty() {
             return;
         }
@@ -3462,14 +3531,17 @@ impl AiMemoryServer {
                 .access_bump_seen
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            select_bumpable(&mut seen, ids, Instant::now(), ACCESS_BUMP_COOLDOWN)
+            select_bumpable(&mut seen, ids, actor, Instant::now(), ACCESS_BUMP_COOLDOWN)
         };
         if fresh.is_empty() {
             return;
         }
         let writer = self.writer.clone();
+        // Carried into the write so reinforcement is recorded per operator as
+        // well as in the shared counter.
+        let actor = actor.map(str::to_string);
         tokio::spawn(async move {
-            if let Err(e) = writer.bump_access(fresh).await {
+            if let Err(e) = writer.bump_access(fresh, actor).await {
                 tracing::warn!(error = %e, "access bump failed");
             }
         });
@@ -8730,6 +8802,265 @@ mod tests {
         );
     }
 
+    /// Reviewer that always proposes the same two pages, so one of them can be
+    /// made to collide with an already-pending proposal.
+    struct TwoProposalAutoImproveLlm;
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for TwoProposalAutoImproveLlm {
+        fn name(&self) -> &'static str {
+            "fake-auto-improve"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            Ok(ai_memory_llm::ChatResponse {
+                text: String::new(),
+                usage: None,
+                model: self.model().to_string(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "summary": "two staged proposals",
+                "proposals": [
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/collides.md",
+                        "title": "Colliding Lesson",
+                        "kind": "note",
+                        "confidence": 0.93,
+                        "rationale": "A proposal for this page is already pending.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# Colliding Lesson\n\nsecond proposal"
+                    },
+                    {
+                        "operation": "create_or_update",
+                        "path": "notes/fresh.md",
+                        "title": "Fresh Lesson",
+                        "kind": "note",
+                        "confidence": 0.91,
+                        "rationale": "The session contains a durable lesson worth adding.",
+                        "evidence": [{"page":"session", "quote":"durable lesson"}],
+                        "body_markdown": "# Fresh Lesson\n\nfirst proposal"
+                    }
+                ],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
+    /// Stage one pending proposal for `notes/collides.md` into
+    /// `pending_bucket`, then run `memory_auto_improve` as `caller` against the
+    /// same page. Returns the tool's JSON so the caller can see whether the
+    /// second proposal collided or got its own bucket.
+    async fn auto_improve_over_pending_target(
+        trusted_proxy_identity: bool,
+        pending_bucket: Option<String>,
+        caller: Option<&str>,
+    ) -> serde_json::Value {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson worth capturing".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .stage_auto_improve_run(StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: Some("test".into()),
+                model: Some("model".into()),
+                summary: Some("earlier run".into()),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({}),
+                staged_by_actor_user: pending_bucket,
+                proposal_actor: ai_memory_core::ActorContext::default(),
+                proposals: vec![NewAutoImproveProposal {
+                    operation: AutoImproveProposalOperation::Create,
+                    target_path: PagePath::new("notes/collides.md").unwrap(),
+                    kind: "note".into(),
+                    title: "Colliding Lesson".into(),
+                    confidence: 0.9,
+                    rationale: "staged earlier".into(),
+                    evidence_json: serde_json::json!([]),
+                    body_markdown: "# Colliding Lesson\n\nfirst proposal".into(),
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(TwoProposalAutoImproveLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator)
+            .with_auto_improve_require_approval(true)
+            .with_trusted_proxy_identity(trusted_proxy_identity);
+
+        let mut parts = test_parts_default();
+        if let Some(user) = caller {
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some(user.to_string()),
+                ..ai_memory_core::ActorContext::default()
+            });
+        }
+
+        call_tool_json(
+            server
+                .memory_auto_improve(
+                    Parameters(AutoImproveArgs {
+                        session_id: Some(session_id.to_string()),
+                        dry_run: None,
+                        stage: None,
+                        mode: None,
+                        project: None,
+                        workspace: None,
+                        min_observations: Some(1),
+                        min_session_duration_secs: Some(0),
+                        min_confidence: Some(0.75),
+                        max_input_tokens: None,
+                        max_proposals: Some(5),
+                        include_raw_fallback: None,
+                    }),
+                    OptionalParts(parts),
+                )
+                .await
+                .expect("a collision must not fail the run"),
+        )
+    }
+
+    /// A proposal the store refuses to stage must reach the agent. Reporting
+    /// only `proposal_ids` shows a successful run of N-1 proposals with nothing
+    /// saying the Nth ever existed — the silent drop the per-proposal skip was
+    /// introduced to end.
+    #[tokio::test]
+    async fn memory_auto_improve_reports_a_collided_proposal_instead_of_dropping_it() {
+        // The default parts carry no operator, matching the unattributed
+        // bucket the pending proposal was staged into.
+        let json = auto_improve_over_pending_target(false, None, None).await;
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 1, "the sibling proposal still stages");
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1, "the collided proposal must be reported");
+        assert_eq!(skipped[0]["target_path"], "notes/collides.md");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "a skipped proposal must say why: {}",
+            skipped[0]
+        );
+    }
+
+    /// `[auth].root_username` alone does not make a server multi-operator. The
+    /// scheduler and the report handlers stage unattributed, so bucketing an
+    /// interactive call by its actor would leave TWO pending proposals for one
+    /// page on a single-operator server — exactly the collision V42 promises
+    /// cannot happen.
+    #[tokio::test]
+    async fn single_operator_auto_improve_shares_one_pending_bucket_with_the_scheduler() {
+        let json = auto_improve_over_pending_target(false, None, Some("the-operator")).await;
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 1, "the sibling proposal still stages");
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a named root operator must not open a second pending bucket for the same page"
+        );
+        assert_eq!(skipped[0]["target_path"], "notes/collides.md");
+    }
+
+    /// The other mode: once a trusted proxy tells operators apart, each one
+    /// gets their own pending slot instead of blocking the others — the point
+    /// of V42's author-scoped index. The pending bucket is built through the
+    /// identity contract, the same encoding `owner_stamp` produces for the
+    /// caller.
+    #[tokio::test]
+    async fn proxied_operators_each_hold_a_pending_proposal_for_the_same_page() {
+        let alice = ai_memory_core::IdentityKey::User("alice".into()).storage_key();
+        let json = auto_improve_over_pending_target(true, Some(alice), Some("bob")).await;
+
+        let proposals = json["proposals"].as_array().expect("proposals array");
+        assert_eq!(
+            proposals.len(),
+            2,
+            "a second operator must be able to propose for a page someone else has pending"
+        );
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert!(
+            skipped.is_empty(),
+            "nothing should collide across distinct operators: {skipped:?}"
+        );
+    }
+
     /// `memory_lint` reads the wiki to build its candidate set. With
     /// no wiki wired, it must error cleanly.
     #[tokio::test]
@@ -8987,28 +9318,67 @@ mod tests {
 
         // First sighting of both pages → both due, in input order.
         assert_eq!(
-            select_bumpable(&mut seen, vec![a, b], t0, cooldown),
+            select_bumpable(&mut seen, vec![a, b], None, t0, cooldown),
             vec![a, b]
         );
 
         // The same hot pages 30s later (inside the window) → nothing due, so
         // the writer actor is spared the redundant reinforcement writes.
         let t30 = t0 + Duration::from_secs(30);
-        assert!(select_bumpable(&mut seen, vec![a, b], t30, cooldown).is_empty());
+        assert!(select_bumpable(&mut seen, vec![a, b], None, t30, cooldown).is_empty());
 
         // A fresh page mixed in with the cooling ones → only the fresh one.
         assert_eq!(
-            select_bumpable(&mut seen, vec![a, b, c], t30, cooldown),
+            select_bumpable(&mut seen, vec![a, b, c], None, t30, cooldown),
             vec![c]
         );
 
         // Past the window, `a` is due again.
         let t90 = t0 + Duration::from_secs(90);
-        assert_eq!(select_bumpable(&mut seen, vec![a], t90, cooldown), vec![a]);
+        assert_eq!(
+            select_bumpable(&mut seen, vec![a], None, t90, cooldown),
+            vec![a]
+        );
 
         // Aged-out entries are pruned, so the map never grows without bound.
         let t_far = t0 + Duration::from_secs(1_000);
-        assert!(select_bumpable(&mut seen, Vec::new(), t_far, cooldown).is_empty());
+        assert!(select_bumpable(&mut seen, Vec::new(), None, t_far, cooldown).is_empty());
         assert!(seen.is_empty(), "aged-out entries must be pruned");
+    }
+
+    /// The throttle is keyed on (page, operator) ON PURPOSE: keyed on the page
+    /// alone, whoever read it first would swallow everybody else's
+    /// reinforcement inside the cooldown window, under-counting breadth
+    /// exactly on the busy pages it matters for.
+    #[test]
+    fn access_bump_throttle_is_per_operator_not_per_page() {
+        let cooldown = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let page = PageId::new();
+        let mut seen = HashMap::new();
+
+        let alice = ai_memory_core::IdentityKey::User("alice".into()).storage_key();
+        let bob = ai_memory_core::IdentityKey::User("bob".into()).storage_key();
+
+        // Alice reads first; inside the window Bob's read must still count.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![page], Some(&alice), t0, cooldown),
+            vec![page]
+        );
+        let t10 = t0 + Duration::from_secs(10);
+        assert_eq!(
+            select_bumpable(&mut seen, vec![page], Some(&bob), t10, cooldown),
+            vec![page],
+            "one operator's read must not swallow another's reinforcement"
+        );
+        // An unattributed read is its own throttle slot, not Alice's.
+        assert_eq!(
+            select_bumpable(&mut seen, vec![page], None, t10, cooldown),
+            vec![page]
+        );
+
+        // Each operator is still throttled against THEMSELVES.
+        assert!(select_bumpable(&mut seen, vec![page], Some(&alice), t10, cooldown).is_empty());
+        assert!(select_bumpable(&mut seen, vec![page], Some(&bob), t10, cooldown).is_empty());
     }
 }

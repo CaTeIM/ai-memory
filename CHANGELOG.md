@@ -86,6 +86,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consolidation and commits (a refusal skips the baton and is logged), and a
   refused, timed-out or unreachable claim leaves the handoff open for the next
   session (#334).
+- Pending auto-improve proposals record who staged them (V42
+  `staged_by_actor_user`, the qualified identity key, surfaced on the proposal
+  detail), and the one-pending-per-target rule is scoped per operator through
+  a NULL-collapsing unique index, so one operator's pending suggestion stops
+  blocking everybody else's for the same page while every unattributed caller
+  keeps the original one-per-page rule unchanged (#336).
+- Page reinforcement records each distinct authenticated operator (V43
+  `page_access`) beside the existing shared access counter. The opt-in
+  `[decay] breadth_weight` term (default `0.0`) lets the forget sweep retain
+  pages reinforced by several operators without changing existing scores at
+  the default or for pages with zero or one identified reader (#336).
 
 ### Fixed
 - Handoff and session ownership is stamped only where the deployment actually
@@ -154,6 +165,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shortest shipped client's one-second fetch timeout. A slow deciding webhook
   leaves the baton open instead of approving and consuming it after the caller
   has disconnected (#334).
+- A staged auto-improve proposal colliding with one already pending no longer
+  aborts its whole staging run (losing the run row, its sibling proposals and
+  the paid LLM review): the colliding proposal alone is skipped, and every
+  staging surface — `memory_auto_improve`, `/admin/auto-improve`, the
+  telemetry report, the curator, the CLI and the scheduler's log — names the
+  skipped target and the reason instead of silently returning N-1 proposals
+  (#336).
 
 ## [1.21.0] - 2026-07-31
 

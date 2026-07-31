@@ -57,8 +57,8 @@ use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapsho
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
     DecayParams, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
-    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
+    ScopeResolutionError, SkippedProposal, StageAutoImproveRun, StoreError, WriterHandle,
+    create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope, lookup_existing_workspace,
 };
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
 use axum::Json;
@@ -302,6 +302,10 @@ struct AutoImproveStageResponse {
     warnings: Vec<String>,
     rejected_candidates_count: usize,
     proposals: Vec<AutoImproveProposalOutcome>,
+    /// Proposals the reviewer produced but the store did not stage, with the
+    /// reason. Always present (empty on a clean run) so a consumer can tell
+    /// "nothing was dropped" from "this build does not report drops".
+    skipped: Vec<SkippedProposal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -337,6 +341,9 @@ struct AutoImproveTelemetryReportStageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
     report: AutoImproveTelemetryReport,
 }
 
@@ -365,6 +372,9 @@ struct CuratorStageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
     report: CuratorReport,
 }
 
@@ -1475,10 +1485,47 @@ async fn handle_auto_improve(
         run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
             .await
             .map_err(auto_improve_error_response)?;
+    // Whose suggestion this is. It scopes the one-pending-per-target rule
+    // (V42), and is taken from the authenticated actor's qualified identity
+    // key rather than a `users` row, because most identified operators on a
+    // shared server are named by an authenticating proxy and never get one.
+    //
+    // Only where operators are actually told apart, though: on a
+    // single-operator server this call would otherwise stage into bucket
+    // `user:<root_username>` while the scheduler and the report handlers stage
+    // into the unattributed one, leaving two proposals pending for the same
+    // page — the collision V42 promises cannot happen.
+    //
+    // Both halves go through the shared accessors — `identity_key` for "which
+    // human is this", `owner_stamp` for "does this deployment name them" —
+    // rather than re-deriving either here. Its `memory_auto_improve` sibling
+    // stages into the same V42 bucket, and a bucket computed two ways is a
+    // bucket that eventually disagrees with itself.
+    let staged_by_actor_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+    );
     let proposals = auto_improve_new_proposals(&state, ws, proj, &report).await?;
-    let staged =
-        stage_auto_improve_report(&state, ws, proj, req.session_id, &cfg, &report, proposals)
-            .await?;
+    let staged = stage_auto_improve_report(
+        &state,
+        AutoImproveStagingScope {
+            ws,
+            proj,
+            session_id: req.session_id,
+            cfg: &cfg,
+            staged_by_actor_user,
+        },
+        &report,
+        proposals,
+    )
+    .await?;
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
@@ -1517,6 +1564,10 @@ async fn handle_auto_improve(
                 warnings: report.warnings,
                 rejected_candidates_count: report.rejected_candidates.len(),
                 proposals: outcomes,
+                // Store-level collisions the reviewer's run never staged.
+                // Dropped silently, a run reporting N-1 proposals has nothing
+                // saying the Nth ever existed.
+                skipped: staged.skipped,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -1647,17 +1698,37 @@ struct StagedAutoImproveData {
     run_id: ai_memory_core::AutoImproveRunId,
     proposal_ids: Vec<AutoImproveProposalId>,
     sidecar_paths: Vec<String>,
+    /// Proposals the store refused to stage. Dropping these here would hand the
+    /// operator a run reporting N-1 proposals with nothing saying the Nth
+    /// existed — the silent drop the per-proposal skip was meant to end.
+    skipped: Vec<SkippedProposal>,
+}
+
+/// Everything `stage_auto_improve_report` needs about WHO and WHERE, bundled so
+/// the helper keeps a readable arity.
+struct AutoImproveStagingScope<'a> {
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session_id: SessionId,
+    cfg: &'a AutoImproveReviewConfig,
+    /// Operator that staged the run, as the qualified identity storage key;
+    /// also scopes the one-pending-per-target rule.
+    staged_by_actor_user: Option<String>,
 }
 
 async fn stage_auto_improve_report(
     state: &AdminState,
-    ws: WorkspaceId,
-    proj: ProjectId,
-    session_id: SessionId,
-    cfg: &AutoImproveReviewConfig,
+    scope: AutoImproveStagingScope<'_>,
     report: &ai_memory_consolidate::AutoImproveReport,
     proposals: Vec<NewAutoImproveProposal>,
 ) -> Result<StagedAutoImproveData, (StatusCode, Json<serde_json::Value>)> {
+    let AutoImproveStagingScope {
+        ws,
+        proj,
+        session_id,
+        cfg,
+        staged_by_actor_user,
+    } = scope;
     let staged = state
         .writer
         .stage_auto_improve_run(StageAutoImproveRun {
@@ -1691,6 +1762,9 @@ async fn stage_auto_improve_report(
                 "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
                 "eval": cfg.eval,
             }),
+            // Whose suggestion this is; also scopes the one-pending-per-target
+            // rule (V42) so operators stop blocking each other.
+            staged_by_actor_user,
             proposal_actor: ai_memory_core::ActorContext {
                 agent: Some(cfg.proposal_actor.clone()),
                 ..ai_memory_core::ActorContext::default()
@@ -1704,6 +1778,7 @@ async fn stage_auto_improve_report(
         run_id: staged.run_id,
         proposal_ids: staged.proposal_ids,
         sidecar_paths,
+        skipped: staged.skipped,
     })
 }
 
@@ -1808,6 +1883,12 @@ async fn handle_auto_improve_report(
                     "auto_improve_report": true,
                     "params": params,
                 }),
+                // The report describes the project, not the caller, and its
+                // target page is a single canonical path. Staging it into the
+                // unattributed bucket of the one-pending-per-target rule (V42)
+                // keeps "one pending report per project" in both modes, exactly
+                // as before the rule learned about authors.
+                staged_by_actor_user: None,
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some("auto_improve_report".into()),
                     ..ai_memory_core::ActorContext::default()
@@ -1846,6 +1927,7 @@ async fn handle_auto_improve_report(
                         .map(ToString::to_string)
                         .collect(),
                     sidecar_paths,
+                    skipped: staged.skipped,
                     report,
                 })
                 .unwrap_or_else(|_| serde_json::json!({})),
@@ -1928,6 +2010,10 @@ async fn handle_curator(
                 "curator": true,
                 "params": params,
             }),
+            // Same reasoning as the telemetry report above: a project-scoped
+            // report on one canonical path, so it shares the unattributed
+            // bucket of the one-pending-per-target rule (V42).
+            staged_by_actor_user: None,
             proposal_actor: ai_memory_core::ActorContext {
                 agent: Some("curator".into()),
                 ..ai_memory_core::ActorContext::default()
@@ -1964,6 +2050,7 @@ async fn handle_curator(
                     .map(ToString::to_string)
                     .collect(),
                 sidecar_paths,
+                skipped: staged.skipped,
                 report,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
@@ -5505,6 +5592,7 @@ mod tests {
                 warnings_json: serde_json::json!([]),
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({"mode":"stage"}),
+                staged_by_actor_user: None,
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some("auto_improve".into()),
                     ..ai_memory_core::ActorContext::default()
@@ -5847,6 +5935,384 @@ mod tests {
             note_page.body,
             "# New Auto Improve Lesson\n\nnew page proposal"
         );
+    }
+
+    /// The V42 staging bucket is keyed on
+    /// [`ai_memory_core::ActorContext::identity_key`] through
+    /// [`ai_memory_core::owner_stamp`], not on `actor.user`, so an operator an
+    /// ingress named with the OIDC subject claim alone still lands in their own
+    /// bucket (`sub:<subject>`) rather than the unattributed one their
+    /// colleagues share.
+    ///
+    /// # This shape is a floor, not a live rung
+    ///
+    /// `AuthLevel::Root` beside an actor carrying only `sub` is not something
+    /// `require_bearer` produces: the proxy overlay downgrades a caller it names
+    /// with a subject alone to `AuthLevel::User` (it can never match
+    /// `root_username`), and `require_root_for_multiuser_admin` then turns that
+    /// caller away before this handler runs. It is pinned anyway because the
+    /// `memory_auto_improve` MCP tool computes the SAME bucket for the same
+    /// operator, and the two must not derive it differently — a bucket computed
+    /// two ways is one that eventually disagrees with itself, and the V42
+    /// one-pending-per-target promise is what breaks when it does.
+    #[tokio::test]
+    async fn auto_improve_buckets_a_sub_only_operator_by_identity_key() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // A trusted proxy is configured, so the deployment distinguishes its
+        // operators even with no `users` rows — which is exactly the case where
+        // reaching for `actor.user` sees nobody.
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.trusted_proxy_identity = true;
+        let router = admin_router(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/admin/auto-improve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": session_id.to_string(),
+                    "min_observations": 1,
+                    "min_session_duration_secs": 0,
+                    "min_confidence": 0.75,
+                    "max_proposals_per_run": 5
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ai_memory_core::ActorContext {
+            sub: Some("oidc|subject-only-42".into()),
+            ..ai_memory_core::ActorContext::anonymous()
+        });
+        req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The bucket the contract stamps, built through the API rather than
+        // hand-written, so this test follows the encoding if it ever moves.
+        let expected_bucket =
+            ai_memory_core::IdentityKey::Subject("oidc|subject-only-42".into()).storage_key();
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        assert!(!staged.is_empty(), "the fake LLM proposes two pages");
+        for proposal in &staged {
+            let detail = store
+                .reader
+                .auto_improve_proposal_detail(ws, proj, proposal.id)
+                .await
+                .unwrap()
+                .expect("staged proposal readable in its own scope");
+            assert_eq!(
+                detail.staged_by_actor_user.as_deref(),
+                Some(expected_bucket.as_str()),
+                "the subject claim is the operator, not `None`: {}",
+                detail.summary.target_path.as_str()
+            );
+        }
+    }
+
+    /// The admin report must name the proposals the store refused to stage.
+    /// Returning only the staged ids hands the operator a successful run of
+    /// N-1 proposals with no trace of the Nth — the silent drop the
+    /// per-proposal skip was introduced to end.
+    #[tokio::test]
+    async fn auto_improve_report_names_the_proposal_a_collision_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["proposals"].as_array().unwrap().len(),
+            1,
+            "the sibling proposal still stages",
+        );
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1, "the collided proposal must be reported");
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "a skipped proposal must say why: {}",
+            skipped[0]
+        );
+    }
+
+    /// `[auth].root_username` alone does not make a server multi-operator: the
+    /// scheduler and the report handlers stage unattributed, so bucketing this
+    /// call by its actor would leave TWO pending proposals for one page on a
+    /// single-operator server — the collision V42 promises cannot happen.
+    #[tokio::test]
+    async fn single_operator_admin_auto_improve_shares_the_unattributed_bucket() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // The root actor `[auth].root_username` produces, as the auth
+        // middleware would stamp it.
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ))
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(ai_memory_core::ActorContext {
+                    user: Some("the-operator".into()),
+                    ..ai_memory_core::ActorContext::default()
+                });
+                next.run(req).await
+            },
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a named root operator must not open a second pending bucket for the same page"
+        );
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
     }
 
     #[tokio::test]
