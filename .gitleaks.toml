@@ -1,13 +1,14 @@
 # gitleaks configuration for ai-memory.
 #
-# Wired into CI via `.github/workflows/ci.yml`'s `gitleaks` job. Runs
-# on every push and PR; fails the build if a credential-shaped value
-# lands in any tracked file.
+# Wired into CI via `.github/workflows/ci.yml` for changed commits and
+# `.github/workflows/secret-scan.yml` for scheduled/manual full-history
+# scans. Both fail if a credential-shaped value is not explicitly reviewed.
 #
 # The default ruleset (Google API keys, Anthropic, OpenAI, Slack, AWS,
 # GitHub PATs, …) covers what ai-memory's own sanitiser covers. We
 # inherit it and only ADD an allowlist for the specific test fixtures
-# we deliberately ship.
+# we deliberately ship. `.gitleaksignore` contains exact fingerprints for
+# reviewed legacy findings; never add broad commit, path, or rule exclusions.
 #
 # Lesson from M18: a previous iteration of sanitize.rs used a live
 # Gemini key as a test fixture and Google's automated scanner caught
