@@ -83,6 +83,12 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
+- **Optional per-operator memory slots.** On shared servers,
+  `[slots] per_user = true` keeps engine-written `_slots/` context in a bounded
+  namespace derived from the authenticated operator. Session briefs and
+  consolidation prompts receive shared slots plus the caller's own; exact wiki
+  reads and searches remain project-wide, so this is context-injection
+  isolation rather than RBAC. See [multi-user operation](docs/users.md#per-operator-memory-slots).
 - **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
   in the same directory hours later - the next agent sees a
   "where you left off" block before its first prompt.

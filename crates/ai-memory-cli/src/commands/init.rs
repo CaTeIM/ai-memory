@@ -218,6 +218,7 @@ mod tests {
             "parsed token_pepper must round-trip from the rendered template"
         );
         assert!(loaded.auth.bearer_token.is_none());
+        assert!(!loaded.slots.per_user);
         assert!(loaded.auth.root_username.is_none());
     }
 

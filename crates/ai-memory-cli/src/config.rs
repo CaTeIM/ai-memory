@@ -127,6 +127,8 @@ pub struct Config {
     pub decay: ai_memory_store::DecayParams,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Memory-slot behaviour.
+    pub slots: SlotSettings,
     /// Auto-improvement reviewer. The scheduler launches background review for
     /// newly completed sessions; manual CLI/admin/MCP runs remain available.
     /// Both approve validated proposals by default unless `require_approval` is
@@ -446,6 +448,7 @@ impl Default for Config {
             embedding_base_url: None,
             decay: ai_memory_store::DecayParams::default(),
             maintenance: MaintenanceSettings::default(),
+            slots: SlotSettings::default(),
             auto_improve: AutoImproveSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
@@ -606,6 +609,43 @@ impl Default for AutoImproveSettings {
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         }
     }
+}
+
+/// `[slots]` memory-slot behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SlotSettings {
+    /// Namespace engine-written slots under the operator that produced them
+    /// (`_slots/u-alice/current-focus.md` instead of
+    /// `_slots/current-focus.md`). The segment is the operator's
+    /// `IdentityKey::path_segment()` — `u-<name>` for safe usernames and a
+    /// bounded deterministic identifier for path-hostile usernames or complete
+    /// OIDC issuer/subject pairs — never a raw OIDC value.
+    ///
+    /// Off by default, so nothing changes for an existing install: with the
+    /// flag off a nested slot path carries no ownership meaning at all, and
+    /// every slot goes into every brief exactly as it did before.
+    ///
+    /// Turning it ON changes reads and writes, in both directions:
+    ///
+    /// * a session brief and the consolidation prompt see the shared slots
+    ///   plus the requesting operator's own — so a slot already stored under
+    ///   `_slots/<segment>/…` becomes visible to that operator alone;
+    /// * writing into another operator's namespace is refused (admins aside);
+    /// * a write naming the SHARED slot is namespaced into the writer's own
+    ///   prefix, whether it comes from the engine or from `memory_write_page`.
+    ///
+    /// What the flag scopes is INJECTION, not access: an exact-path read
+    /// still returns anyone's slot, like any other page.
+    ///
+    /// Turning it back OFF restores the pre-feature rule everywhere: personal
+    /// slots become visible to everyone again and nested writes stop being
+    /// gated. Un-namespaced slots are shared under either setting, so nothing
+    /// already stored is ever hidden or reinterpreted.
+    ///
+    /// Only meaningful once requests carry distinct identities; with a single
+    /// shared credential every slot lands under the same namespace.
+    pub per_user: bool,
 }
 
 /// `[maintenance]` scheduled server jobs.
@@ -1070,6 +1110,7 @@ mod tests {
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);

@@ -491,6 +491,8 @@ pub struct HookState {
     /// as single-operator forever. Held here because the hooks crate makes no
     /// config reads.
     pub trusted_proxy_identity: bool,
+    /// Namespace slot injection by the qualified request identity.
+    pub per_user_slots: bool,
 }
 
 /// The owner to stamp on the session and handoff rows this event creates
@@ -1227,7 +1229,7 @@ async fn fetch_and_accept_handoff(
     // The brief is additive and non-destructive: unlike the handoff (a
     // single-use slot claimed below), it is recomposed on every opted-in
     // session start — exactly what a Claude Code `/clear` needs (#176).
-    let brief_md = render_requested_session_brief(state, &query, ws, proj).await?;
+    let brief_md = render_requested_session_brief(state, &query, ws, proj, actor.as_ref()).await?;
     // Handoff first: it is a short curated pointer and must not be buried
     // under a ledger that can run tens of KB. The existing ledger-then-brief
     // order is preserved. Claim both single-use inputs only after every
@@ -1392,6 +1394,7 @@ async fn render_requested_session_brief(
     query: &HandoffQuery,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    viewer: Option<&ai_memory_core::IdentityKey>,
 ) -> anyhow::Result<Option<String>> {
     if !crate::payload::query_flag_truthy(query.briefing.as_deref()) {
         return Ok(None);
@@ -1404,11 +1407,16 @@ async fn render_requested_session_brief(
         .clamp(BRIEF_BUDGET_MIN, BRIEF_BUDGET_MAX);
     let (core, recent) = state
         .reader
-        .session_brief_pages(
+        .session_brief_pages_with_slot_visibility(
             workspace_id,
             project_id,
             BRIEF_CORE_PAGES_LIMIT,
             BRIEF_RECENT_PAGES_LIMIT,
+            // With `[slots] per_user` on, personal slots reach only their
+            // owner and shared ones reach everyone. With it off — the default
+            // — no slot is anybody's, so the brief carries all of them exactly
+            // as it did before the feature existed.
+            ai_memory_core::SlotVisibility::for_viewer(state.per_user_slots, viewer),
         )
         .await?;
     Ok(render_session_brief(&core, &recent, budget))
@@ -2879,6 +2887,7 @@ mod tests {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: IngestGates::default(),
+            per_user_slots: false,
         }
     }
 
@@ -7601,6 +7610,138 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
         }
+    }
+
+    /// DEFAULT CONFIG (`[slots] per_user` off, which is `make_state`). A slot
+    /// page nested one level deep — `_slots/backend/context.md`, a legal path
+    /// a project may have carried for a year — is not owned by anybody, so it
+    /// must keep reaching every session brief, named viewer or not.
+    #[tokio::test]
+    async fn nested_slot_pages_still_reach_the_brief_at_default_config() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/u/legacy-slots-repo";
+
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        // Every write path force-pins slot pages, which is why the brief's
+        // `pinned` arm cannot be the thing that lets this page through.
+        state
+            .writer
+            .upsert_page(brief_page(
+                ws,
+                proj,
+                "_slots/backend/context.md",
+                "the backend runs behind a queue",
+                true,
+            ))
+            .await
+            .unwrap();
+
+        let query = HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.into()),
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: Some("true".into()),
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+        };
+
+        let named = ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        for viewer in [ai_memory_core::ActorContext::anonymous(), named] {
+            let rendered =
+                fetch_and_accept_handoff(&state, query.clone(), viewer.identity_key(), Vec::new())
+                    .await
+                    .unwrap()
+                    .expect("the brief must be injected");
+            assert!(
+                rendered.contains("the backend runs behind a queue"),
+                "a pre-existing nested slot must survive the upgrade for {viewer:?}: {rendered}"
+            );
+        }
+    }
+
+    /// The `/handoff?briefing=1` surface is the one that carries slot BODIES
+    /// into an agent's context, so with `[slots] per_user` on it must inject
+    /// the requesting operator's own slot and withhold everybody else's —
+    /// keyed on `identity_key`, so an OIDC operator without a display username
+    /// gets their own body too.
+    #[tokio::test]
+    async fn per_user_brief_carries_own_slot_body_and_not_others() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.per_user_slots = true;
+        let cwd = "/home/u/per-user-slots-repo";
+
+        let carol = ai_memory_core::ActorContext {
+            issuer: Some("https://idp.example".into()),
+            sub: Some("oidc-subject-carol".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+        let carol_ns = carol.identity_key().unwrap().path_segment();
+        let bob_ns = ai_memory_core::IdentityKey::User("bob".into()).path_segment();
+
+        let (ws, proj) = resolve_project_ids(
+            &state,
+            Some(cwd),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        for (path, body) in [
+            ("_slots/current-focus.md".to_string(), "SHARED-CONTEXT"),
+            (format!("_slots/{carol_ns}/focus.md"), "CAROL-SECRET"),
+            (format!("_slots/{bob_ns}/focus.md"), "BOB-SECRET"),
+        ] {
+            state
+                .writer
+                .upsert_page(brief_page(ws, proj, &path, body, true))
+                .await
+                .unwrap();
+        }
+
+        let query = HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.into()),
+            workspace: None,
+            project: None,
+            project_strategy: None,
+            briefing: Some("true".into()),
+            briefing_budget: None,
+            managed_run: None,
+            session_id: None,
+        };
+
+        let rendered = fetch_and_accept_handoff(&state, query, carol.identity_key(), Vec::new())
+            .await
+            .unwrap()
+            .expect("the brief must be injected");
+        assert!(rendered.contains("SHARED-CONTEXT"), "{rendered}");
+        assert!(
+            rendered.contains("CAROL-SECRET"),
+            "an OIDC operator must receive their OWN slot body: {rendered}"
+        );
+        assert!(
+            !rendered.contains("BOB-SECRET"),
+            "another operator's slot body leaked into this brief: {rendered}"
+        );
     }
 
     /// `briefing=true` on the `/handoff` query returns the compiled project

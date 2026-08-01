@@ -164,6 +164,56 @@ proxied caller on the single-operator escape hatch that waves admin through.
 One question, every gate: the MCP admin tools, the `/admin/*` route layer, and
 the ownership stamped on handoffs and sessions all ask it.
 
+## Per-operator memory slots
+
+The "absent means shared" rule extends to memory slots, so a single-operator
+server behaves exactly as it always has. `_slots/current-focus.md` is injected
+into every operator's context; `_slots/<segment>/current-focus.md` is injected
+only into the operator whose `path_segment()` is `<segment>` (`u-alice`,
+`uh-<uuid>` for a path-hostile username, or `o-<uuid>` for a complete OIDC
+issuer/subject pair). What the feature scopes is injection, not access: a slot
+is an ordinary wiki page, so exact reads and searches remain project-wide like
+every other page. Every slot written before this is unnamespaced, therefore
+shared.
+
+`[slots] per_user` (default off) is the switch for the whole regime. With it
+ON:
+
+- session briefs and consolidation prompts show you the shared slots plus your
+  own — including the pointer list of recently touched pages, so another
+  operator's slot path and title stay out of your brief too;
+- the engine namespaces the slots it writes: a consolidation run that targets
+  the shared slot lands in the session operator's own namespace instead, and a
+  path the model aims at somebody else's namespace is skipped rather than
+  written or re-homed — that path comes from the model, and
+  anything reaching your observations can dictate it;
+- a `memory_write_page` call naming the SHARED slot is namespaced into your
+  own prefix, exactly as the engine would (the response reports the path the
+  page actually got), and writing into another operator's namespace is refused
+  (admins may still curate any namespace, the shared slot included).
+
+With it OFF a nested slot path means nothing in particular — every slot goes
+into every brief, exactly as before the feature existed — so turning it back
+off makes personal slots visible to everyone again rather than stranding them.
+
+The `<segment>` is derived from the qualified identity on this server: a safe
+username stays readable, while a path-hostile username or complete OIDC
+issuer/subject pair becomes a bounded deterministic identifier. The OIDC pair
+outranks the username; see "Identity keys" above. Every named operator owns a
+working namespace, and long or path-hostile values never fall back onto the
+shared slot. One consequence of qualified segments is worth stating: a nested
+path written before the feature
+(`_slots/backend/…`) spells a segment no qualified identity can produce, so
+with the flag ON it belongs to nobody and reaches no brief until the flag is
+turned back off or an admin re-homes it.
+
+One gap is deliberate and documented rather than closed: `ai-memory bootstrap`
+writes pages at paths the model picks from the repository's own README, docs
+and code, with no operator to attribute them to, so a repo carrying injected
+instructions can make it write a `_slots/…` page. It is an admin-only
+operation on a repository the admin chose to ingest, and the behaviour is the
+same with the flag off; review `bootstrap.md` — it lists every path written.
+
 ## Implementation contract
 
 Request identity and authorization are separate:

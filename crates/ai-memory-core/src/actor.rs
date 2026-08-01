@@ -358,6 +358,38 @@ impl IdentityKey {
         }
     }
 
+    /// A bounded, filesystem-safe namespace component for operator-owned data.
+    ///
+    /// Readable usernames are retained when they are short and contain only
+    /// path/GLOB-safe ASCII. All other usernames, and every OIDC identity, use
+    /// a deterministic UUIDv5 derived from the fully qualified storage key.
+    /// This keeps the OIDC issuer in the identity while avoiding filesystem
+    /// component limits for long or path-hostile values.
+    #[must_use]
+    pub fn path_segment(&self) -> String {
+        match self {
+            Self::User(user)
+                if user.len() <= 64
+                    && !user.is_empty()
+                    && user
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) =>
+            {
+                format!("u-{user}")
+            }
+            Self::User(_) => format!(
+                "uh-{}",
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, self.storage_key().as_bytes())
+                    .as_simple()
+            ),
+            Self::Subject { .. } => format!(
+                "o-{}",
+                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, self.storage_key().as_bytes())
+                    .as_simple()
+            ),
+        }
+    }
+
     /// Parse the qualified TEXT form produced by [`Self::storage_key`].
     ///
     /// Stored owners sometimes need to be turned back into a typed actor. The
@@ -632,8 +664,34 @@ mod tests {
         };
         assert_ne!(by_name.storage_key(), issuer_a.storage_key());
         assert_ne!(issuer_a.storage_key(), issuer_b.storage_key());
+        assert_ne!(by_name.path_segment(), issuer_a.path_segment());
+        assert_ne!(issuer_a.path_segment(), issuer_b.path_segment());
         let names_filter = OwnerFilter::User(by_name.storage_key());
         assert!(!names_filter.admits(Some(&issuer_a.storage_key())));
+    }
+
+    #[test]
+    fn identity_path_segments_are_bounded_and_path_safe() {
+        let identities = [
+            IdentityKey::User("alice".into()),
+            IdentityKey::User("../alice[*]".repeat(100)),
+            IdentityKey::Subject {
+                issuer: "https://idp.example/".repeat(100),
+                subject: "../../subject[*]".repeat(100),
+            },
+        ];
+        assert_eq!(identities[0].path_segment(), "u-alice");
+        for identity in identities {
+            let segment = identity.path_segment();
+            assert!(segment.len() <= 67, "{segment}");
+            assert!(
+                segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)),
+                "{segment}"
+            );
+            assert_eq!(segment, identity.path_segment());
+        }
     }
 
     #[test]
