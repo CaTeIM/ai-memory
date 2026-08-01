@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ScheduledAutoImproveSettings,
-    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep,
+    run_auto_improve_scheduler_tick, run_embedding_backfill, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -15,7 +15,9 @@ use ai_memory_hooks::{
     workstream_router,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
-use ai_memory_mcp::{AdminState, AiMemoryServer, ScopeInvalidation, admin_router};
+use ai_memory_mcp::{
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_decay_breadth,
+};
 use ai_memory_store::{ReaderPool, Store, WriterHandle};
 use ai_memory_web::{WebMountSpec, mount_web_router, normalize_prefix, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
@@ -449,9 +451,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         max_entries = config.auto_scope.max_entries,
         "active-project isolation mode"
     );
+    let decay_params = config.decay.decay_params();
     let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
         .with_wiki(wiki.clone())
-        .with_decay_params(config.decay)
+        .with_decay_params(decay_params)
+        .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -604,33 +608,36 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
             });
-            let admin = admin_router(AdminState {
-                writer: store.writer.clone(),
-                reader: store.reader.clone(),
-                wiki: wiki.clone(),
-                llm: admin_llm,
-                auto_improve_require_approval: config.auto_improve.require_approval,
-                auto_improve_review_config: auto_improve_review_config_from_settings(
-                    &config.auto_improve,
-                ),
-                embedder: embedder.clone(),
-                provider_health: provider_health.clone(),
-                decay_params: config.decay,
-                data_dir: config.data_dir.clone(),
-                db_path: store.db_path().to_path_buf(),
-                bind: bind.clone(),
-                home_dir: config.home_dir.clone(),
-                bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                token_pepper: config
-                    .auth
-                    .token_pepper
-                    .as_ref()
-                    .filter(|p| !p.trim().is_empty())
-                    .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
-                active_project: active_project.clone(),
-                scope_invalidator: Some(scope_invalidator),
-                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
-            });
+            let admin = admin_router_with_decay_breadth(
+                AdminState {
+                    writer: store.writer.clone(),
+                    reader: store.reader.clone(),
+                    wiki: wiki.clone(),
+                    llm: admin_llm,
+                    auto_improve_require_approval: config.auto_improve.require_approval,
+                    auto_improve_review_config: auto_improve_review_config_from_settings(
+                        &config.auto_improve,
+                    ),
+                    embedder: embedder.clone(),
+                    provider_health: provider_health.clone(),
+                    decay_params,
+                    data_dir: config.data_dir.clone(),
+                    db_path: store.db_path().to_path_buf(),
+                    bind: bind.clone(),
+                    home_dir: config.home_dir.clone(),
+                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    token_pepper: config
+                        .auth
+                        .token_pepper
+                        .as_ref()
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
+                    active_project: active_project.clone(),
+                    scope_invalidator: Some(scope_invalidator),
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                },
+                config.decay.breadth_weight,
+            );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
             //     stays as-is, middleware injects anonymous actor.
@@ -814,7 +821,7 @@ async fn start_maintenance_scheduler(
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
-    decay: ai_memory_store::DecayParams,
+    decay: crate::config::DecaySettings,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -857,8 +864,14 @@ async fn start_maintenance_scheduler(
                     let decay = decay;
                     async move {
                         let started = std::time::Instant::now();
-                        let outcome =
-                            run_scheduled_sweep_tick(&reader, &writer, &wiki, &decay).await?;
+                        let outcome = run_scheduled_sweep_tick(
+                            &reader,
+                            &writer,
+                            &wiki,
+                            &decay.decay_params(),
+                            decay.breadth_weight,
+                        )
+                        .await?;
                         if outcome.errors > 0 {
                             anyhow::bail!(
                                 "scheduled forget sweep had {} scope errors",
@@ -1090,6 +1103,7 @@ async fn run_scheduled_sweep_tick(
     writer: &WriterHandle,
     wiki: &Wiki,
     decay: &ai_memory_store::DecayParams,
+    breadth_weight: f64,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1098,13 +1112,14 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep(
+        match run_sweep_with_breadth(
             reader,
             writer,
             Some(wiki),
             scope.workspace_id,
             scope.project_id,
             decay,
+            breadth_weight,
             false,
         )
         .await
@@ -2020,7 +2035,7 @@ mod tests {
             wiki,
             None,
             None,
-            ai_memory_store::DecayParams::default(),
+            crate::config::DecaySettings::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -2064,7 +2079,7 @@ mod tests {
                 wiki,
                 None,
                 None,
-                ai_memory_store::DecayParams::default(),
+                crate::config::DecaySettings::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -2326,7 +2341,7 @@ mod tests {
             cold_threshold: 2.0,
             ..ai_memory_store::DecayParams::default()
         };
-        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay)
+        let outcome = run_scheduled_sweep_tick(&store.reader, &store.writer, &wiki, &decay, 0.0)
             .await
             .unwrap();
 

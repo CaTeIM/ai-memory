@@ -39,6 +39,60 @@ pub const DEFAULT_WORKSPACE: &str = ai_memory_core::DEFAULT_WORKSPACE_NAME;
 /// Defensive project fallback used only when no cwd/project is available.
 pub const DEFAULT_PROJECT: &str = ai_memory_core::DEFAULT_PROJECT_NAME;
 
+/// Config-file representation of retention settings.
+///
+/// The breadth coefficient lives here rather than expanding the public
+/// `ai_memory_store::DecayParams` struct, preserving source compatibility for
+/// downstream Rust callers that construct that struct directly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecaySettings {
+    /// Per-day decay rate.
+    pub lambda: f64,
+    /// Access-reinforcement magnitude.
+    pub sigma: f64,
+    /// Per-day decay of access reinforcement.
+    pub mu: f64,
+    /// Default page salience.
+    pub salience_default: f64,
+    /// Soft-delete threshold.
+    pub cold_threshold: f64,
+    /// Delay before hard-deleting an untouched soft-deleted page.
+    pub hard_delete_after_days: i64,
+    /// Optional weight for the number of distinct authenticated readers.
+    pub breadth_weight: f64,
+}
+
+impl Default for DecaySettings {
+    fn default() -> Self {
+        let base = ai_memory_store::DecayParams::default();
+        Self {
+            lambda: base.lambda,
+            sigma: base.sigma,
+            mu: base.mu,
+            salience_default: base.salience_default,
+            cold_threshold: base.cold_threshold,
+            hard_delete_after_days: base.hard_delete_after_days,
+            breadth_weight: 0.0,
+        }
+    }
+}
+
+impl DecaySettings {
+    /// Retention coefficients consumed by existing store/consolidation APIs.
+    #[must_use]
+    pub fn decay_params(self) -> ai_memory_store::DecayParams {
+        ai_memory_store::DecayParams {
+            lambda: self.lambda,
+            sigma: self.sigma,
+            mu: self.mu,
+            salience_default: self.salience_default,
+            cold_threshold: self.cold_threshold,
+            hard_delete_after_days: self.hard_delete_after_days,
+        }
+    }
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -124,7 +178,7 @@ pub struct Config {
     /// threshold), followed by ~180 days of soft-delete buffer before
     /// hard-deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
-    pub decay: ai_memory_store::DecayParams,
+    pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
     /// Memory-slot behaviour.
@@ -446,7 +500,7 @@ impl Default for Config {
             embedding_model: None,
             embedding_dim: None,
             embedding_base_url: None,
-            decay: ai_memory_store::DecayParams::default(),
+            decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
             slots: SlotSettings::default(),
             auto_improve: AutoImproveSettings::default(),
@@ -749,6 +803,12 @@ impl Config {
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
         config.runtime_env = runtime_env;
+
+        if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
+            anyhow::bail!(
+                "decay.breadth_weight must be a finite number greater than or equal to zero"
+            );
+        }
 
         Ok(config)
     }
@@ -1110,6 +1170,7 @@ mod tests {
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
+        assert_eq!(cfg.decay.breadth_weight, 0.0);
         assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
@@ -1161,6 +1222,21 @@ mod tests {
                 .map(|c| c.join(cli_dir.file_name().unwrap()))
                 .unwrap_or(cli_dir)
         );
+    }
+
+    #[test]
+    fn load_rejects_destructive_invalid_breadth_weights() {
+        for value in ["-0.1", "nan", "inf"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, format!("[decay]\nbreadth_weight = {value}\n")).unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err("invalid breadth weight must fail closed");
+            assert!(
+                error.to_string().contains("breadth_weight"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
     }
 
     #[test]

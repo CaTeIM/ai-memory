@@ -1102,9 +1102,21 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
 /// Bump `access_count` + `last_accessed_at` for the pages whose ids
 /// appear in `page_ids`. Idempotent for unknown ids (no-op).
 /// Used by the read path to feed the M8 reinforcement term.
-pub fn bump_access_for_pages(conn: &mut Connection, page_ids: &[PageId]) -> StoreResult<()> {
+///
+/// Bump shared access counters and record an optional typed operator as a
+/// distinct reader. Both mutations commit in the same transaction.
+pub fn bump_access_for_pages_for_actor(
+    conn: &mut Connection,
+    page_ids: &[PageId],
+    actor: Option<&IdentityKey>,
+) -> StoreResult<()> {
     if page_ids.is_empty() {
         return Ok(());
+    }
+    if actor.is_some_and(|identity| !identity.is_valid()) {
+        return Err(StoreError::InvalidState(
+            "page access actor is not a normalized identity".into(),
+        ));
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
@@ -1116,6 +1128,30 @@ pub fn bump_access_for_pages(conn: &mut Connection, page_ids: &[PageId]) -> Stor
         )?;
         for id in page_ids {
             stmt.execute(params![now, id.as_bytes()])?;
+        }
+        // Per-operator reinforcement, recorded in the SAME transaction so the
+        // scalar and the breakdown cannot drift. Purely additive: the scalar
+        // above is what the retention formula still reads by default.
+        if let Some(actor) = actor {
+            let actor = actor.storage_key();
+            // The `WHERE EXISTS` guard is what keeps the documented idempotence
+            // for unknown ids: `page_access.page_id` REFERENCES `pages(id)` and
+            // the writer connection runs with `foreign_keys` ON, so a bare
+            // INSERT for a page deleted between the search and this (detached,
+            // post-response) bump would raise a FK violation and roll back the
+            // WHOLE batch — costing every other page in the result set its
+            // reinforcement. `INSERT OR IGNORE` does not help: it suppresses
+            // constraint conflicts, not FK violations. The predicate mirrors the
+            // UPDATE above so the scalar and the breakdown cannot drift.
+            let mut per_actor = tx.prepare(
+                "INSERT INTO page_access (page_id, actor) \
+                 SELECT ?1, ?2 \
+                 WHERE EXISTS (SELECT 1 FROM pages WHERE id = ?1 AND is_latest = 1) \
+                 ON CONFLICT(page_id, actor) DO NOTHING",
+            )?;
+            for id in page_ids {
+                per_actor.execute(params![id.as_bytes(), actor])?;
+            }
         }
     }
     tx.commit()?;

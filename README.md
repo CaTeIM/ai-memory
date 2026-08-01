@@ -263,7 +263,10 @@ priors are at the [bottom](#influences-and-prior-art).
   auto-improve-report --workspace <w> --project <p>` returns a read-only
   telemetry report for recent auto-improvement outcomes without staging or
   creating proposals; add `--stage` to create one pending report page for
-  audit/approval. See
+  audit/approval. On deployments that distinguish operators, pending learning
+  proposals are isolated by qualified operator identity, so one person's
+  proposal for a page does not block another's; unattributed and single-user
+  deployments retain the shared pending queue. See
   [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
   example executable eval scorers.
 
@@ -279,7 +282,9 @@ priors are at the [bottom](#influences-and-prior-art).
   episodic pages, stale slots, duplicate exact normalized titles, and dangling
   cross-project links. It is report-only unless `--stage` is passed; staging
   queues one report page for approval and still performs no maintenance actions
-  itself.
+  itself. Shared servers can opt into `[decay] breadth_weight` to give pages
+  reinforced by several identified operators a retention bonus; the default
+  `0.0` leaves existing retention scores unchanged.
 - **"Run one ai-memory for the whole household."** Stand the server
   up on a homelab box at `0.0.0.0:49374` with a bearer token; every
   laptop/desktop talks to it. Per-cwd routing keeps each project's

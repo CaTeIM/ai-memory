@@ -63,10 +63,58 @@ pub fn retention_score(
     days_since_access: Option<f64>,
     salience: Option<f64>,
 ) -> f64 {
+    retention_score_with_breadth(
+        params,
+        age_days,
+        access_count,
+        days_since_access,
+        salience,
+        0,
+        0.0,
+    )
+}
+
+/// Retention score that also accounts for HOW MANY distinct operators reinforced
+/// the page.
+///
+/// `access_count` cannot tell "50 reads by one person" from "one read by each of
+/// 50 people", although only the second says the page is load-bearing for a
+/// team. `distinct_actors` supplies that, weighted by
+/// `breadth_weight`. A weight of `0.0` preserves the historical formula.
+///
+/// Identity at the default weight of `0.0`, and identity again for
+/// `distinct_actors` of 0 (no per-actor rows recorded — every page written
+/// before this existed) or 1 (a single reader). So enabling the table changes
+/// no score until an operator deliberately turns the weight up, and there is no
+/// eviction cliff to migrate around.
+///
+/// `salience` is the page's own feedback-moved salience; it scales the time
+/// term independently of breadth, which scales the access term.
+#[must_use]
+pub fn retention_score_with_breadth(
+    params: &DecayParams,
+    age_days: f64,
+    access_count: u32,
+    days_since_access: Option<f64>,
+    salience: Option<f64>,
+    distinct_actors: u32,
+    breadth_weight: f64,
+) -> f64 {
     let salience = salience.unwrap_or(params.salience_default);
+    // Destructive callers validate and reject invalid config. The pure helper
+    // also fails closed for direct library callers: an invalid coefficient
+    // disables the optional bonus instead of producing NaN or reducing a
+    // page's historical retention score.
+    let breadth_weight = if breadth_weight.is_finite() && breadth_weight >= 0.0 {
+        breadth_weight
+    } else {
+        0.0
+    };
     let time_term = salience * (-params.lambda * age_days).exp();
+    // g(0) = g(1) = 1, monotonically non-decreasing afterwards.
+    let breadth = 1.0 + breadth_weight * (f64::from(distinct_actors.max(1)) - 1.0).ln_1p();
     let access_term = days_since_access.map_or(0.0, |d| {
-        params.sigma * (1.0 + f64::from(access_count)).ln() * (-params.mu * d).exp()
+        params.sigma * (1.0 + f64::from(access_count)).ln() * (-params.mu * d).exp() * breadth
     });
     time_term + access_term
 }

@@ -128,10 +128,12 @@ from hook paths.
    `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at` - the M8 reinforcement term, which
-   `memory_feedback` complements with explicit per-page salience. That bump is
-   throttled to at most once per page per minute, so a burst of overlapping
-   searches does not flood the writer actor with redundant reinforcement
-   writes.
+   `memory_feedback` complements with explicit per-page salience. Identified
+   operators also add one `page_access` row per page; an opt-in
+   `[decay] breadth_weight` can reward pages reinforced by several distinct
+   operators. That bump is throttled to at most once per page per minute, so a
+   burst of overlapping searches does not flood the writer actor with
+   redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -260,6 +262,8 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
+| `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
+| `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
@@ -268,7 +272,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Tier | Lifetime | Decay |
 |---|---|---|
 | Working | Current session only | Hard-drop on session end (kept in `observations` for forensics) |
-| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access)` |
+| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
 | Semantic | Indefinite | None - only supersedeable via M7 LLM rewrite |
 | Procedural | Indefinite | Frequency-decay if not re-observed |
 
@@ -484,6 +488,7 @@ sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
+breadth_weight = 0.0               # opt-in reward for distinct operators
 
 [slots]                           # optional shared-server injection boundary
 per_user = false                  # shared + own slots in agent context

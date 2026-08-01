@@ -214,6 +214,40 @@ instructions can make it write a `_slots/…` page. It is an admin-only
 operation on a repository the admin chose to ingest, and the behaviour is the
 same with the flag off; review `bootstrap.md` — it lists every path written.
 
+## Other per-operator state
+
+Beyond attribution, some engine state is recorded per operator. "Absent means
+shared" is the rule throughout — a row with no recorded operator behaves
+exactly as it did before the column existed — so a single-operator server
+keeps its historical behaviour:
+
+- **Auto-improvement proposals.** Each records the operator who staged it (the
+  qualified identity key — username or complete OIDC issuer/subject pair — so
+  proxy-asserted humans count too, and it shows up on the proposal detail),
+  and the "one
+  pending proposal per page" rule applies per operator, so operators stop
+  blocking each other. Only where the deployment distinguishes operators,
+  though: elsewhere proposals stay unattributed and the original one-per-page
+  rule holds unchanged. A scheduled run has no caller and stages unattributed;
+  the telemetry report and the curator describe the project rather than a
+  person and stay unattributed too, so they neither block nor are blocked by
+  any named operator's pending proposal for the same page.
+
+  A proposal that does collide with one already pending is skipped on its own
+  — the run's other proposals still stage — and every staging surface reports
+  the skip with the target path and the reason (the `skipped` list in the MCP
+  and `/admin` responses, the CLI output, and the scheduler's log), so a run
+  of N-1 proposals is never silently indistinguishable from a clean run of
+  N-1.
+- **Page reinforcement.** The first reinforced read by each identified
+  operator is recorded per page alongside the existing shared access counter.
+  `[decay] breadth_weight` (default `0.0`) optionally lets a
+  page reinforced by many different people outrank one read repeatedly by a
+  single person — the forget sweep reads the per-page count of distinct
+  operators and feeds it into the retention score. At the default, and for
+  pages with fewer than two distinct readers at any weight, retention scores
+  are unchanged.
+
 ## Implementation contract
 
 Request identity and authorization are separate:

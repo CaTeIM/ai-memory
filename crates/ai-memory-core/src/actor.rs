@@ -343,6 +343,16 @@ pub enum IdentityKey {
 }
 
 impl IdentityKey {
+    /// Whether this value satisfies the same non-blank, trimmed invariants as
+    /// [`ActorContext::identity_key`].
+    ///
+    /// The enum is public, so storage boundaries use this check before
+    /// accepting a directly constructed value.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.to_actor_context().identity_key().as_ref() == Some(self)
+    }
+
     /// The TEXT form used for in-memory routing and future owner columns:
     /// `oidc:<issuer-byte-length>:<issuer><subject>` or `user:<name>`.
     ///
@@ -414,7 +424,7 @@ impl IdentityKey {
         // trims and rejects blanks. Enforce the same invariant on persisted
         // data so a corrupt `user:` / partial OIDC key cannot become a new
         // ownership bucket when a session is finalized.
-        (parsed.to_actor_context().identity_key().as_ref() == Some(&parsed)).then_some(parsed)
+        parsed.is_valid().then_some(parsed)
     }
 
     /// Build an actor that round-trips through [`ActorContext::identity_key`].
@@ -474,13 +484,23 @@ impl OwnerFilter {
 /// A single-operator server leaves rows shared even when its HTTP root has a
 /// username, because the same operator's stdio transport carries no actor.
 #[must_use]
+pub fn owner_identity(
+    identity: Option<&IdentityKey>,
+    distinguishes_operators: bool,
+) -> Option<IdentityKey> {
+    distinguishes_operators
+        .then(|| identity.filter(|identity| identity.is_valid()).cloned())
+        .flatten()
+}
+
+/// Derive the qualified owner string stored by an operator-distinguishing
+/// deployment.
+#[must_use]
 pub fn owner_stamp(
     identity: Option<&IdentityKey>,
     distinguishes_operators: bool,
 ) -> Option<String> {
-    distinguishes_operators
-        .then(|| identity.map(IdentityKey::storage_key))
-        .flatten()
+    owner_identity(identity, distinguishes_operators).map(|identity| identity.storage_key())
 }
 
 #[cfg(test)]
@@ -738,6 +758,13 @@ mod tests {
             issuer: "https://idp.example".into(),
             subject: "oidc-subject-123".into(),
         };
+        assert_eq!(owner_identity(Some(&key), false), None);
+        assert_eq!(owner_identity(None, true), None);
+        assert_eq!(owner_identity(Some(&key), true), Some(key.clone()));
+        assert_eq!(
+            owner_identity(Some(&IdentityKey::User(" ".into())), true),
+            None
+        );
         assert_eq!(owner_stamp(Some(&key), false), None);
         assert_eq!(owner_stamp(None, true), None);
         assert_eq!(owner_stamp(Some(&key), true), Some(key.storage_key()));
