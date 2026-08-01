@@ -259,7 +259,10 @@ priors are at the [bottom](#influences-and-prior-art).
   automatic review, or set `[auto_improve] require_approval = true` to keep both
   scheduled and manual proposals pending for human review. `ai-memory
   auto-improve --session-id <uuid>` and MCP `memory_auto_improve` remain
-  available for manual catch-up or targeted reruns. `ai-memory
+  available for manual catch-up or targeted reruns. When its `session_id` is
+  omitted, the MCP tool selects the newest completed session without a
+  persisted auto-improvement run, so repeated calls advance past short
+  preflight-skipped sessions; an explicit ID reruns that session. `ai-memory
   auto-improve-report --workspace <w> --project <p>` returns a read-only
   telemetry report for recent auto-improvement outcomes without staging or
   creating proposals; add `--stage` to create one pending report page for
