@@ -2907,16 +2907,16 @@ impl AiMemoryServer {
                 // to two agents.
                 let claimed = self
                     .writer
-                    .accept_handoff(
-                        h.id,
-                        ws,
-                        proj,
-                        AgentKind::Other,
-                        None,
-                        actor_user.clone(),
+                    .accept_handoff(ai_memory_core::HandoffAcceptance {
+                        handoff_id: h.id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        accepting_agent: AgentKind::Other,
+                        accepting_session: None,
+                        accepting_user: actor_user.clone(),
                         owner_filter,
                         receiving_cwd,
-                    )
+                    })
                     .await
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if claimed {

@@ -42,7 +42,7 @@ pub use actor::{
     SKIP_ADMISSION_CHAIN_HEADER, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffState, NewHandoff};
+pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
 pub use ids::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
     ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,

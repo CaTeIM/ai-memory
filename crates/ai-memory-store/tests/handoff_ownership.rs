@@ -14,8 +14,8 @@
 //! string that could drift from it.
 
 use ai_memory_core::{
-    ActorContext, AgentKind, IdentityKey, NewHandoff, OwnerFilter, ProjectId, WorkspaceId,
-    owner_stamp,
+    ActorContext, AgentKind, HandoffAcceptance, HandoffId, IdentityKey, NewHandoff, OwnerFilter,
+    ProjectId, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::Store;
 
@@ -31,6 +31,26 @@ fn filter_for(name: &str) -> OwnerFilter {
         user: Some(name.into()),
         ..ActorContext::default()
     })
+}
+
+fn acceptance(
+    handoff_id: HandoffId,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    accepting_user: Option<String>,
+    owner_filter: OwnerFilter,
+    receiving_cwd: Option<String>,
+) -> HandoffAcceptance {
+    HandoffAcceptance {
+        handoff_id,
+        workspace_id,
+        project_id,
+        accepting_agent: AgentKind::ClaudeCode,
+        accepting_session: None,
+        accepting_user,
+        owner_filter,
+        receiving_cwd,
+    }
 }
 
 /// Build an open handoff, optionally owned by the named operator.
@@ -188,32 +208,28 @@ async fn ownership_writes_reject_malformed_identity_keys() {
     assert!(
         store
             .writer
-            .accept_handoff(
+            .accept_handoff(acceptance(
                 id,
                 ws,
                 proj,
-                AgentKind::ClaudeCode,
-                None,
                 Some("alice".into()),
                 filter_for("alice"),
                 None,
-            )
+            ))
             .await
             .is_err()
     );
     assert!(
         store
             .writer
-            .accept_handoff(
+            .accept_handoff(acceptance(
                 id,
                 ws,
                 proj,
-                AgentKind::ClaudeCode,
-                None,
                 Some(operator("bob")),
                 filter_for("alice"),
                 None,
-            )
+            ))
             .await
             .is_err(),
         "the accepting identity and owner filter must not disagree"
@@ -331,16 +347,14 @@ async fn another_operator_cannot_claim_the_handoff() {
 
     let stolen = store
         .writer
-        .accept_handoff(
+        .accept_handoff(acceptance(
             id,
             ws,
             proj,
-            AgentKind::ClaudeCode,
-            None,
             Some(operator("bob")),
             filter_for("bob"),
             None,
-        )
+        ))
         .await
         .unwrap();
     assert!(!stolen, "Bob must not be able to claim Alice's handoff");
@@ -348,32 +362,28 @@ async fn another_operator_cannot_claim_the_handoff() {
     // Still open for its owner, and now claimable by her exactly once.
     let claimed = store
         .writer
-        .accept_handoff(
+        .accept_handoff(acceptance(
             id,
             ws,
             proj,
-            AgentKind::ClaudeCode,
-            None,
             Some(operator("alice")),
             filter_for("alice"),
             None,
-        )
+        ))
         .await
         .unwrap();
     assert!(claimed, "the owner claims her own handoff");
 
     let twice = store
         .writer
-        .accept_handoff(
+        .accept_handoff(acceptance(
             id,
             ws,
             proj,
-            AgentKind::ClaudeCode,
-            None,
             Some(operator("alice")),
             filter_for("alice"),
             None,
-        )
+        ))
         .await
         .unwrap();
     assert!(!twice, "a handoff is single-use even for its owner");
@@ -482,16 +492,14 @@ async fn destructive_handoff_updates_recheck_scope_atomically() {
     assert!(
         !store
             .writer
-            .accept_handoff(
+            .accept_handoff(acceptance(
                 id,
                 ws,
                 other_proj,
-                AgentKind::ClaudeCode,
-                None,
                 Some(operator("alice")),
                 OwnerFilter::Any,
                 None,
-            )
+            ))
             .await
             .unwrap(),
         "even a root recovery claim must not cross its resolved project"
@@ -511,16 +519,14 @@ async fn destructive_handoff_updates_recheck_scope_atomically() {
     assert!(
         store
             .writer
-            .accept_handoff(
+            .accept_handoff(acceptance(
                 id,
                 ws,
                 proj,
-                AgentKind::ClaudeCode,
-                None,
                 Some(operator("alice")),
                 OwnerFilter::Any,
                 None,
-            )
+            ))
             .await
             .unwrap(),
         "the exact project can still claim the handoff"
@@ -609,16 +615,14 @@ async fn handoff_listing_is_owner_scoped_and_covers_every_state() {
     // Consume Alice's, then find it again by state — the recovery path.
     store
         .writer
-        .accept_handoff(
+        .accept_handoff(acceptance(
             alice,
             ws,
             proj,
-            AgentKind::ClaudeCode,
-            None,
             Some(operator("alice")),
             filter_for("alice"),
             None,
-        )
+        ))
         .await
         .unwrap();
     let open = summaries(filter_for("alice"), Some(HandoffState::Open)).await;
@@ -806,16 +810,14 @@ async fn automatic_supersession_does_not_reach_across_operators() {
     // and ranks below hers.
     let claimed = store
         .writer
-        .accept_handoff(
+        .accept_handoff(acceptance(
             alice_newest,
             ws,
             proj,
-            AgentKind::ClaudeCode,
-            None,
             Some(operator("alice")),
             filter_for("alice"),
             Some("/repo".into()),
-        )
+        ))
         .await
         .unwrap();
     assert!(claimed, "Alice claims her own handoff");

@@ -1285,15 +1285,19 @@ async fn fetch_and_accept_handoff(
         state
             .writer
             .accept_startup_context(
-                handoff.as_ref().map(|handoff| handoff.id),
-                ws,
-                proj,
-                agent,
-                None,
-                actor.as_ref().map(IdentityKey::storage_key),
-                owner_filter,
+                handoff
+                    .as_ref()
+                    .map(|handoff| ai_memory_core::HandoffAcceptance {
+                        handoff_id: handoff.id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        accepting_agent: agent,
+                        accepting_session: None,
+                        accepting_user: actor.as_ref().map(IdentityKey::storage_key),
+                        owner_filter,
+                        receiving_cwd: query.cwd.clone(),
+                    }),
                 managed.as_ref().map(|managed| managed.run_id),
-                query.cwd.clone(),
             )
             .await?
     } else {

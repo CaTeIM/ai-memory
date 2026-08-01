@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
-    ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId,
-    WorkspaceId,
+    AgentKind, HandoffAcceptance, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage,
+    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
+    SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -163,14 +163,7 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
     AcceptHandoff {
-        handoff_id: HandoffId,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        accepting_user: Option<String>,
-        owner_filter: OwnerFilter,
-        receiving_cwd: Option<String>,
+        acceptance: HandoffAcceptance,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     CancelHandoff {
@@ -371,15 +364,8 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     AcceptStartupContext {
-        handoff_id: Option<HandoffId>,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        accepting_user: Option<String>,
-        owner_filter: OwnerFilter,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
-        receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -771,27 +757,10 @@ impl WriterHandle {
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn accept_handoff(
-        &self,
-        handoff_id: HandoffId,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        accepting_user: Option<String>,
-        owner_filter: OwnerFilter,
-        receiving_cwd: Option<String>,
-    ) -> StoreResult<bool> {
+    pub async fn accept_handoff(&self, acceptance: HandoffAcceptance) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
-            handoff_id,
-            workspace_id,
-            project_id,
-            accepting_agent,
-            accepting_session,
-            accepting_user,
-            owner_filter,
-            receiving_cwd,
+            acceptance,
             reply: tx,
         })
         .await?;
@@ -1476,30 +1445,15 @@ impl WriterHandle {
     ///
     /// When a managed run was requested but is no longer claimable, the
     /// handoff remains open and both result fields are false.
-    #[allow(clippy::too_many_arguments)]
     pub async fn accept_startup_context(
         &self,
-        handoff_id: Option<HandoffId>,
-        workspace_id: WorkspaceId,
-        project_id: ProjectId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        accepting_user: Option<String>,
-        owner_filter: OwnerFilter,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
-        receiving_cwd: Option<String>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
-            handoff_id,
-            workspace_id,
-            project_id,
-            accepting_agent,
-            accepting_session,
-            accepting_user,
-            owner_filter,
+            handoff,
             managed_run_id,
-            receiving_cwd,
             reply: tx,
         })
         .await?;
@@ -1744,28 +1698,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
             }
-            WriteCmd::AcceptHandoff {
-                handoff_id,
-                workspace_id,
-                project_id,
-                accepting_agent,
-                accepting_session,
-                accepting_user,
-                owner_filter,
-                receiving_cwd,
-                reply,
-            } => {
-                let result = ops::accept_handoff(
-                    &mut conn,
-                    &handoff_id,
-                    &workspace_id,
-                    &project_id,
-                    accepting_agent,
-                    accepting_session.as_ref(),
-                    accepting_user.as_deref(),
-                    &owner_filter,
-                    receiving_cwd.as_deref(),
-                );
+            WriteCmd::AcceptHandoff { acceptance, reply } => {
+                let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
             }
             WriteCmd::CancelHandoff {
@@ -2059,15 +1993,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "accept_managed_run_context");
             }
             WriteCmd::AcceptStartupContext {
-                handoff_id,
-                workspace_id,
-                project_id,
-                accepting_agent,
-                accepting_session,
-                accepting_user,
-                owner_filter,
+                handoff,
                 managed_run_id,
-                receiving_cwd,
                 reply,
             } => {
                 let result = (|| {
@@ -2081,18 +2008,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     if managed_run_id.is_some() && !managed_context_accepted {
                         return Ok(StartupContextAcceptance::default());
                     }
-                    let handoff_accepted = match handoff_id {
-                        Some(handoff_id) => ops::accept_handoff_in_transaction(
-                            &tx,
-                            &handoff_id,
-                            &workspace_id,
-                            &project_id,
-                            accepting_agent,
-                            accepting_session.as_ref(),
-                            accepting_user.as_deref(),
-                            &owner_filter,
-                            receiving_cwd.as_deref(),
-                        )?,
+                    let handoff_accepted = match handoff {
+                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
                         None => false,
                     };
                     tx.commit()?;

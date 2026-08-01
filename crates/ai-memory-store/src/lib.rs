@@ -127,10 +127,10 @@ impl Store {
 mod tests {
     use super::*;
     use ai_memory_core::{
-        ActorContext, AgentKind, HandoffId, HandoffState, LinkTarget, ManagedRunId, NewHandoff,
-        NewObservation, NewPage, NewSession, NewWorkstreamEvent, ObservationId, ObservationKind,
-        PageId, PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, WorkspaceId,
-        WorkstreamEventKind,
+        ActorContext, AgentKind, HandoffAcceptance, HandoffId, HandoffState, LinkTarget,
+        ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewWorkstreamEvent,
+        ObservationId, ObservationKind, PageId, PagePath, ProjectId, Sanitized, Sanitizer,
+        SessionId, Tier, UserId, WorkspaceId, WorkstreamEventKind,
     };
     use rusqlite::{Connection, params};
     use sha2::{Digest, Sha256};
@@ -4977,21 +4977,21 @@ mod tests {
             files_touched: Vec::new(),
             owner_user: None,
         };
+        let acceptance = |handoff_id, receiving_cwd| HandoffAcceptance {
+            handoff_id,
+            workspace_id: ws,
+            project_id: proj,
+            accepting_agent: AgentKind::Codex,
+            accepting_session: None,
+            accepting_user: None,
+            owner_filter: ai_memory_core::OwnerFilter::Any,
+            receiving_cwd,
+        };
 
         let first_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let accepted = store
             .writer
-            .accept_startup_context(
-                Some(first_handoff),
-                ws,
-                proj,
-                AgentKind::Codex,
-                None,
-                None,
-                ai_memory_core::OwnerFilter::Any,
-                Some(run.run_id),
-                None,
-            )
+            .accept_startup_context(Some(acceptance(first_handoff, None)), Some(run.run_id))
             .await
             .unwrap();
         assert_eq!(
@@ -5013,17 +5013,7 @@ mod tests {
         let second_handoff = store.writer.insert_handoff(insert_handoff()).await.unwrap();
         let rejected = store
             .writer
-            .accept_startup_context(
-                Some(second_handoff),
-                ws,
-                proj,
-                AgentKind::Codex,
-                None,
-                None,
-                ai_memory_core::OwnerFilter::Any,
-                Some(run.run_id),
-                None,
-            )
+            .accept_startup_context(Some(acceptance(second_handoff, None)), Some(run.run_id))
             .await
             .unwrap();
         assert_eq!(
@@ -5086,15 +5076,8 @@ mod tests {
         let rejected_auto = store
             .writer
             .accept_startup_context(
-                Some(selected_auto),
-                ws,
-                proj,
-                AgentKind::Codex,
-                None,
-                None,
-                ai_memory_core::OwnerFilter::Any,
+                Some(acceptance(selected_auto, Some("/repo/api/src".into()))),
                 Some(run.run_id),
-                Some("/repo/api/src".into()),
             )
             .await
             .unwrap();

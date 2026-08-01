@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, EntityId, HandoffId, IdentityKey, LinkTarget, NewHandoff, NewObservation, NewPage,
-    NewSession, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId,
-    SessionId, WorkspaceId,
+    AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, NewHandoff,
+    NewObservation, NewPage, NewSession, ObservationId, ObservationKind, OwnerFilter, PageId,
+    PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -1529,20 +1529,18 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
 /// `receiving_cwd` is where the *claiming* session is starting, not where the
 /// claimed handoff came from; it bounds the post-claim sweep of stale automatic
 /// handoffs.
-pub fn accept_handoff(
-    conn: &mut Connection,
-    handoff_id: &HandoffId,
-    workspace_id: &WorkspaceId,
-    project_id: &ProjectId,
-    accepting_agent: AgentKind,
-    accepting_session: Option<&SessionId>,
-    accepting_user: Option<&str>,
-    owner_filter: &OwnerFilter,
-    receiving_cwd: Option<&str>,
-) -> StoreResult<bool> {
+pub fn accept_handoff(conn: &mut Connection, acceptance: &HandoffAcceptance) -> StoreResult<bool> {
     let tx = conn.transaction()?;
-    let claimed = accept_handoff_in_transaction(
-        &tx,
+    let claimed = accept_handoff_in_transaction(&tx, acceptance)?;
+    tx.commit()?;
+    Ok(claimed)
+}
+
+pub(crate) fn accept_handoff_in_transaction(
+    tx: &Transaction<'_>,
+    acceptance: &HandoffAcceptance,
+) -> StoreResult<bool> {
+    let HandoffAcceptance {
         handoff_id,
         workspace_id,
         project_id,
@@ -1551,22 +1549,8 @@ pub fn accept_handoff(
         accepting_user,
         owner_filter,
         receiving_cwd,
-    )?;
-    tx.commit()?;
-    Ok(claimed)
-}
-
-pub(crate) fn accept_handoff_in_transaction(
-    tx: &Transaction<'_>,
-    handoff_id: &HandoffId,
-    workspace_id: &WorkspaceId,
-    project_id: &ProjectId,
-    accepting_agent: AgentKind,
-    accepting_session: Option<&SessionId>,
-    accepting_user: Option<&str>,
-    owner_filter: &OwnerFilter,
-    receiving_cwd: Option<&str>,
-) -> StoreResult<bool> {
+    } = acceptance;
+    let accepting_user = accepting_user.as_deref();
     validate_identity_storage_key(accepting_user, "accepting handoff operator")?;
     match (owner_filter, accepting_user) {
         (OwnerFilter::User(expected), Some(actual)) if expected != actual => {
@@ -1588,7 +1572,7 @@ pub(crate) fn accept_handoff_in_transaction(
     }
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
-    let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
+    let session: Option<&[u8]> = accepting_session.as_ref().map(|s| &s.as_bytes()[..]);
     let metadata = tx
         .query_row(
             "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user \
@@ -1678,7 +1662,7 @@ pub(crate) fn accept_handoff_in_transaction(
                 project_id.as_bytes(),
                 cwd.as_deref(),
                 created_at,
-                receiving_cwd,
+                receiving_cwd.as_deref(),
                 owner_user.as_deref(),
             )?;
             if expired > 0 {
@@ -2556,6 +2540,23 @@ pub(crate) mod tests {
         String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
     }
 
+    fn handoff_acceptance(
+        handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> HandoffAcceptance {
+        HandoffAcceptance {
+            handoff_id,
+            workspace_id,
+            project_id,
+            accepting_agent: AgentKind::Codex,
+            accepting_session: None,
+            accepting_user: None,
+            owner_filter: OwnerFilter::Any,
+            receiving_cwd: None,
+        }
+    }
+
     /// Open a fresh DB with migrations applied + a default workspace
     /// and "scratch" project pre-created. Tuple-return keeps the
     /// tempdir alive for the duration of the test.
@@ -3357,18 +3358,7 @@ pub(crate) mod tests {
         assert_eq!(state, "open");
         assert!(accepted_by.is_none());
 
-        accept_handoff(
-            &mut conn,
-            &id,
-            &ws,
-            &proj,
-            AgentKind::Codex,
-            None,
-            None,
-            &OwnerFilter::Any,
-            None,
-        )
-        .unwrap();
+        accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap();
         let (state, accepted_by): (String, Option<String>) = conn
             .query_row(
                 "SELECT state, accepted_by FROM handoffs WHERE id = ?1",
@@ -3383,17 +3373,7 @@ pub(crate) mod tests {
         // either succeed silently or fail clearly, never corrupt
         // the row. (Current impl is a no-op UPDATE with a state
         // guard.)
-        let second = accept_handoff(
-            &mut conn,
-            &id,
-            &ws,
-            &proj,
-            AgentKind::Codex,
-            None,
-            None,
-            &OwnerFilter::Any,
-            None,
-        );
+        let second = accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj));
         assert!(second.is_ok(), "double-accept must not error");
     }
 
@@ -3469,18 +3449,7 @@ pub(crate) mod tests {
             owner_user: None,
         };
         let id = insert_handoff(&mut conn, &new()).unwrap();
-        accept_handoff(
-            &mut conn,
-            &id,
-            &ws,
-            &proj,
-            AgentKind::Codex,
-            None,
-            None,
-            &OwnerFilter::Any,
-            None,
-        )
-        .unwrap();
+        accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap();
         let id2 = insert_handoff(&mut conn, &new()).unwrap();
         assert!(cancel_handoff(&mut conn, &id2, &ws, &proj, &OwnerFilter::Any).unwrap());
 
@@ -3496,18 +3465,7 @@ pub(crate) mod tests {
         );
         // Idempotent misses stay out of the trail: a double-accept and a
         // cancel of an already-accepted handoff change no row, audit nothing.
-        accept_handoff(
-            &mut conn,
-            &id,
-            &ws,
-            &proj,
-            AgentKind::Codex,
-            None,
-            None,
-            &OwnerFilter::Any,
-            None,
-        )
-        .unwrap();
+        accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap();
         assert!(!cancel_handoff(&mut conn, &id, &ws, &proj, &OwnerFilter::Any).unwrap());
         assert_eq!(
             audit_row_for(&conn, "accept_handoff").0,

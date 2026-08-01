@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentKind, HandoffId, ProjectId, SessionId, WorkspaceId};
+use crate::{
+    OwnerFilter,
+    ids::{AgentKind, HandoffId, ProjectId, SessionId, WorkspaceId},
+};
 
 /// State machine of a single handoff row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,29 @@ pub struct NewHandoff {
     /// actor produces).
     #[serde(default)]
     pub owner_user: Option<String>,
+}
+
+/// Scope, ownership, and receiver metadata for an atomic handoff claim.
+#[derive(Debug, Clone)]
+pub struct HandoffAcceptance {
+    /// Handoff being claimed.
+    pub handoff_id: HandoffId,
+    /// Workspace the caller resolved before the claim.
+    pub workspace_id: WorkspaceId,
+    /// Project the caller resolved before the claim.
+    pub project_id: ProjectId,
+    /// Agent CLI accepting the handoff.
+    pub accepting_agent: AgentKind,
+    /// Session accepting the handoff, when known.
+    pub accepting_session: Option<SessionId>,
+    /// Operator accepting the handoff, in [`crate::IdentityKey::storage_key`]
+    /// form.
+    pub accepting_user: Option<String>,
+    /// Ownership boundary the caller is authorized to claim through.
+    pub owner_filter: OwnerFilter,
+    /// Working directory of the receiving session, used to bound automatic
+    /// handoff supersession.
+    pub receiving_cwd: Option<String>,
 }
 
 /// Materialised view of a handoff row.

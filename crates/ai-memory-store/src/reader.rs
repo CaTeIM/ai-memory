@@ -6900,16 +6900,16 @@ mod tests {
             .unwrap();
         store
             .writer
-            .accept_handoff(
-                selected.id,
-                ws,
-                proj,
-                AgentKind::Codex,
-                None,
-                None,
-                ai_memory_core::OwnerFilter::Any,
-                Some("/repo/api/src".into()),
-            )
+            .accept_handoff(ai_memory_core::HandoffAcceptance {
+                handoff_id: selected.id,
+                workspace_id: ws,
+                project_id: proj,
+                accepting_agent: AgentKind::Codex,
+                accepting_session: None,
+                accepting_user: None,
+                owner_filter: ai_memory_core::OwnerFilter::Any,
+                receiving_cwd: Some("/repo/api/src".into()),
+            })
             .await
             .unwrap();
 
