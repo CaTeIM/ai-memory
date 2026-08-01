@@ -14,6 +14,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 use crate::ManagedHarness;
 
@@ -88,10 +89,10 @@ pub async fn export_transcript(
         // blob whose step-type enum is unversioned, so message text cannot be
         // decoded without guessing at a schema that changes between `agy`
         // releases. Conversation identity and workspace are read (they are
-        // stable, self-describing fields); the visible-event ledger for this
-        // harness comes from lifecycle-hook capture instead.
+        // stable fields observed in current metadata); the visible-event
+        // ledger for this harness comes from lifecycle-hook capture instead.
         return Err(anyhow!(
-            "antigravity conversations expose no decodable transcript;              this session's events come from hook capture"
+            "antigravity conversations expose no decodable transcript; this session's events come from hook capture"
         ));
     }
     let path = locate_session_file(harness, home, cwd, session_dir, native_session_id)?
@@ -1575,6 +1576,9 @@ fn locate_session_file(
     let root = session_root(harness, home, session_dir);
     if harness == ManagedHarness::Antigravity {
         // The conversation id is the file name, so no scan is ever needed.
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
         let exact = root.join(format!("{id}.db"));
         return Ok(exact.is_file().then_some(exact));
     }
@@ -1760,7 +1764,7 @@ fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> 
     let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(None);
     };
-    if !valid_native_session_id(id) {
+    if !valid_native_session_id(id) || Uuid::parse_str(id).is_err() {
         return Ok(None);
     }
     let Ok(connection) = Connection::open_with_flags(
@@ -1770,7 +1774,7 @@ fn antigravity_session_header(path: &Path) -> Result<Option<(String, PathBuf)>> 
         return Ok(None);
     };
     let blob = connection.query_row(
-        "SELECT data FROM trajectory_metadata_blob LIMIT 1",
+        "SELECT data FROM trajectory_metadata_blob WHERE id = 'main' LIMIT 1",
         [],
         |row| row.get::<_, Vec<u8>>(0),
     );
@@ -1819,6 +1823,9 @@ fn protobuf_field(message: &[u8], field: u64) -> Option<&[u8]> {
 fn protobuf_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     for (index, byte) in bytes.iter().take(10).enumerate() {
+        if index == 9 && *byte > 1 {
+            return None;
+        }
         value |= u64::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
             return Some((value, index + 1));
@@ -3234,15 +3241,38 @@ mod tests {
         );
     }
 
-    /// Build the two protobuf layers `agy` writes: an outer message whose
-    /// field 1 holds a nested message whose field 1 is the workspace URI.
+    fn push_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            output.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_protobuf_bytes(output: &mut Vec<u8>, field: u64, value: &[u8]) {
+        push_protobuf_varint(output, (field << 3) | 2);
+        push_protobuf_varint(output, u64::try_from(value.len()).unwrap());
+        output.extend_from_slice(value);
+    }
+
+    /// Build the two protobuf layers observed in `agy` v1.1.7 metadata. The
+    /// unrelated fields ensure discovery searches by field number instead of
+    /// assuming the workspace URI is the entire message.
     fn antigravity_metadata(uri: &str) -> Vec<u8> {
-        let mut nested = vec![0x0a];
-        nested.push(u8::try_from(uri.len()).unwrap());
-        nested.extend_from_slice(uri.as_bytes());
-        let mut outer = vec![0x0a];
-        outer.push(u8::try_from(nested.len()).unwrap());
-        outer.extend_from_slice(&nested);
+        let mut nested = Vec::new();
+        push_protobuf_varint(&mut nested, 2 << 3);
+        push_protobuf_varint(&mut nested, 7);
+        push_protobuf_bytes(&mut nested, 1, uri.as_bytes());
+        push_protobuf_bytes(&mut nested, 4, b"fixture-metadata");
+
+        let mut outer = Vec::new();
+        push_protobuf_bytes(&mut outer, 3, b"unrelated");
+        push_protobuf_bytes(&mut outer, 1, &nested);
+        push_protobuf_varint(&mut outer, 5 << 3);
+        push_protobuf_varint(&mut outer, 1);
         outer
     }
 
@@ -3276,13 +3306,15 @@ mod tests {
     }
 
     /// The conversation id is the file name and the workspace comes from the
-    /// metadata blob, so a checkout only sees its own conversations.
+    /// metadata blob, so a checkout only sees its own conversations. The long
+    /// component forces both protobuf layers to use multi-byte varint lengths.
     #[tokio::test]
     async fn antigravity_lists_only_conversations_from_this_workspace() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join(".gemini/antigravity-cli/conversations");
         fs::create_dir_all(&root).unwrap();
-        let cwd = temp.path().join("checkout");
+        fs::write(root.parent().unwrap().join("outside.db"), b"outside").unwrap();
+        let cwd = temp.path().join(format!("checkout-{}", "x".repeat(140)));
         fs::create_dir_all(&cwd).unwrap();
         let mine = "a0d5ac62-2501-4780-b783-76d159c56cb3";
         let theirs = "9576275f-7c4e-4709-b372-22d1ad2a0af8";
@@ -3312,6 +3344,16 @@ mod tests {
                 &cwd,
                 None,
                 "11111111-1111-1111-1111-111111111111"
+            )
+            .unwrap()
+        );
+        assert!(
+            !native_session_exists(
+                ManagedHarness::Antigravity,
+                temp.path(),
+                &cwd,
+                None,
+                "../outside"
             )
             .unwrap()
         );
@@ -3397,5 +3439,7 @@ mod tests {
         assert_eq!(protobuf_field(&message, 9), None);
         // Truncated input ends the walk instead of panicking on a slice.
         assert_eq!(protobuf_field(&[0x22, 0x10, b'x'], 4), None);
+        // A ten-byte varint may carry only one payload bit in its final byte.
+        assert_eq!(protobuf_varint(&[0xff; 10]), None);
     }
 }

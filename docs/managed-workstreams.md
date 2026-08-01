@@ -158,10 +158,12 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
 | OMP | native default creation | `--resume=<id>` | `~/.omp/agent/sessions/**/*.jsonl` |
 | Grok Build CLI | generated `--session-id` | `--resume <id>` | `$GROK_HOME/sessions/*/*/chat_history.jsonl` |
+| Antigravity CLI | native default creation | `--conversation <id>` | `~/.gemini/antigravity-cli/conversations/<id>.db` metadata plus lifecycle-hook capture |
 
 An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
-or Codex's `resume` wins. ai-memory links the selected native session and resets
-an unrelated adapter cursor rather than assuming it belongs to the old session.
+Codex's `resume`, or Antigravity's `--conversation` / `--continue` wins.
+ai-memory links the selected native session and resets an unrelated adapter
+cursor rather than assuming it belongs to the old session.
 Pi and OMP `--session-dir` values and Crush `--data-dir` values are passed
 through unchanged and used as the read-only import root. Native store
 environment overrides are also honored:
@@ -180,8 +182,9 @@ chooser.
 the harness's native dangerous mode. The translation is Claude Code
 `--dangerously-skip-permissions`, Codex
 `--dangerously-bypass-approvals-and-sandbox`, OpenCode `--auto`, Pi `--approve`,
-Crush `--yolo`, Kimi Code `--yolo`, and Grok Build CLI `--yolo` (equivalent to
-its `--always-approve` option). OMP currently needs no added flag. ai-memory
+Crush `--yolo`, Kimi Code `--yolo`, Grok Build CLI `--yolo` (equivalent to its
+`--always-approve` option), and Antigravity CLI
+`--dangerously-skip-permissions`. OMP currently needs no added flag. ai-memory
 does not add a duplicate when the translated native flag is already present.
 
 Managed support is intentionally narrower than the general integration matrix.
@@ -260,15 +263,16 @@ workspace is the directory `agy` was launched from, not a checkout root, so a
 conversation started one level up is not offered inside a subdirectory.
 
 `agy` accepts no caller-chosen id for a new conversation, so a fresh launch
-injects nothing and the id is linked by the hooks or discovered after exit; a
+injects no selector and the id is linked by the hooks or discovered after exit; a
 linked resume passes `--conversation <id>`. `--continue` / `-c` is treated as an
 explicit user choice and is never overridden. `--yolo` maps to
 `--dangerously-skip-permissions`. Step payloads are undocumented, unversioned
 protobuf blobs, so ai-memory does not decode conversation text: the visible-event
 ledger for this harness comes from lifecycle-hook capture, and transcript export
 fails with a message saying so. The managed launcher accepts `antigravity`,
-`antigravity-cli`, and `agy`. Antigravity is not part of the no-argument
-auto-detection set; name it explicitly or pick it from `ai-memory show`.
+`antigravity-cli`, and `agy`. The native contract was verified against
+Antigravity CLI v1.1.7. Antigravity is not part of the no-argument
+auto-detection set; name it explicitly.
 
 Crush needs no ai-memory hook installation for managed mode. The launcher reads
 its one-time context from the server, copies the existing global Crush JSON into
@@ -322,10 +326,10 @@ process launch is fatal; ai-memory does not silently start an unmanaged agent.
 ## Privacy and storage boundaries
 
 ai-memory's managed adapters do not write to Claude, Codex, OpenCode, Pi, Crush,
-Kimi Code, OMP, or Grok private stores. The launched harness retains normal
-ownership of its own session writes. Adapters read only documented or observed
-local session formats. Provider credentials, encrypted content,
-system/developer prompt records, and hidden reasoning are not copied. The
+Kimi Code, OMP, Grok, or Antigravity private stores. The launched harness
+retains normal ownership of its own session writes. Adapters read only
+documented or observed local session formats. Provider credentials, encrypted
+content, system/developer prompt records, and hidden reasoning are not copied. The
 server sanitizer runs before both the SQLite FTS ledger and immutable files under
 `<data_dir>/raw/workstreams/<workstream-id>/segments/` are written.
 
@@ -339,8 +343,9 @@ belong in wiki pages through consolidation or explicit durable writes.
 project name. Wiki paths are UUID-keyed, so it moves no server directory, source
 checkout, or native harness session. If the source checkout path itself is
 renamed, absolute-path session locators used by Claude Code, Codex, OpenCode,
-Pi, Kimi Code (`state.json`'s `workDir`), and OMP may still reference the old
-path; Crush's project-local `.crush` database moves with the checkout.
+Pi, Kimi Code (`state.json`'s `workDir`), OMP, and Antigravity may still
+reference the old path; Crush's project-local `.crush` database moves with the
+checkout.
 
 There is no portable, supported API that rewrites every harness's private
 project locator. ai-memory therefore does not mutate those stores or silently
@@ -369,12 +374,15 @@ OpenCode receive only copied authentication material; OMP receives a temporary
 agent directory with read-consistent credential/model database backups and
 copied settings. Crush uses its existing global provider configuration and an
 isolated project database. Kimi Code runs with an isolated `$KIMI_CODE_HOME`
-seeded with the operator's provider configuration. The deterministic phase
-also covers first-run adoption, bare-mode selection and empty-directory
-failure, wrapper `--yolo`, lease exclusion, Crush context cleanup, a fake-mode
-Kimi store/resume/import round trip, and the established-workstream guard
-against obsolete sessions. The fake Kimi round trip also deletes the linked
-native session and verifies automatic fresh-session recovery and repointing.
+seeded with the operator's provider configuration. Antigravity runs with an
+isolated `HOME` seeded only with the operator's OAuth and settings files. The
+deterministic phase also covers first-run adoption, bare-mode selection and
+empty-directory failure, wrapper `--yolo`, lease exclusion, Crush context
+cleanup, a fake-mode Kimi store/resume/import round trip, an Antigravity
+hook/link/resume round trip, private-trajectory exclusion, and the
+established-workstream guard against obsolete sessions. The fake Kimi round
+trip also deletes the linked native session and verifies automatic
+fresh-session recovery and repointing.
 Native session creation, read-only extraction, cross-harness injection, and
 returning resume paths are all exercised. Docker wrapper host execution and
 remote URL preservation are covered separately by the `ai-memory-cli`
@@ -382,19 +390,22 @@ packaging tests.
 
 The real-harness phase treats the model as the system under transport, not as
 the test oracle. For each leg it records the prior ledger sequence, then
-requires a newly imported assistant event from that harness. When a context
-delta is expected, it first verifies that the prior ledger endpoint is newer
+requires a newly imported assistant event from harnesses with readable native
+transcripts. For Antigravity it instead requires the exact native conversation
+link and a new correlated startup-hook observation, because its private
+trajectory protobuf is deliberately not decoded. When a context delta is
+expected, it first verifies that the prior ledger endpoint is newer
 than that harness's delivery cursor, then requires the latest managed run to
 report that exact endpoint as `sync_through` with `context_delivered = 1`. It
 does not require the model to quote a prior sentinel: Claude Code may
 externalize a large hook result to a file, and whether a model chooses to read
 that file is not a deterministic continuity signal. The deterministic fake
-Grok cross-harness fixture exercises the same assertion helper without
-credentials or model calls.
+Grok and Antigravity cross-harness fixtures exercise the same assertion helper
+without credentials or model calls.
 
 Set
-`AI_MEMORY_ACCEPTANCE_HARNESSES="kimi-cli codex"` to select a
-Kimi-to-Codex-to-Kimi round trip (Kimi aliases normalize to the installed
-`kimi` executable), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
+`AI_MEMORY_ACCEPTANCE_HARNESSES="antigravity codex"` to select an
+Antigravity-to-Codex-to-Antigravity round trip (`agy` and `antigravity-cli` are
+accepted aliases), `AI_MEMORY_ACCEPTANCE_DETERMINISTIC_ONLY=1` to skip model
 calls, or
 `AI_MEMORY_ACCEPTANCE_KEEP=1` to retain all temporary logs and data.

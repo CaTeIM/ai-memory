@@ -193,8 +193,8 @@ priors are at the [bottom](#influences-and-prior-art).
   the workstream immediately. If a linked native transcript was deleted,
   ai-memory detects the orphan before launch and starts fresh; `--fresh` forces
   that recovery for one harness. Managed mode currently covers Claude Code,
-  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI; direct harness
-  launches remain unchanged. See
+  Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity
+  CLI; direct harness launches remain unchanged. See
   [Managed cross-harness workstreams](docs/managed-workstreams.md).
 - **"Quit at 4 PM, pick up at 9 AM in a different agent."** The
   classic. SessionStart hook in the next supported hook client prepends a
@@ -882,7 +882,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, slim routing snippet + managed Agent Skills, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
-| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, and Grok Build CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
+| [`docs/managed-workstreams.md`](docs/managed-workstreams.md) | Optional `ai-memory run` continuity across Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, and Antigravity CLI: automatic harness selection, native resume, argument forwarding, ledger search, privacy, and recovery. |
 | [`docs/managed-harness-contributions.md`](docs/managed-harness-contributions.md) | Protocol and acceptance bar for contributors adding managed resume, read-only transcript import, and startup context delivery to another harness. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
