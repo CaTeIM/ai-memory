@@ -72,10 +72,12 @@ pub struct ActorContext {
     /// in this session" against `audit_log` + `observations`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Reserved for the external-auth-proxy rung: the JWT `sub` claim
-    /// (stable user UUID). Kept `Option<String>` so payloads to the
-    /// future admission webhook chain stay forward-compatible with the
-    /// shape PR #55 documents — we don't fill it from rungs 0-3.
+    /// Issuer for the external-auth-proxy rung's OIDC subject. A subject is
+    /// unique only within its issuer, so proxy authentication accepts these
+    /// two fields only as a pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// OIDC `sub` claim asserted by an external authenticating proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
     /// Reserved for the external-auth-proxy rung: the DCR client UUID
@@ -255,6 +257,7 @@ impl ActorContext {
             || self.name.is_some()
             || self.email.is_some()
             || self.session_id.is_some()
+            || self.issuer.is_some()
             || self.sub.is_some()
             || self.client.is_some()
     }
@@ -273,7 +276,7 @@ impl ActorContext {
     /// which name a new row is stamped with — goes through here rather than
     /// reaching for [`Self::user`] directly, because "identified" is not the
     /// same question as "has a username". An ingress that terminates OIDC and
-    /// forwards only the subject claim asserts `sub` with no
+    /// forwards only the issuer and subject claims asserts no
     /// `preferred_username`; the auth middleware already resolves that request
     /// to `AuthLevel::User`, so a per-site `.user` check would call the same
     /// request identified for authorization and anonymous for ownership — and
@@ -287,19 +290,18 @@ impl ActorContext {
     /// share that person's rows. Qualification makes the collision
     /// unrepresentable rather than unlikely.
     ///
-    /// `sub` wins whenever it is present. OIDC pins this ordering:
-    /// the spec defines `sub` as the stable, non-reassignable identifier and
+    /// An `(issuer, sub)` pair wins whenever both fields are present. OIDC pins
+    /// this ordering: the spec defines that pair as the stable identifier and
     /// explicitly forbids relying on `preferred_username` for identity. It is
     /// also the direction that stays stable through the common upgrade — an
     /// ingress that forwarded only `sub` and later starts forwarding a
     /// username keeps the same key. The reverse upgrade (username-only, later
-    /// adding `sub`) re-buckets once, at the moment the deployment starts
+    /// adding the OIDC pair) re-buckets once, at the moment the deployment starts
     /// asserting the stronger identifier; `docs/users.md` tells operators to
     /// forward `sub` from day one exactly so that moment never comes.
     ///
-    /// Blank and whitespace-only values name nobody — they would otherwise
-    /// mint an owner literally called `""` that the next blank-actor caller
-    /// would match. Same rule [`OwnerFilter::for_actor_context`] applies.
+    /// Blank and whitespace-only values name nobody. A partial OIDC pair is
+    /// deliberately not an identity; trusted-proxy ingress rejects it.
     #[must_use]
     pub fn identity_key(&self) -> Option<IdentityKey> {
         let trimmed = |v: &Option<String>| {
@@ -308,8 +310,8 @@ impl ActorContext {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
         };
-        if let Some(sub) = trimmed(&self.sub) {
-            return Some(IdentityKey::Subject(sub));
+        if let (Some(issuer), Some(subject)) = (trimmed(&self.issuer), trimmed(&self.sub)) {
+            return Some(IdentityKey::Subject { issuer, subject });
         }
         trimmed(&self.user).map(IdentityKey::User)
     }
@@ -317,17 +319,20 @@ impl ActorContext {
 
 /// A qualified operator identity — the one value ownership is keyed on.
 ///
-/// The variant is part of the identity: `User("alice")` and
-/// `Subject("alice")` are different operators, always. Everything that
-/// persists or compares an identity goes through [`Self::storage_key`] (DB
-/// TEXT columns) or [`Self::path_segment`] (wiki paths); nothing stores the
-/// raw value, so no call site can accidentally flatten the two name spaces
-/// back into one.
+/// The variant is part of the identity: a username and an OIDC subject with
+/// equal text are different operators. Everything that persists or compares
+/// an identity goes through [`Self::storage_key`], so call sites cannot flatten
+/// the namespaces or discard an OIDC issuer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IdentityKey {
-    /// Named by an IdP-issued OIDC subject claim. Checked first: `sub` is the
-    /// identifier the OIDC spec defines as stable and non-reassignable.
-    Subject(String),
+    /// Named by the OIDC issuer and subject pair. `sub` alone is not globally
+    /// unique when a proxy accepts tokens from more than one issuer.
+    Subject {
+        /// Exact OIDC `iss` value validated by the proxy.
+        issuer: String,
+        /// Exact OIDC `sub` value validated by the proxy.
+        subject: String,
+    },
     /// Named by an asserted or configured username. Usernames are display
     /// names in OIDC terms — present, human-readable, and explicitly not
     /// guaranteed stable — so this variant keys a caller only when no
@@ -336,141 +341,20 @@ pub enum IdentityKey {
 }
 
 impl IdentityKey {
-    /// The TEXT form stored in owner columns and compared by
-    /// [`OwnerFilter::admits`]: `sub:<subject>` or `user:<name>`.
+    /// The TEXT form used for in-memory routing and future owner columns:
+    /// `oidc:<issuer-byte-length>:<issuer><subject>` or `user:<name>`.
     ///
-    /// The prefix runs to the first `:`; only these two prefixes exist, so
-    /// the encoding needs no escaping — whatever follows the first `:` is the
-    /// raw value, even if it contains further colons (subjects are often
-    /// URLs).
+    /// Length-prefixing the issuer makes the OIDC form unambiguous without
+    /// constraining either value or adding an encoding dependency.
     #[must_use]
     pub fn storage_key(&self) -> String {
         match self {
-            Self::Subject(sub) => format!("sub:{sub}"),
+            Self::Subject { issuer, subject } => {
+                format!("oidc:{}:{issuer}{subject}", issuer.len())
+            }
             Self::User(user) => format!("user:{user}"),
         }
     }
-
-    /// A filesystem-safe, injective encoding for per-operator wiki paths
-    /// (`_slots/<segment>/…`).
-    ///
-    /// Subjects and usernames may hold anything the IdP or operator chose —
-    /// URLs are common subjects — and wiki pages are real files on every
-    /// platform the server runs on, so the raw value cannot be a path
-    /// component. Values made only of `[A-Za-z0-9._-]` (≤ 64 chars, no
-    /// leading dot) pass through readably as `s-<value>` / `u-<value>`;
-    /// anything else becomes lowercase hex of its UTF-8 bytes under the
-    /// distinct `sx-` / `ux-` prefixes. The prefixes are what keep the
-    /// encoding injective: a passthrough value that *looks* like hex
-    /// (`s-c3a9`) can never collide with the value that *hexes* to the same
-    /// digits (`sx-c3a9`).
-    #[must_use]
-    pub fn path_segment(&self) -> String {
-        fn passthrough(value: &str) -> bool {
-            value.len() <= 64
-                && !value.starts_with('.')
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        }
-        fn hex(value: &str) -> String {
-            value.bytes().fold(String::new(), |mut acc, b| {
-                use std::fmt::Write;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            })
-        }
-        match self {
-            Self::Subject(v) if passthrough(v) => format!("s-{v}"),
-            Self::Subject(v) => format!("sx-{}", hex(v)),
-            Self::User(v) if passthrough(v) => format!("u-{v}"),
-            Self::User(v) => format!("ux-{}", hex(v)),
-        }
-    }
-}
-
-/// Which owned rows a caller is allowed to see or act on.
-///
-/// Used for handoffs and for sessions. A row whose owner is `None` is
-/// *shared*: it predates ownership, was written by a caller with no actor, or
-/// was deliberately published to the whole project. Shared rows stay visible
-/// to everyone, which is what keeps single-operator servers behaving exactly
-/// as before.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnerFilter {
-    /// An identified caller: their own rows plus the shared ones. Holds the
-    /// [`IdentityKey::storage_key`] form — the same TEXT that
-    /// [`owner_stamp`] writes — so admit checks are exact string equality
-    /// with no re-derivation.
-    User(String),
-    /// A caller with no actor: shared rows only. Prevents an unattributed
-    /// reader (or a browser hitting a read-only API) from draining or
-    /// reading something that belongs to a specific operator.
-    Unattributed,
-    /// Explicit opt-in to every owner, for operator recovery ("give me
-    /// whatever is pending here, even if it is not mine").
-    Any,
-}
-
-impl OwnerFilter {
-    /// Build the filter for a caller, applying the one identity rule in
-    /// [`ActorContext::identity_key`] instead of re-deriving it at the call
-    /// site.
-    #[must_use]
-    pub fn for_actor_context(actor: &ActorContext) -> Self {
-        match actor.identity_key() {
-            Some(key) => Self::User(key.storage_key()),
-            None => Self::Unattributed,
-        }
-    }
-
-    /// Does a row owned by `owner` pass this filter?
-    #[must_use]
-    pub fn admits(&self, owner: Option<&str>) -> bool {
-        match (self, owner) {
-            // Shared rows are visible to everyone (legacy + single-user).
-            (_, None) => true,
-            (Self::Any, _) => true,
-            (Self::User(me), Some(owner)) => me == owner,
-            (Self::Unattributed, Some(_)) => false,
-        }
-    }
-}
-
-/// The owner to stamp on a row a request creates — the write-side mirror of
-/// [`OwnerFilter::for_actor_context`], which decides what that same request
-/// may read.
-///
-/// `distinguishes_operators` is the deployment-level question the admin gates
-/// already ask (`users` rows exist, or a trusted proxy asserts identities),
-/// and it is what makes this more than `identity.map(storage_key)`.
-///
-/// # Why a deployment that names one operator must still stamp nothing
-///
-/// On a server with `[auth].bearer_token` + `[auth].root_username` and no
-/// users and no proxy, every HTTP request resolves to that single name.
-/// Stamping it does not separate anybody from anybody — there is only one
-/// operator — but it does split that operator in two, because the transports
-/// disagree about whether a request carries an actor at all: the HTTP write
-/// would land owned, while the SAME person's stdio / in-process MCP transport
-/// carries no actor, filters as [`OwnerFilter::Unattributed`], and could no
-/// longer see what they just wrote. Producing the pre-ownership `NULL` there
-/// is what keeps the transports agreeing.
-///
-/// The read side deliberately does **not** take this gate: a caller still
-/// filters as `OwnerFilter::User(key)`, which admits both the shared rows and
-/// any row already stamped with that key, so rows written while a deployment
-/// did distinguish operators stay reachable after it stops (the last `users`
-/// row is deleted).
-#[must_use]
-pub fn owner_stamp(
-    identity: Option<&IdentityKey>,
-    distinguishes_operators: bool,
-) -> Option<String> {
-    if !distinguishes_operators {
-        return None;
-    }
-    identity.map(IdentityKey::storage_key)
 }
 
 #[cfg(test)]
@@ -594,6 +478,10 @@ mod tests {
         assert!(a.has_any());
         a = ActorContext::default();
 
+        a.issuer = Some("https://idp.example".into());
+        assert!(a.has_any());
+        a = ActorContext::default();
+
         a.sub = Some("8f3a".into());
         assert!(a.has_any());
         a = ActorContext::default();
@@ -602,111 +490,54 @@ mod tests {
         assert!(a.has_any());
     }
 
-    /// An actor the auth middleware resolved to `AuthLevel::User` must be
-    /// identified for ownership too, whichever field the proxy filled in. The
-    /// sub-only rung is the one a per-site `.user` check silently drops.
+    /// OIDC identity is the issuer and subject pair, never the subject alone.
     #[test]
-    fn identity_key_accepts_sub_when_no_username_was_asserted() {
-        let sub_only = ActorContext {
+    fn identity_key_accepts_oidc_pair_without_username() {
+        let oidc = ActorContext {
+            issuer: Some("https://idp.example".into()),
             sub: Some("oidc-subject-123".into()),
             ..ActorContext::default()
         };
         assert_eq!(
-            sub_only.identity_key(),
-            Some(IdentityKey::Subject("oidc-subject-123".into()))
+            oidc.identity_key(),
+            Some(IdentityKey::Subject {
+                issuer: "https://idp.example".into(),
+                subject: "oidc-subject-123".into(),
+            })
         );
     }
 
-    /// `sub` outranks `user`: OIDC defines `sub` as the stable identifier and
-    /// forbids relying on `preferred_username`. The concrete upgrade this
-    /// protects: an ingress that forwarded only `sub` and later starts
-    /// forwarding a username must keep the same key, or the operator's rows
-    /// re-bucket the day the proxy config improves.
+    /// The stable OIDC pair outranks the display username.
     #[test]
-    fn identity_key_prefers_sub_over_user() {
+    fn identity_key_prefers_oidc_pair_over_user() {
         let both = ActorContext {
             user: Some("alice".into()),
+            issuer: Some("https://idp.example".into()),
             sub: Some("oidc-subject-123".into()),
             ..ActorContext::default()
         };
         assert_eq!(
             both.identity_key(),
-            Some(IdentityKey::Subject("oidc-subject-123".into()))
+            Some(IdentityKey::Subject {
+                issuer: "https://idp.example".into(),
+                subject: "oidc-subject-123".into(),
+            })
         );
     }
 
-    /// The aliasing the qualified form exists to kill: a username equal to
-    /// somebody else's subject is a DIFFERENT identity, in storage and in
-    /// admit checks. Raw TEXT keys would have merged these two people.
     #[test]
-    fn a_username_never_aliases_an_equal_subject() {
+    fn identity_storage_keys_keep_namespaces_and_issuers_distinct() {
         let by_name = IdentityKey::User("alice".into());
-        let by_subject = IdentityKey::Subject("alice".into());
-        assert_ne!(by_name.storage_key(), by_subject.storage_key());
-        assert_ne!(by_name.path_segment(), by_subject.path_segment());
-
-        let names_filter = OwnerFilter::User(by_name.storage_key());
-        assert!(!names_filter.admits(Some(&by_subject.storage_key())));
-    }
-
-    /// Subjects are IdP-issued and often URLs; wiki paths are real files on
-    /// every platform. Path-hostile values hex-encode under a DISTINCT prefix
-    /// so a passthrough value that merely looks like hex cannot collide with
-    /// the value that hexes to the same digits.
-    #[test]
-    fn path_segment_is_filesystem_safe_and_injective() {
-        assert_eq!(IdentityKey::User("alice".into()).path_segment(), "u-alice");
-        assert_eq!(
-            IdentityKey::Subject("103459784".into()).path_segment(),
-            "s-103459784"
-        );
-        let url_sub = IdentityKey::Subject("https://idp.example/id/42".into());
-        let seg = url_sub.path_segment();
-        assert!(seg.starts_with("sx-"), "url subject must hex-encode: {seg}");
-        assert!(
-            seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-            "segment must be path-safe: {seg}"
-        );
-        // The ambiguity the split prefixes prevent: "c3a9" passes through,
-        // "é" hexes to c3a9 — different prefixes, no collision.
-        assert_eq!(IdentityKey::Subject("c3a9".into()).path_segment(), "s-c3a9");
-        assert_eq!(IdentityKey::Subject("é".into()).path_segment(), "sx-c3a9");
-    }
-
-    /// The write-side gate: identity alone is not enough to stamp — the
-    /// deployment must actually distinguish operators, or a single-operator
-    /// server would split its own transports (HTTP names the operator, stdio
-    /// carries no actor).
-    #[test]
-    fn owner_stamp_requires_both_identity_and_a_distinguishing_deployment() {
-        let key = IdentityKey::Subject("oidc-subject-123".into());
-        assert_eq!(owner_stamp(Some(&key), false), None);
-        assert_eq!(owner_stamp(None, true), None);
-        assert_eq!(
-            owner_stamp(Some(&key), true),
-            Some("sub:oidc-subject-123".into())
-        );
-    }
-
-    /// The admit matrix in one place: shared rows reach everyone, owned rows
-    /// reach their owner and `Any`, and an unattributed caller sees only the
-    /// shared ones.
-    #[test]
-    fn owner_filter_admit_matrix() {
-        let alice = OwnerFilter::for_actor_context(&ActorContext {
-            user: Some("alice".into()),
-            ..ActorContext::default()
-        });
-        let owned = IdentityKey::User("alice".into()).storage_key();
-        let other = IdentityKey::User("bob".into()).storage_key();
-
-        for filter in [&alice, &OwnerFilter::Unattributed, &OwnerFilter::Any] {
-            assert!(filter.admits(None), "shared rows reach everyone");
-        }
-        assert!(alice.admits(Some(&owned)));
-        assert!(!alice.admits(Some(&other)));
-        assert!(!OwnerFilter::Unattributed.admits(Some(&owned)));
-        assert!(OwnerFilter::Any.admits(Some(&other)));
+        let issuer_a = IdentityKey::Subject {
+            issuer: "https://idp-a.example".into(),
+            subject: "alice".into(),
+        };
+        let issuer_b = IdentityKey::Subject {
+            issuer: "https://idp-b.example".into(),
+            subject: "alice".into(),
+        };
+        assert_ne!(by_name.storage_key(), issuer_a.storage_key());
+        assert_ne!(issuer_a.storage_key(), issuer_b.storage_key());
     }
 
     /// Naming nobody stays naming nobody: an agent/session-only actor carries
@@ -723,25 +554,29 @@ mod tests {
         assert_eq!(transport_only.identity_key(), None);
         let blank = ActorContext {
             user: Some("   ".into()),
+            issuer: Some("\n".into()),
             sub: Some("\t".into()),
             ..ActorContext::default()
         };
         assert_eq!(blank.identity_key(), None);
     }
 
-    /// A blank `user` beside a real `sub` must fall through rather than
-    /// resolving the whole actor to "nobody".
     #[test]
-    fn identity_key_skips_a_blank_user_and_uses_sub() {
+    fn partial_oidc_pair_does_not_override_username() {
         let actor = ActorContext {
-            user: Some("  ".into()),
+            user: Some("alice".into()),
             sub: Some("oidc-subject-123".into()),
             ..ActorContext::default()
         };
         assert_eq!(
             actor.identity_key(),
-            Some(IdentityKey::Subject("oidc-subject-123".into()))
+            Some(IdentityKey::User("alice".into()))
         );
+        let sub_only = ActorContext {
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(sub_only.identity_key(), None);
     }
 
     #[test]
@@ -773,6 +608,7 @@ mod tests {
             name: Some("Alice Smith".into()),
             email: Some("alice@home".into()),
             session_id: Some("019e6d".into()),
+            issuer: Some("https://idp.example".into()),
             sub: Some("8f3a-uuid".into()),
             client: Some("72836f52-uuid".into()),
         };

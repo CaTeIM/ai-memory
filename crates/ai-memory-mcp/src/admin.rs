@@ -141,7 +141,7 @@ pub struct AdminState {
     /// admin-only tests).
     pub scope_invalidator: Option<ScopeInvalidator>,
     /// True when a trusted authenticating proxy is configured to assert
-    /// end-user identities (`[auth].actor_proxy_secret`).
+    /// end-user identities (`[auth].actor_proxy_bearer_token`).
     ///
     /// Proxy-asserted operators never get a `users` row, so `users_exist()`
     /// alone answers "does this deployment distinguish operators" with a
@@ -7617,6 +7617,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_topology_gates_admin_without_db_users() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: true,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match req
+                    .headers()
+                    .get("x-test-auth-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => ai_memory_core::AuthLevel::Root,
+                    Some("user") => ai_memory_core::AuthLevel::User,
+                    _ => ai_memory_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        for (level, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("user"), StatusCode::FORBIDDEN),
+            (Some("root"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(level) = level {
+                request = request.header("x-test-auth-level", level);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "level={level:?}");
+        }
     }
 
     #[tokio::test]

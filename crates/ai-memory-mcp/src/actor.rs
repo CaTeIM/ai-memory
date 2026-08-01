@@ -44,6 +44,7 @@ pub fn actor_from_headers(headers: &HeaderMap) -> ActorContext {
     ActorContext {
         agent: header_str(headers, "x-memory-actor-agent"),
         user: header_str(headers, "x-memory-actor-user"),
+        issuer: header_str(headers, "x-memory-actor-issuer"),
         sub: header_str(headers, "x-memory-actor-sub"),
         client: header_str(headers, "x-memory-actor-client"),
         session_id: header_str(headers, "x-memory-actor-session-id"),
@@ -115,6 +116,10 @@ mod tests {
             HeaderValue::from_static("claude-code"),
         );
         h.insert("x-memory-actor-user", HeaderValue::from_static("djalmajr"));
+        h.insert(
+            "x-memory-actor-issuer",
+            HeaderValue::from_static("https://idp.example"),
+        );
         h.insert("x-memory-actor-sub", HeaderValue::from_static("8f3a-uuid"));
         h.insert(
             "x-memory-actor-client",
@@ -127,6 +132,7 @@ mod tests {
         let ctx = actor_from_headers(&h);
         assert_eq!(ctx.agent.as_deref(), Some("claude-code"));
         assert_eq!(ctx.user.as_deref(), Some("djalmajr"));
+        assert_eq!(ctx.issuer.as_deref(), Some("https://idp.example"));
         assert_eq!(ctx.sub.as_deref(), Some("8f3a-uuid"));
         assert_eq!(ctx.client.as_deref(), Some("72836f52-uuid"));
         assert_eq!(ctx.session_id.as_deref(), Some("019e6d-session"));
@@ -139,6 +145,7 @@ mod tests {
         let ctx = actor_from_headers(&h);
         assert!(ctx.agent.is_none());
         assert!(ctx.user.is_none());
+        assert!(ctx.issuer.is_none());
         assert!(ctx.sub.is_none());
         assert!(ctx.client.is_none());
         assert!(ctx.session_id.is_none());

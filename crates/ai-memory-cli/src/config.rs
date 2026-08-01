@@ -357,6 +357,13 @@ pub struct AuthSettings {
     /// pre-multi-user behaviour — bearer authenticates but
     /// attributes anonymously.
     pub root_username: Option<String>,
+    /// OIDC issuer for the root operator when a trusted proxy asserts stable
+    /// identities. Configure together with [`Self::root_subject`].
+    pub root_issuer: Option<String>,
+    /// OIDC subject for the root operator. Configure together with
+    /// [`Self::root_issuer`]; only this pair can grant a proxy-authenticated
+    /// request root capability. A display username is not a stable root key.
+    pub root_subject: Option<String>,
     /// Optional email for the root user, surfaced alongside
     /// `root_username` in the web UI + `/api/v1` responses.
     pub root_email: Option<String>,
@@ -372,20 +379,16 @@ pub struct AuthSettings {
     /// token resolution even during first-user bootstrap; operational admin
     /// access becomes root-only once a user row exists.
     pub token_pepper: Option<String>,
-    /// Shared secret proving a request came from a trusted authenticating
-    /// proxy, allowing it to name the real end user in `X-Memory-Actor-*`
-    /// headers.
+    /// Dedicated bearer token for a trusted authenticating proxy, allowing it
+    /// to name the real end user in `X-Memory-Actor-*` headers.
     ///
     /// A proxy that terminates SSO usually cannot forward the user's own
-    /// credential upstream — it authenticates with [`Self::bearer_token`] and
-    /// describes the human in headers. Those headers are ignored unless this
-    /// secret is set AND the proxy echoes it in `X-Memory-Actor-Proxy-Secret`,
-    /// because anything able to reach the port could otherwise claim any
-    /// identity. Leave unset (the default) and every proxied caller is
-    /// attributed to [`Self::root_username`], as before.
+    /// credential upstream. This token must differ from [`Self::bearer_token`]
+    /// so an omitted or malformed identity cannot fall through as root.
+    /// Actor headers on ordinary root and DB-user requests are ignored.
     ///
     /// Only set this when the server is reachable *only* through that proxy.
-    pub actor_proxy_secret: Option<String>,
+    pub actor_proxy_bearer_token: Option<String>,
 }
 
 /// `[auto_scope]` — controls how the hook-published "currently active

@@ -510,14 +510,13 @@ async fn handle_hook(
     // it. Runs before the semaphore so a dropped event consumes no capacity.
     // The auth middleware in front of `/hook` injects the request's
     // [`ActorContext`] (rung 1 root, rung 2 DB user, or anonymous). We
-    // capture its `user` field NOW — before the spawn drops the request
-    // extensions — so `process()` can key the `ActiveProject` map by the
-    // authenticated identity when `[auto_scope] mode = per_actor` is on.
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
-        .unwrap_or_default();
+    // derive its qualified identity NOW, before the spawn drops the request
+    // extensions, so `process()` can key `ActiveProject` consistently with MCP.
+    let actor_identity = actor_ext
+        .and_then(|axum::Extension(ctx)| ctx.identity_key())
+        .map(|identity| identity.storage_key());
     let actor_key = ActorKey {
-        user: actor_user.clone(),
+        user: actor_identity.clone(),
         session_id: env.session_id.clone(),
     };
     if should_drop_subagent(&state, &env, &actor_key).await {
@@ -527,7 +526,7 @@ async fn handle_hook(
         warn!("hook ingest saturated; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
     };
-    let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+    let rate_key = ingest_rate_key(&env, actor_identity.as_deref());
     if !state
         .ingest_rate
         .lock()
@@ -539,7 +538,7 @@ async fn handle_hook(
     }
     tokio::spawn(async move {
         let _permit = permit;
-        process_envelope(state, env, actor_user).await;
+        process_envelope(state, env, actor_identity).await;
     });
     (StatusCode::ACCEPTED, "queued")
 }
@@ -653,9 +652,9 @@ async fn handle_hook_batch(
     }
     // All items in a batch share the drain's single identity, so the actor is
     // captured once from the batch request (mirrors `handle_hook`).
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
-        .unwrap_or_default();
+    let actor_identity = actor_ext
+        .and_then(|axum::Extension(ctx)| ctx.identity_key())
+        .map(|identity| identity.storage_key());
     let mut accepted_indices = Vec::new();
     for (idx, mut item) in items.into_iter().enumerate() {
         // Same unconditional assistant-message backstop as `handle_hook`, applied
@@ -675,7 +674,7 @@ async fn handle_hook_batch(
             continue;
         };
         let actor_key = ActorKey {
-            user: actor_user.clone(),
+            user: actor_identity.clone(),
             session_id: env.session_id.clone(),
         };
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
@@ -695,7 +694,7 @@ async fn handle_hook_batch(
                 Json(HookBatchAck::indexed(accepted_indices)),
             );
         };
-        let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+        let rate_key = ingest_rate_key(&env, actor_identity.as_deref());
         if !state
             .ingest_rate
             .lock()
@@ -707,7 +706,7 @@ async fn handle_hook_batch(
             continue;
         }
         let _permit = permit;
-        if let Err(e) = process(&state, env, actor_user.clone()).await {
+        if let Err(e) = process(&state, env, actor_identity.clone()).await {
             warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
             return (
                 StatusCode::OK,
@@ -1069,10 +1068,10 @@ async fn handle_handoff(
     Query(query): Query<HandoffQuery>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
 ) -> impl IntoResponse {
-    let actor_user = actor_ext
-        .map(|axum::Extension(ctx)| ctx.user)
-        .unwrap_or_default();
-    match fetch_and_accept_handoff(&state, query, actor_user).await {
+    let actor_identity = actor_ext
+        .and_then(|axum::Extension(ctx)| ctx.identity_key())
+        .map(|identity| identity.storage_key());
+    match fetch_and_accept_handoff(&state, query, actor_identity).await {
         Ok(Some(markdown)) => (StatusCode::OK, markdown),
         Ok(None) => (StatusCode::OK, String::new()),
         Err(e) => {
@@ -1085,7 +1084,7 @@ async fn handle_handoff(
 async fn fetch_and_accept_handoff(
     state: &HookState,
     query: HandoffQuery,
-    actor_user: Option<String>,
+    actor_identity: Option<String>,
 ) -> anyhow::Result<Option<String>> {
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // A managed run's ledger is additive, not a replacement. Returning it here
@@ -1100,7 +1099,7 @@ async fn fetch_and_accept_handoff(
     // therefore falls back to the single slot (graceful degradation),
     // while `per_actor` keys by `user` alone.
     let actor_key = ai_memory_core::ActorKey {
-        user: actor_user,
+        user: actor_identity,
         session_id: None,
     };
     let (ws, proj) = resolve_project_ids_inner(
@@ -1892,8 +1891,12 @@ fn sticky_within_session_tree(
     std::path::Path::new(&event_norm).starts_with(std::path::Path::new(&session_norm))
 }
 
-async fn process_envelope(state: Arc<HookState>, env: HookEnvelope, actor_user: Option<String>) {
-    if let Err(e) = process(&state, env, actor_user).await {
+async fn process_envelope(
+    state: Arc<HookState>,
+    env: HookEnvelope,
+    actor_identity: Option<String>,
+) {
+    if let Err(e) = process(&state, env, actor_identity).await {
         warn!(error = %e, "hook processing failed");
     }
 }
@@ -1930,12 +1933,12 @@ async fn enqueue_session_end_consolidation(
 async fn process(
     state: &HookState,
     env: HookEnvelope,
-    actor_user: Option<String>,
+    actor_identity: Option<String>,
 ) -> anyhow::Result<()> {
     let session_id = resolve_session_id(&env)?;
     // Build the actor key used to scope the in-process `ActiveProject`
-    // pointer. `user` is whatever the auth middleware extracted from this
-    // request; `session_id` is the RAW string from the payload (NOT the
+    // pointer. `user` is the qualified key derived from auth middleware;
+    // `session_id` is the RAW string from the payload (NOT the
     // resolved UUID) — agents that forward an opaque session id over
     // `X-Memory-Actor-Session-Id` on /mcp pass the same raw string, so set
     // and get land on the same map slot. The MCP server's
@@ -1943,7 +1946,7 @@ async fn process(
     // (anonymous + no session) is allowed — `set_for` falls back to the
     // single slot.
     let actor_key = ai_memory_core::ActorKey {
-        user: actor_user.clone(),
+        user: actor_identity,
         session_id: env.session_id.clone(),
     };
     // Session-sticky attribution: for an event whose session already
