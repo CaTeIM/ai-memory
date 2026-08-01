@@ -1195,6 +1195,7 @@ const fn managed_harness(choice: RunHarnessChoice) -> ManagedHarness {
         RunHarnessChoice::Omp => ManagedHarness::Omp,
         RunHarnessChoice::Kimi => ManagedHarness::Kimi,
         RunHarnessChoice::Grok => ManagedHarness::Grok,
+        RunHarnessChoice::Antigravity => ManagedHarness::Antigravity,
     }
 }
 
@@ -1207,6 +1208,7 @@ const fn managed_harness_from_agent(agent: AgentKind) -> Option<ManagedHarness> 
         AgentKind::Crush => Some(ManagedHarness::Crush),
         AgentKind::KimiCode => Some(ManagedHarness::Kimi),
         AgentKind::Grok => Some(ManagedHarness::Grok),
+        AgentKind::AntigravityCli => Some(ManagedHarness::Antigravity),
         _ => None,
     }
 }
