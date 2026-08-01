@@ -77,6 +77,15 @@ live ai-memory server. In particular, bearer tokens and endpoint settings
 should stay in environment or local config references rather than generated
 plugin source files.
 
+The hook router does recognize `agent=hermes` as a concrete session kind and
+accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
+tool-family metadata and capture-exclusion enforcement. A custom bridge should
+map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's
+canonical `session-start`, `post-tool-use`, and `session-end` event names while
+forwarding the original JSON object. This protocol recognition does not install
+or trust a third-party plugin. Hermes ignores session-start hook stdout, so it
+cannot consume an automatic handoff there; use MCP `memory_handoff_accept`.
+
 The same lifecycle guidance below applies to Hermes or any other external
 bridge: map known events onto ai-memory's canonical hook events where
 possible, and use extension metadata for source-specific events instead of
