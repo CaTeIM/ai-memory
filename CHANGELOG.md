@@ -106,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default or for pages with zero or one identified reader (#336).
 
 ### Fixed
+- `run` on Windows now resolves npm-style harness installs through `PATHEXT`
+  and starts the resolved wrapper. This avoids accepting an extensionless Unix
+  shell shim such as `opencode` during availability checks and then failing to
+  launch it when the adjacent `opencode.cmd` is the Windows entry point. Unix
+  resolution remains unchanged (#343).
 - `memory_auto_improve` without a `session_id` now selects the newest
   completed session that has no persisted auto-improvement run. Preflight-
   skipped sessions therefore advance the implicit manual-review queue instead
