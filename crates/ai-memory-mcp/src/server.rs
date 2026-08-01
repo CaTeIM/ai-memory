@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep,
+    run_auto_improve_review, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -366,6 +366,8 @@ pub struct AiMemoryServer {
     /// M8 retention parameters. Defaults if not overridden by the
     /// caller (typically from the user's config.toml `[decay]` block).
     decay_params: DecayParams,
+    /// Optional distinct-reader reinforcement coefficient.
+    decay_breadth_weight: f64,
     /// M9 embedder for hybrid query. When `None`, `memory_query`
     /// still fuses FTS5 with entity matches and graph-neighbour expansion.
     embedder: Option<Arc<dyn Embedder>>,
@@ -1000,6 +1002,7 @@ impl AiMemoryServer {
             llm: None,
             wiki: None,
             decay_params: DecayParams::default(),
+            decay_breadth_weight: 0.0,
             embedder: None,
             reranker: None,
             rerank_gate: Arc::new(tokio::sync::Semaphore::new(RERANK_MAX_IN_FLIGHT)),
@@ -1476,6 +1479,13 @@ impl AiMemoryServer {
         self
     }
 
+    /// Set the optional distinct-reader reinforcement coefficient.
+    #[must_use]
+    pub fn with_decay_breadth_weight(mut self, breadth_weight: f64) -> Self {
+        self.decay_breadth_weight = breadth_weight;
+        self
+    }
+
     /// Attach the wiki handle. Without this, `memory_forget_sweep`
     /// and `memory_lint` cannot write their report pages.
     #[must_use]
@@ -1674,7 +1684,7 @@ impl AiMemoryServer {
         let bump_actor = Self::bump_actor_from_parts(&parts);
         self.spawn_access_bump(
             hits.iter().map(|(h, _)| h.id).collect(),
-            bump_actor.as_deref(),
+            bump_actor.as_ref(),
         );
         // Raw-observation fallback when compiled-page search misses. Works
         // for a single resolved project (default / workspace+project) AND
@@ -1755,7 +1765,7 @@ impl AiMemoryServer {
                             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                         self.spawn_access_bump(
                             hits.iter().map(|(h, _)| h.id).collect(),
-                            bump_actor.as_deref(),
+                            bump_actor.as_ref(),
                         );
                         hits.into_iter()
                             .map(|(hit, score_details)| QueryHit { hit, score_details })
@@ -1837,7 +1847,7 @@ impl AiMemoryServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(
             hits.iter().map(|h| h.id).collect(),
-            Self::bump_actor_from_parts(&parts).as_deref(),
+            Self::bump_actor_from_parts(&parts).as_ref(),
         );
         ok_json(&MemoryRecentResponse {
             hits,
@@ -2104,13 +2114,14 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
-        let report = run_sweep(
+        let report = run_sweep_with_breadth(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
             ws,
             proj,
             &self.decay_params,
+            self.decay_breadth_weight,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -2315,11 +2326,11 @@ impl AiMemoryServer {
         // decides when that matters.
         //
         // Both halves go through the shared accessors — `identity_key` for
-        // "which human is this", `owner_stamp` for "does this deployment name
-        // them" — so this tool and its `/admin/auto-improve` sibling compute
+        // "which human is this", `owner_identity` for "does this deployment
+        // name them" — so this tool and its `/admin/auto-improve` sibling compute
         // the SAME bucket for the same operator; a bucket computed two ways
         // eventually disagrees with itself.
-        let staged_by_actor_user = ai_memory_core::owner_stamp(
+        let staging_owner = ai_memory_core::owner_identity(
             request_actor.identity_key().as_ref(),
             self.deployment_distinguishes_operators()
                 .await
@@ -2372,44 +2383,46 @@ impl AiMemoryServer {
         }
         let staged = self
             .writer
-            .stage_auto_improve_run(StageAutoImproveRun {
-                workspace_id: ws,
-                project_id: proj,
-                session_id: Some(session_id),
-                provider: Some(report.provider.clone()),
-                model: Some(report.model.clone()),
-                summary: Some(report.summary.clone()),
-                warnings_json: serde_json::to_value(&report.warnings)
-                    .unwrap_or_else(|_| serde_json::json!([])),
-                rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                    .unwrap_or_else(|_| serde_json::json!([])),
-                config_json: serde_json::json!({
-                    "min_observations": cfg.min_observations,
-                    "min_session_duration_secs": cfg.min_session_duration_secs,
-                    "min_confidence": cfg.min_confidence,
-                    "max_input_tokens": cfg.max_input_tokens,
-                    "max_proposals_per_run": cfg.max_proposals_per_run,
-                    "include_raw_fallback": cfg.include_raw_fallback,
-                    "max_patchable_pages": cfg.max_patchable_pages,
-                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
-                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
-                    "max_edit_content_chars": cfg.max_edit_content_chars,
-                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
-                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
-                    "max_rejection_context": cfg.max_rejection_context,
-                    "rejection_context_days": cfg.rejection_context_days,
-                    "max_final_body_chars": cfg.max_final_body_chars,
-                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
-                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
-                    "eval": cfg.eval,
-                }),
-                proposal_actor: ai_memory_core::ActorContext {
-                    agent: Some(cfg.proposal_actor.clone()),
-                    ..ai_memory_core::ActorContext::default()
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: Some(session_id),
+                    provider: Some(report.provider.clone()),
+                    model: Some(report.model.clone()),
+                    summary: Some(report.summary.clone()),
+                    warnings_json: serde_json::to_value(&report.warnings)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                    rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                    config_json: serde_json::json!({
+                        "min_observations": cfg.min_observations,
+                        "min_session_duration_secs": cfg.min_session_duration_secs,
+                        "min_confidence": cfg.min_confidence,
+                        "max_input_tokens": cfg.max_input_tokens,
+                        "max_proposals_per_run": cfg.max_proposals_per_run,
+                        "include_raw_fallback": cfg.include_raw_fallback,
+                        "max_patchable_pages": cfg.max_patchable_pages,
+                        "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                        "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                        "max_edit_content_chars": cfg.max_edit_content_chars,
+                        "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                        "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                        "max_rejection_context": cfg.max_rejection_context,
+                        "rejection_context_days": cfg.rejection_context_days,
+                        "max_final_body_chars": cfg.max_final_body_chars,
+                        "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                        "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                        "eval": cfg.eval,
+                    }),
+                    proposal_actor: ai_memory_core::ActorContext {
+                        agent: Some(cfg.proposal_actor.clone()),
+                        ..ai_memory_core::ActorContext::default()
+                    },
+                    proposals,
                 },
-                proposals,
-                staged_by_actor_user,
-            })
+                staging_owner,
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
@@ -3468,7 +3481,7 @@ const ACCESS_BUMP_COOLDOWN: Duration = Duration::from_secs(60);
 ///
 /// The operator half is what stops one person's read from swallowing everyone
 /// else's reinforcement for the whole window.
-type AccessBumpSeen = HashMap<(PageId, Option<String>), Instant>;
+type AccessBumpSeen = HashMap<(PageId, Option<ai_memory_core::IdentityKey>), Instant>;
 
 /// Pick the page ids due for an access bump, updating the cooldown clock in
 /// place: a page is due when it has not been bumped within `cooldown`.
@@ -3479,7 +3492,7 @@ type AccessBumpSeen = HashMap<(PageId, Option<String>), Instant>;
 fn select_bumpable(
     seen: &mut AccessBumpSeen,
     ids: Vec<PageId>,
-    actor: Option<&str>,
+    actor: Option<&ai_memory_core::IdentityKey>,
     now: Instant,
     cooldown: Duration,
 ) -> Vec<PageId> {
@@ -3488,7 +3501,7 @@ fn select_bumpable(
     seen.retain(|_, last| now.duration_since(*last) < cooldown);
     let mut fresh = Vec::new();
     for id in ids {
-        let id = (id, actor.map(str::to_string));
+        let id = (id, actor.cloned());
         // After the prune, an occupied slot means "still within cooldown" —
         // skip it, and do not refresh its timestamp: refreshing would starve
         // a continuously-hot page of its once-per-window bump entirely.
@@ -3501,17 +3514,17 @@ fn select_bumpable(
 }
 
 impl AiMemoryServer {
-    /// The caller's qualified identity storage key
-    /// ([`ai_memory_core::IdentityKey::storage_key`]), for keying the bump
-    /// throttle and the `page_access` rows it feeds. One derivation for both:
+    /// The caller's typed identity for keying the bump throttle and the
+    /// `page_access` rows it feeds. One derivation for both:
     /// a throttle keyed one way and a table keyed another would throttle one
     /// operator's reads against another's rows.
-    fn bump_actor_from_parts(parts: &axum::http::request::Parts) -> Option<String> {
+    fn bump_actor_from_parts(
+        parts: &axum::http::request::Parts,
+    ) -> Option<ai_memory_core::IdentityKey> {
         parts
             .extensions
             .get::<ai_memory_core::ActorContext>()
             .and_then(ai_memory_core::ActorContext::identity_key)
-            .map(|key| key.storage_key())
     }
 
     /// Fire-and-forget access-counter bump for the M8 reinforcement term,
@@ -3522,7 +3535,7 @@ impl AiMemoryServer {
     /// breadth — the signal `[decay] breadth_weight` exists to read — would
     /// under-count exactly on the busy pages it matters for. Failures are
     /// logged at warn but never surfaced to the caller.
-    fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&str>) {
+    fn spawn_access_bump(&self, ids: Vec<PageId>, actor: Option<&ai_memory_core::IdentityKey>) {
         if ids.is_empty() {
             return;
         }
@@ -3539,9 +3552,9 @@ impl AiMemoryServer {
         let writer = self.writer.clone();
         // Carried into the write so reinforcement is recorded per operator as
         // well as in the shared counter.
-        let actor = actor.map(str::to_string);
+        let actor = actor.cloned();
         tokio::spawn(async move {
-            if let Err(e) = writer.bump_access(fresh, actor).await {
+            if let Err(e) = writer.bump_access_for_actor(fresh, actor).await {
                 tracing::warn!(error = %e, "access bump failed");
             }
         });
@@ -8867,7 +8880,7 @@ mod tests {
     /// second proposal collided or got its own bucket.
     async fn auto_improve_over_pending_target(
         trusted_proxy_identity: bool,
-        pending_bucket: Option<String>,
+        pending_owner: Option<ai_memory_core::IdentityKey>,
         caller: Option<&str>,
     ) -> serde_json::Value {
         let tmp = TempDir::new().unwrap();
@@ -8895,6 +8908,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -8918,33 +8932,35 @@ mod tests {
             .unwrap();
         store
             .writer
-            .stage_auto_improve_run(StageAutoImproveRun {
-                workspace_id: ws,
-                project_id: proj,
-                session_id: None,
-                provider: Some("test".into()),
-                model: Some("model".into()),
-                summary: Some("earlier run".into()),
-                warnings_json: serde_json::json!([]),
-                rejected_candidates_json: serde_json::json!([]),
-                config_json: serde_json::json!({}),
-                staged_by_actor_user: pending_bucket,
-                proposal_actor: ai_memory_core::ActorContext::default(),
-                proposals: vec![NewAutoImproveProposal {
-                    operation: AutoImproveProposalOperation::Create,
-                    target_path: PagePath::new("notes/collides.md").unwrap(),
-                    kind: "note".into(),
-                    title: "Colliding Lesson".into(),
-                    confidence: 0.9,
-                    rationale: "staged earlier".into(),
-                    evidence_json: serde_json::json!([]),
-                    body_markdown: "# Colliding Lesson\n\nfirst proposal".into(),
-                    artifact_sha256: None,
-                    edit_mode: None,
-                    patch_json: None,
-                    expected_base_body_sha256: None,
-                }],
-            })
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: None,
+                    provider: Some("test".into()),
+                    model: Some("model".into()),
+                    summary: Some("earlier run".into()),
+                    warnings_json: serde_json::json!([]),
+                    rejected_candidates_json: serde_json::json!([]),
+                    config_json: serde_json::json!({}),
+                    proposal_actor: ai_memory_core::ActorContext::default(),
+                    proposals: vec![NewAutoImproveProposal {
+                        operation: AutoImproveProposalOperation::Create,
+                        target_path: PagePath::new("notes/collides.md").unwrap(),
+                        kind: "note".into(),
+                        title: "Colliding Lesson".into(),
+                        confidence: 0.9,
+                        rationale: "staged earlier".into(),
+                        evidence_json: serde_json::json!([]),
+                        body_markdown: "# Colliding Lesson\n\nfirst proposal".into(),
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    }],
+                },
+                pending_owner,
+            )
             .await
             .unwrap();
 
@@ -9041,11 +9057,11 @@ mod tests {
     /// The other mode: once a trusted proxy tells operators apart, each one
     /// gets their own pending slot instead of blocking the others — the point
     /// of V42's author-scoped index. The pending bucket is built through the
-    /// identity contract, the same encoding `owner_stamp` produces for the
+    /// identity contract, the same encoding `owner_identity` produces for the
     /// caller.
     #[tokio::test]
     async fn proxied_operators_each_hold_a_pending_proposal_for_the_same_page() {
-        let alice = ai_memory_core::IdentityKey::User("alice".into()).storage_key();
+        let alice = ai_memory_core::IdentityKey::User("alice".into());
         let json = auto_improve_over_pending_target(true, Some(alice), Some("bob")).await;
 
         let proposals = json["proposals"].as_array().expect("proposals array");
@@ -9357,8 +9373,8 @@ mod tests {
         let page = PageId::new();
         let mut seen = HashMap::new();
 
-        let alice = ai_memory_core::IdentityKey::User("alice".into()).storage_key();
-        let bob = ai_memory_core::IdentityKey::User("bob".into()).storage_key();
+        let alice = ai_memory_core::IdentityKey::User("alice".into());
+        let bob = ai_memory_core::IdentityKey::User("bob".into());
 
         // Alice reads first; inside the window Bob's read must still count.
         assert_eq!(

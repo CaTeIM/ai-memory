@@ -46,8 +46,8 @@ use ai_memory_consolidate::{
     BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
     EmbedBackfillCounts, EmbedBackfillOptions, SourceCounts, prune_sources_to_budget,
     render_auto_improve_telemetry_report_markdown, render_curator_report_markdown,
-    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report,
-    run_embedding_backfill, run_lint, run_sweep,
+    run_auto_improve_review, run_auto_improve_telemetry_report, run_curator_report_with_breadth,
+    run_embedding_backfill, run_lint, run_sweep_with_breadth,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
@@ -76,6 +76,9 @@ use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
+
+#[derive(Clone, Copy)]
+struct DecayBreadthWeight(f64);
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -521,6 +524,11 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 /// - `POST /admin/delete-page`
 /// - user-management routes under `/admin/users*`
 pub fn admin_router(state: AdminState) -> Router {
+    admin_router_with_decay_breadth(state, 0.0)
+}
+
+/// Build the admin router with the optional distinct-reader retention weight.
+pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
@@ -590,6 +598,7 @@ pub fn admin_router(state: AdminState) -> Router {
             require_root_for_multiuser_admin,
         ))
         .with_state(state)
+        .layer(axum::Extension(DecayBreadthWeight(breadth_weight)))
 }
 
 async fn require_root_for_multiuser_admin(
@@ -1497,11 +1506,11 @@ async fn handle_auto_improve(
     // page — the collision V42 promises cannot happen.
     //
     // Both halves go through the shared accessors — `identity_key` for "which
-    // human is this", `owner_stamp` for "does this deployment name them" —
+    // human is this", `owner_identity` for "does this deployment name them" —
     // rather than re-deriving either here. Its `memory_auto_improve` sibling
     // stages into the same V42 bucket, and a bucket computed two ways is a
     // bucket that eventually disagrees with itself.
-    let staged_by_actor_user = ai_memory_core::owner_stamp(
+    let staging_owner = ai_memory_core::owner_identity(
         actor_ext
             .as_ref()
             .and_then(|axum::Extension(actor)| actor.identity_key())
@@ -1520,7 +1529,7 @@ async fn handle_auto_improve(
             proj,
             session_id: req.session_id,
             cfg: &cfg,
-            staged_by_actor_user,
+            staging_owner,
         },
         &report,
         proposals,
@@ -1711,9 +1720,9 @@ struct AutoImproveStagingScope<'a> {
     proj: ProjectId,
     session_id: SessionId,
     cfg: &'a AutoImproveReviewConfig,
-    /// Operator that staged the run, as the qualified identity storage key;
-    /// also scopes the one-pending-per-target rule.
-    staged_by_actor_user: Option<String>,
+    /// Typed operator that staged the run; also scopes the
+    /// one-pending-per-target rule.
+    staging_owner: Option<ai_memory_core::IdentityKey>,
 }
 
 async fn stage_auto_improve_report(
@@ -1727,50 +1736,50 @@ async fn stage_auto_improve_report(
         proj,
         session_id,
         cfg,
-        staged_by_actor_user,
+        staging_owner,
     } = scope;
     let staged = state
         .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: Some(session_id),
-            provider: Some(report.provider.clone()),
-            model: Some(report.model.clone()),
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::to_value(&report.warnings)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            config_json: serde_json::json!({
-                "min_observations": cfg.min_observations,
-                "min_session_duration_secs": cfg.min_session_duration_secs,
-                "min_confidence": cfg.min_confidence,
-                "max_input_tokens": cfg.max_input_tokens,
-                "max_proposals_per_run": cfg.max_proposals_per_run,
-                "include_raw_fallback": cfg.include_raw_fallback,
-                "max_patchable_pages": cfg.max_patchable_pages,
-                "max_patchable_body_chars": cfg.max_patchable_body_chars,
-                "max_edits_per_proposal": cfg.max_edits_per_proposal,
-                "max_edit_content_chars": cfg.max_edit_content_chars,
-                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
-                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
-                "max_rejection_context": cfg.max_rejection_context,
-                "rejection_context_days": cfg.rejection_context_days,
-                "max_final_body_chars": cfg.max_final_body_chars,
-                "max_rule_page_tokens": cfg.max_rule_page_tokens,
-                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
-                "eval": cfg.eval,
-            }),
-            // Whose suggestion this is; also scopes the one-pending-per-target
-            // rule (V42) so operators stop blocking each other.
-            staged_by_actor_user,
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some(cfg.proposal_actor.clone()),
-                ..ai_memory_core::ActorContext::default()
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(session_id),
+                provider: Some(report.provider.clone()),
+                model: Some(report.model.clone()),
+                summary: Some(report.summary.clone()),
+                warnings_json: serde_json::to_value(&report.warnings)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                config_json: serde_json::json!({
+                    "min_observations": cfg.min_observations,
+                    "min_session_duration_secs": cfg.min_session_duration_secs,
+                    "min_confidence": cfg.min_confidence,
+                    "max_input_tokens": cfg.max_input_tokens,
+                    "max_proposals_per_run": cfg.max_proposals_per_run,
+                    "include_raw_fallback": cfg.include_raw_fallback,
+                    "max_patchable_pages": cfg.max_patchable_pages,
+                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                    "max_edit_content_chars": cfg.max_edit_content_chars,
+                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                    "max_rejection_context": cfg.max_rejection_context,
+                    "rejection_context_days": cfg.rejection_context_days,
+                    "max_final_body_chars": cfg.max_final_body_chars,
+                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                    "eval": cfg.eval,
+                }),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some(cfg.proposal_actor.clone()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals,
             },
-            proposals,
-        })
+            staging_owner,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let sidecar_paths = write_auto_improve_sidecars(state, ws, proj, &staged.proposal_ids).await?;
@@ -1869,7 +1878,8 @@ async fn handle_auto_improve_report(
         let operation = target_operation_for_page(&state, ws, proj, &target).await?;
         let staged = state
             .writer
-            .stage_auto_improve_run(StageAutoImproveRun {
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
                 workspace_id: ws,
                 project_id: proj,
                 session_id: None,
@@ -1883,12 +1893,6 @@ async fn handle_auto_improve_report(
                     "auto_improve_report": true,
                     "params": params,
                 }),
-                // The report describes the project, not the caller, and its
-                // target page is a single canonical path. Staging it into the
-                // unattributed bucket of the one-pending-per-target rule (V42)
-                // keeps "one pending report per project" in both modes, exactly
-                // as before the rule learned about authors.
-                staged_by_actor_user: None,
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some("auto_improve_report".into()),
                     ..ai_memory_core::ActorContext::default()
@@ -1911,7 +1915,9 @@ async fn handle_auto_improve_report(
                     patch_json: None,
                     expected_base_body_sha256: None,
                 }],
-            })
+                },
+                None,
+            )
             .await
             .map_err(|e| internal_err(e.to_string()))?;
         let sidecar_paths =
@@ -1942,6 +1948,7 @@ async fn handle_auto_improve_report(
 
 async fn handle_curator(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
     Json(req): Json<CuratorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -1965,13 +1972,14 @@ async fn handle_curator(
 
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
     let params = CuratorParams::default();
-    let mut report = run_curator_report(
+    let mut report = run_curator_report_with_breadth(
         &state.reader,
         ws,
         proj,
         &req.workspace,
         &req.project,
         params.clone(),
+        breadth.0,
     )
     .await
     .map_err(|e| internal_err(e.to_string()))?;
@@ -1995,47 +2003,46 @@ async fn handle_curator(
     let operation = target_operation_for_page(&state, ws, proj, &target).await?;
 
     let staged = state
-        .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: None,
-            provider: None,
-            model: None,
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::json!([]),
-            rejected_candidates_json: serde_json::json!([]),
-            config_json: serde_json::json!({
-                "mode": "stage",
-                "curator": true,
-                "params": params,
-            }),
-            // Same reasoning as the telemetry report above: a project-scoped
-            // report on one canonical path, so it shares the unattributed
-            // bucket of the one-pending-per-target rule (V42).
-            staged_by_actor_user: None,
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some("curator".into()),
-                ..ai_memory_core::ActorContext::default()
-            },
-            proposals: vec![NewAutoImproveProposal {
-                operation,
-                target_path: target,
-                kind: "curator_report".into(),
-                title: "Curator Report".into(),
-                confidence: 1.0,
-                rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
-                evidence_json: serde_json::json!({
-                    "summary": report.summary.clone(),
-                    "findings": report.findings.clone(),
-                }),
-                body_markdown,
-                artifact_sha256: None,
-                edit_mode: None,
-                patch_json: None,
-                expected_base_body_sha256: None,
-            }],
-        })
+            .writer
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: None,
+                    provider: None,
+                    model: None,
+                    summary: Some(report.summary.clone()),
+                    warnings_json: serde_json::json!([]),
+                    rejected_candidates_json: serde_json::json!([]),
+                    config_json: serde_json::json!({
+                        "mode": "stage",
+                        "curator": true,
+                        "params": params,
+                    }),
+                    proposal_actor: ai_memory_core::ActorContext {
+                        agent: Some("curator".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    },
+                    proposals: vec![NewAutoImproveProposal {
+                        operation,
+                        target_path: target,
+                        kind: "curator_report".into(),
+                        title: "Curator Report".into(),
+                        confidence: 1.0,
+                        rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
+                        evidence_json: serde_json::json!({
+                            "summary": report.summary.clone(),
+                            "findings": report.findings.clone(),
+                        }),
+                        body_markdown,
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    }],
+                },
+            None,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let sidecar_paths = write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
@@ -2116,7 +2123,7 @@ async fn pending_detail(
     (
         WorkspaceId,
         ProjectId,
-        ai_memory_store::AutoImproveProposalDetail,
+        ai_memory_store::OwnedAutoImproveProposalDetail,
     ),
     (StatusCode, Json<serde_json::Value>),
 > {
@@ -2129,7 +2136,7 @@ async fn pending_detail(
     let (ws, proj) = lookup_ws_proj_no_create(state, &query.workspace, &query.project).await?;
     let detail = state
         .reader
-        .auto_improve_proposal_detail(ws, proj, id)
+        .auto_improve_proposal_detail_with_owner(ws, proj, id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| {
@@ -2161,7 +2168,8 @@ async fn handle_pending_write_diff(
     Query(query): Query<PendingWriteScopeQuery>,
 ) -> impl IntoResponse {
     match pending_detail(&state, &id, &query).await {
-        Ok((ws, proj, detail)) => {
+        Ok((ws, proj, owned)) => {
+            let detail = &owned.detail;
             let before = state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
@@ -2598,17 +2606,19 @@ struct ForgetSweepRequest {
 
 async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(breadth): axum::Extension<DecayBreadthWeight>,
     Json(req): Json<ForgetSweepRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep(
+    run_sweep_with_breadth(
         &state.reader,
         &state.writer,
         Some(&state.wiki),
         ws,
         proj,
         &state.decay_params,
+        breadth.0,
         req.dry_run,
     )
     .await
@@ -5592,7 +5602,6 @@ mod tests {
                 warnings_json: serde_json::json!([]),
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({"mode":"stage"}),
-                staged_by_actor_user: None,
                 proposal_actor: ai_memory_core::ActorContext {
                     agent: Some("auto_improve".into()),
                     ..ai_memory_core::ActorContext::default()
@@ -5939,24 +5948,13 @@ mod tests {
 
     /// The V42 staging bucket is keyed on
     /// [`ai_memory_core::ActorContext::identity_key`] through
-    /// [`ai_memory_core::owner_stamp`], not on `actor.user`, so an operator an
-    /// ingress named with the OIDC subject claim alone still lands in their own
-    /// bucket (`sub:<subject>`) rather than the unattributed one their
-    /// colleagues share.
-    ///
-    /// # This shape is a floor, not a live rung
-    ///
-    /// `AuthLevel::Root` beside an actor carrying only `sub` is not something
-    /// `require_bearer` produces: the proxy overlay downgrades a caller it names
-    /// with a subject alone to `AuthLevel::User` (it can never match
-    /// `root_username`), and `require_root_for_multiuser_admin` then turns that
-    /// caller away before this handler runs. It is pinned anyway because the
-    /// `memory_auto_improve` MCP tool computes the SAME bucket for the same
-    /// operator, and the two must not derive it differently — a bucket computed
-    /// two ways is one that eventually disagrees with itself, and the V42
+    /// [`ai_memory_core::owner_identity`], not on `actor.user`, so an operator
+    /// identified by a complete OIDC issuer/subject pair lands in an
+    /// issuer-qualified bucket rather than the unattributed one. The
+    /// `memory_auto_improve` MCP tool computes the same bucket, and the V42
     /// one-pending-per-target promise is what breaks when it does.
     #[tokio::test]
-    async fn auto_improve_buckets_a_sub_only_operator_by_identity_key() {
+    async fn auto_improve_buckets_an_oidc_operator_by_qualified_identity() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -5998,6 +5996,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -6046,7 +6045,8 @@ mod tests {
             ))
             .unwrap();
         req.extensions_mut().insert(ai_memory_core::ActorContext {
-            sub: Some("oidc|subject-only-42".into()),
+            issuer: Some("https://issuer.example".into()),
+            sub: Some("subject-42".into()),
             ..ai_memory_core::ActorContext::anonymous()
         });
         req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
@@ -6056,8 +6056,11 @@ mod tests {
 
         // The bucket the contract stamps, built through the API rather than
         // hand-written, so this test follows the encoding if it ever moves.
-        let expected_bucket =
-            ai_memory_core::IdentityKey::Subject("oidc|subject-only-42".into()).storage_key();
+        let expected_bucket = ai_memory_core::IdentityKey::Subject {
+            issuer: "https://issuer.example".into(),
+            subject: "subject-42".into(),
+        }
+        .storage_key();
         let staged = store
             .reader
             .list_auto_improve_proposals(ws, proj, None, 10)
@@ -6067,7 +6070,7 @@ mod tests {
         for proposal in &staged {
             let detail = store
                 .reader
-                .auto_improve_proposal_detail(ws, proj, proposal.id)
+                .auto_improve_proposal_detail_with_owner(ws, proj, proposal.id)
                 .await
                 .unwrap()
                 .expect("staged proposal readable in its own scope");
@@ -6075,7 +6078,14 @@ mod tests {
                 detail.staged_by_actor_user.as_deref(),
                 Some(expected_bucket.as_str()),
                 "the subject claim is the operator, not `None`: {}",
-                detail.summary.target_path.as_str()
+                detail.detail.summary.target_path.as_str()
+            );
+            let json = serde_json::to_value(&detail).unwrap();
+            assert_eq!(json["staged_by_actor_user"], expected_bucket);
+            assert!(json.get("summary").is_some(), "detail fields stay flat");
+            assert!(
+                json.get("detail").is_none(),
+                "no nested compatibility wrapper"
             );
         }
     }
@@ -6125,6 +6135,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -6241,6 +6252,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

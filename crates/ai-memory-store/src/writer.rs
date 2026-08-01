@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffAcceptance, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage,
-    NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId, Sanitized,
-    SessionId, UserId, WorkspaceId,
+    AgentKind, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId, NewHandoff, NewObservation,
+    NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
+    Sanitized, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    StagedAutoImproveRunReport,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
@@ -184,7 +185,7 @@ pub(crate) enum WriteCmd {
     },
     BumpAccess {
         page_ids: Vec<PageId>,
-        actor: Option<String>,
+        actor: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordPageFeedback {
@@ -313,6 +314,11 @@ pub(crate) enum WriteCmd {
     StageAutoImproveRun {
         input: StageAutoImproveRun,
         reply: oneshot::Sender<StoreResult<StagedAutoImproveRun>>,
+    },
+    StageAutoImproveRunForOwner {
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+        reply: oneshot::Sender<StoreResult<StagedAutoImproveRunReport>>,
     },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
@@ -863,15 +869,21 @@ impl WriterHandle {
 
     /// Bump access counters for a set of pages (M8 reinforcement term).
     ///
-    /// `actor` is the reading operator's qualified identity storage key
-    /// (`IdentityKey::storage_key()`); `None` records only the shared scalar.
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn bump_access(&self, page_ids: Vec<PageId>) -> StoreResult<()> {
+        self.bump_access_for_actor(page_ids, None).await
+    }
+
+    /// Bump shared access counters and record each identified operator once per
+    /// page for the optional access-breadth retention term.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn bump_access(
+    pub async fn bump_access_for_actor(
         &self,
         page_ids: Vec<PageId>,
-        actor: Option<String>,
+        actor: Option<IdentityKey>,
     ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
@@ -1310,6 +1322,23 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::StageAutoImproveRun { input, reply: tx })
             .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Stage an auto-improvement run in an optional typed operator bucket,
+    /// reporting target collisions without discarding sibling proposals.
+    pub async fn stage_auto_improve_run_for_owner(
+        &self,
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+    ) -> StoreResult<StagedAutoImproveRunReport> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StageAutoImproveRunForOwner {
+            input,
+            owner,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -1762,7 +1791,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 actor,
                 reply,
             } => {
-                let result = ops::bump_access_for_pages(&mut conn, &page_ids, actor.as_deref());
+                let result =
+                    ops::bump_access_for_pages_for_actor(&mut conn, &page_ids, actor.as_ref());
                 send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
@@ -1930,6 +1960,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::StageAutoImproveRun { input, reply } => {
                 let result = crate::auto_improve::stage_run(&mut conn, &input);
                 send_or_warn(reply, result, "stage_auto_improve_run");
+            }
+            WriteCmd::StageAutoImproveRunForOwner {
+                input,
+                owner,
+                reply,
+            } => {
+                let result =
+                    crate::auto_improve::stage_run_for_owner(&mut conn, &input, owner.as_ref());
+                send_or_warn(reply, result, "stage_auto_improve_run_for_owner");
             }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);

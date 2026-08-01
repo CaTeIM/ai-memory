@@ -10,7 +10,10 @@
 //! prediction of what the sweep will evict, so a page the sweep keeps must not
 //! be reported cold.
 
-use ai_memory_consolidate::{CuratorParams, CuratorReport, run_curator_report, run_sweep};
+use ai_memory_consolidate::{
+    CuratorParams, CuratorReport, run_curator_report_with_breadth, run_sweep,
+    run_sweep_with_breadth,
+};
 use ai_memory_core::{IdentityKey, NewPage, PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_store::{DecayParams, Store, WriterHandle, retention_score};
 use rusqlite::params;
@@ -45,19 +48,13 @@ async fn seed(store: &Store) -> (WorkspaceId, ProjectId) {
     for actor in ["alice", "bob", "carol", "dave", "erin"] {
         store
             .writer
-            .bump_access(
-                vec![team],
-                Some(IdentityKey::User(actor.into()).storage_key()),
-            )
+            .bump_access_for_actor(vec![team], Some(IdentityKey::User(actor.into())))
             .await
             .expect("bump team");
     }
     store
         .writer
-        .bump_access(
-            vec![solo],
-            Some(IdentityKey::User("alice".into()).storage_key()),
-        )
+        .bump_access_for_actor(vec![solo], Some(IdentityKey::User("alice".into())))
         .await
         .expect("bump solo");
 
@@ -112,7 +109,6 @@ async fn default_weight_scores_identically_however_many_operators_read_the_page(
     let (ws, proj) = seed(&store).await;
 
     let params = DecayParams::default();
-    assert_eq!(params.breadth_weight, 0.0, "the shipped default");
     let report = run_sweep(&store.reader, &store.writer, None, ws, proj, &params, true)
         .await
         .expect("sweep");
@@ -147,13 +143,19 @@ async fn a_page_many_operators_read_outlives_one_read_as_often_by_a_single_opera
     let store = Store::open(tmp.path()).expect("store");
     let (ws, proj) = seed(&store).await;
 
-    let params = DecayParams {
-        breadth_weight: 1.5,
-        ..DecayParams::default()
-    };
-    let report = run_sweep(&store.reader, &store.writer, None, ws, proj, &params, true)
-        .await
-        .expect("sweep");
+    let params = DecayParams::default();
+    let report = run_sweep_with_breadth(
+        &store.reader,
+        &store.writer,
+        None,
+        ws,
+        proj,
+        &params,
+        1.5,
+        true,
+    )
+    .await
+    .expect("sweep");
 
     assert_eq!(
         report
@@ -164,6 +166,46 @@ async fn a_page_many_operators_read_outlives_one_read_as_often_by_a_single_opera
         vec!["sessions/solo.md"],
         "the team-read page should have been carried over the threshold",
     );
+}
+
+#[tokio::test]
+async fn destructive_readers_reject_invalid_breadth_coefficients() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("store");
+    let (ws, proj) = seed(&store).await;
+    let params = DecayParams::default();
+
+    for weight in [-1.0, f64::NAN, f64::INFINITY] {
+        let sweep_error = run_sweep_with_breadth(
+            &store.reader,
+            &store.writer,
+            None,
+            ws,
+            proj,
+            &params,
+            weight,
+            false,
+        )
+        .await
+        .expect_err("an invalid coefficient must stop the sweep before mutation");
+        assert!(sweep_error.to_string().contains("breadth_weight"));
+
+        let curator_error = run_curator_report_with_breadth(
+            &store.reader,
+            ws,
+            proj,
+            "default",
+            "breadth",
+            CuratorParams {
+                decay_params: params,
+                ..CuratorParams::default()
+            },
+            weight,
+        )
+        .await
+        .expect_err("the curator must reject the same invalid coefficient");
+        assert!(curator_error.to_string().contains("breadth_weight"));
+    }
 }
 
 /// `(path, score, age_days)` for every `cold_episodic` finding, sorted by path.
@@ -196,8 +238,9 @@ async fn curate(
     ws: WorkspaceId,
     proj: ProjectId,
     decay: DecayParams,
+    breadth_weight: f64,
 ) -> CuratorReport {
-    run_curator_report(
+    run_curator_report_with_breadth(
         &store.reader,
         ws,
         proj,
@@ -207,6 +250,7 @@ async fn curate(
             decay_params: decay,
             ..CuratorParams::default()
         },
+        breadth_weight,
     )
     .await
     .expect("curator")
@@ -225,8 +269,7 @@ async fn curator_scores_match_the_pre_breadth_formula_at_the_default_weight() {
     let (ws, proj) = seed(&store).await;
 
     let params = DecayParams::default();
-    assert_eq!(params.breadth_weight, 0.0, "the shipped default");
-    let report = curate(&store, ws, proj, params).await;
+    let report = curate(&store, ws, proj, params, 0.0).await;
 
     let cold = cold_findings(&report);
     assert_eq!(
@@ -257,14 +300,20 @@ async fn the_curator_reports_cold_exactly_when_the_sweep_would_evict() {
     let store = Store::open(tmp.path()).expect("store");
     let (ws, proj) = seed(&store).await;
 
-    let params = DecayParams {
-        breadth_weight: 1.5,
-        ..DecayParams::default()
-    };
-    let sweep = run_sweep(&store.reader, &store.writer, None, ws, proj, &params, true)
-        .await
-        .expect("sweep");
-    let cold = cold_findings(&curate(&store, ws, proj, params).await);
+    let params = DecayParams::default();
+    let sweep = run_sweep_with_breadth(
+        &store.reader,
+        &store.writer,
+        None,
+        ws,
+        proj,
+        &params,
+        1.5,
+        true,
+    )
+    .await
+    .expect("sweep");
+    let cold = cold_findings(&curate(&store, ws, proj, params, 1.5).await);
 
     let mut evicted: Vec<&str> = sweep.evicted.iter().map(|e| e.path.as_str()).collect();
     evicted.sort_unstable();

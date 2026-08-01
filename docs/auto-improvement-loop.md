@@ -398,6 +398,13 @@ proposal state, approval status, evidence metadata, and audit rows, but the
 review artifact itself should be inspectable and versioned like the rest of the
 wiki.
 
+On deployments that distinguish operators, manually staged proposals record
+the qualified operator identity and enforce one pending proposal per target
+*per operator*. Unattributed scheduler, curator, and telemetry proposals stay
+in the shared bucket. A collision skips only that proposal, preserves its
+siblings, and appears in the command or API response with the target and
+reason; it must not become a silent partial run.
+
 Because this is now an MCP tool surface, the standard prompt snippets, managed
 Agent Skills, and regression tests assert `memory_auto_improve` appears in the
 combined prompt-routing surface. Existing installed `CLAUDE.md`/`AGENTS.md`

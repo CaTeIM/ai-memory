@@ -25,8 +25,8 @@
 use std::str::FromStr;
 
 use ai_memory_core::{
-    ActorContext, AutoImproveProposalId, AutoImproveRunId, NewPage, PageId, PagePath, ProjectId,
-    SessionId, UserId, WorkspaceId,
+    ActorContext, AutoImproveProposalId, AutoImproveRunId, IdentityKey, NewPage, PageId, PagePath,
+    ProjectId, SessionId, UserId, WorkspaceId,
 };
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -142,16 +142,6 @@ pub struct StageAutoImproveRun {
     pub config_json: serde_json::Value,
     /// Actor attribution recorded on the run and its `staged` events.
     pub proposal_actor: ActorContext,
-    /// Operator that staged this run, as the qualified
-    /// [`ai_memory_core::IdentityKey::storage_key`] the caller computed through
-    /// [`ai_memory_core::owner_stamp`] (`sub:<subject>` / `user:<name>`).
-    ///
-    /// A storage key rather than a `users(id)`: the majority of identified
-    /// callers on a shared server are asserted by an authenticating proxy and
-    /// have no row. `None` for a single-operator server and for any
-    /// unattributed caller, which keeps the one-pending-per-target rule
-    /// behaving exactly as before (see V42).
-    pub staged_by_actor_user: Option<String>,
     /// Page edits to stage as pending proposals.
     pub proposals: Vec<NewAutoImproveProposal>,
 }
@@ -193,6 +183,16 @@ pub struct StagedAutoImproveRun {
     pub run_id: AutoImproveRunId,
     /// Ids of the staged proposals, in input order.
     pub proposal_ids: Vec<AutoImproveProposalId>,
+}
+
+/// Result of operator-scoped staging, including proposals skipped because the
+/// same operator already has a pending proposal for the target.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagedAutoImproveRunReport {
+    /// Id of the recorded run row.
+    pub run_id: AutoImproveRunId,
+    /// Ids of proposals that were staged, in input order.
+    pub proposal_ids: Vec<AutoImproveProposalId>,
     /// Proposals that could not be staged because something is already pending
     /// for the same target, reported instead of silently dropped.
     ///
@@ -200,6 +200,15 @@ pub struct StagedAutoImproveRun {
     /// row, the non-colliding proposals beside it, and the (paid) LLM call that
     /// produced them.
     pub skipped: Vec<SkippedProposal>,
+}
+
+impl StagedAutoImproveRunReport {
+    fn into_staged(self) -> StagedAutoImproveRun {
+        StagedAutoImproveRun {
+            run_id: self.run_id,
+            proposal_ids: self.proposal_ids,
+        }
+    }
 }
 
 /// One proposal that was not staged, and why.
@@ -287,16 +296,21 @@ pub struct AutoImproveProposalDetail {
     pub expected_base_body_sha256: Option<[u8; 32]>,
     /// Base body hash the staged `body_markdown` was materialized from.
     pub materialized_base_body_sha256: Option<[u8; 32]>,
-    /// Operator whose session produced this proposal, as the qualified
-    /// identity storage key (`sub:<subject>` / `user:<name>`); `None` for an
-    /// unattributed run (single-operator server, or the unattended scheduler on
-    /// a session nobody was named on).
-    ///
-    /// Reviewer-facing — V42 added the column so a reviewer could tell whose
-    /// suggestion they were looking at.
-    pub staged_by_actor_user: Option<String>,
     /// Status history, oldest first.
     pub events: Vec<AutoImproveProposalEvent>,
+}
+
+/// Proposal detail plus the operator identity that staged it.
+///
+/// Kept as an additive wrapper so [`AutoImproveProposalDetail`] remains source
+/// compatible for downstream Rust callers that construct or destructure it.
+#[derive(Debug, Clone, Serialize)]
+pub struct OwnedAutoImproveProposalDetail {
+    /// Existing detail fields, flattened on HTTP serialization.
+    #[serde(flatten)]
+    pub detail: AutoImproveProposalDetail,
+    /// Qualified identity storage key, or `None` for shared/unattributed work.
+    pub staged_by_actor_user: Option<String>,
 }
 
 /// One append-only status-history entry for a proposal.
@@ -566,8 +580,40 @@ pub fn stage_run(
     conn: &mut Connection,
     input: &StageAutoImproveRun,
 ) -> StoreResult<StagedAutoImproveRun> {
+    stage_run_impl(conn, input, None, false).map(StagedAutoImproveRunReport::into_staged)
+}
+
+/// Stage a run in an optional operator bucket and report target collisions
+/// without discarding non-colliding sibling proposals.
+///
+/// The owner is typed so callers cannot manufacture malformed or ambiguous
+/// persisted identity keys. `None` retains the shared legacy bucket.
+///
+/// # Errors
+/// Returns [`StoreError::InvalidState`] when a precondition fails, or an
+/// SQLite error when a statement fails; either way nothing is committed.
+pub fn stage_run_for_owner(
+    conn: &mut Connection,
+    input: &StageAutoImproveRun,
+    owner: Option<&IdentityKey>,
+) -> StoreResult<StagedAutoImproveRunReport> {
+    stage_run_impl(conn, input, owner, true)
+}
+
+fn stage_run_impl(
+    conn: &mut Connection,
+    input: &StageAutoImproveRun,
+    owner: Option<&IdentityKey>,
+    skip_pending_collisions: bool,
+) -> StoreResult<StagedAutoImproveRunReport> {
     let now = Timestamp::now().as_microsecond();
     let run_id = AutoImproveRunId::new();
+    if owner.is_some_and(|identity| !identity.is_valid()) {
+        return Err(StoreError::InvalidState(
+            "auto-improve proposal owner is not a normalized identity".into(),
+        ));
+    }
+    let staged_by_actor_user = owner.map(IdentityKey::storage_key);
     let actor_json = serde_json::to_string(&input.proposal_actor)?;
     let warnings_json = serde_json::to_string(&input.warnings_json)?;
     let rejected_json = serde_json::to_string(&input.rejected_candidates_json)?;
@@ -734,16 +780,27 @@ pub fn stage_run(
                 patch_json,
                 proposal.expected_base_body_sha256.map(|h| h.to_vec()),
                 proposal.expected_base_body_sha256.map(|h| h.to_vec()),
-                input.staged_by_actor_user.as_deref(),
+                staged_by_actor_user.as_deref(),
             ],
         );
         // A pending proposal already exists for this target. Skip just this
         // one: aborting here would discard the run row and every sibling
         // proposal, which is a strictly worse outcome than not staging one
-        // duplicate. Same tolerated-constraint shape as `get_or_create_project`.
+        // duplicate. Confirm the exact pending target below before treating a
+        // UNIQUE failure as a skippable collision.
         match insert {
             Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _)) if is_pending_target_collision(&err) => {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if skip_pending_collisions
+                    && err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    && pending_target_exists(
+                        &tx,
+                        input.workspace_id,
+                        input.project_id,
+                        proposal.target_path.as_str(),
+                        staged_by_actor_user.as_deref(),
+                    )? =>
+            {
                 skipped.push(SkippedProposal {
                     target_path: proposal.target_path.to_string(),
                     reason: "a proposal is already pending review for this path".into(),
@@ -764,7 +821,7 @@ pub fn stage_run(
         proposal_ids.push(id);
     }
     tx.commit()?;
-    Ok(StagedAutoImproveRun {
+    Ok(StagedAutoImproveRunReport {
         run_id,
         proposal_ids,
         skipped,
@@ -1290,17 +1347,29 @@ fn hex_sha256(bytes: &[u8]) -> String {
     out
 }
 
-/// Is this insert failure the one-pending-proposal-per-target collision that
-/// [`stage_run`] is allowed to swallow?
-///
-/// Only the UNIQUE extended code qualifies. `ErrorCode::ConstraintViolation` is
-/// the PRIMARY code shared by NOT NULL, CHECK, FK and `RAISE(ABORT)` failures,
-/// and `auto_improve_proposals` has CHECKs on `status`/`operation`, FKs to four
-/// tables, and a workspace/project pairing trigger — accepting the primary code
-/// would relabel any of those "a proposal is already pending review for this
-/// path" and drop the proposal instead of surfacing a schema-contract bug.
-fn is_pending_target_collision(err: &rusqlite::ffi::Error) -> bool {
-    err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+fn pending_target_exists(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    target_path: &str,
+    owner: Option<&str>,
+) -> StoreResult<bool> {
+    tx.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM auto_improve_proposals \
+             WHERE workspace_id = ?1 AND project_id = ?2 \
+               AND target_path = ?3 AND status = 'pending' \
+               AND staged_by_actor_user IS ?4 \
+         )",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            target_path,
+            owner,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {

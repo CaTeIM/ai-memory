@@ -1103,15 +1103,20 @@ pub fn store_embeddings(conn: &mut Connection, embeddings: &[EmbeddingWrite]) ->
 /// appear in `page_ids`. Idempotent for unknown ids (no-op).
 /// Used by the read path to feed the M8 reinforcement term.
 ///
-/// `actor` is the reading operator's qualified identity storage key
-/// (`IdentityKey::storage_key()`), or `None` for an unattributed read.
-pub fn bump_access_for_pages(
+/// Bump shared access counters and record an optional typed operator as a
+/// distinct reader. Both mutations commit in the same transaction.
+pub fn bump_access_for_pages_for_actor(
     conn: &mut Connection,
     page_ids: &[PageId],
-    actor: Option<&str>,
+    actor: Option<&IdentityKey>,
 ) -> StoreResult<()> {
     if page_ids.is_empty() {
         return Ok(());
+    }
+    if actor.is_some_and(|identity| !identity.is_valid()) {
+        return Err(StoreError::InvalidState(
+            "page access actor is not a normalized identity".into(),
+        ));
     }
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
@@ -1127,7 +1132,8 @@ pub fn bump_access_for_pages(
         // Per-operator reinforcement, recorded in the SAME transaction so the
         // scalar and the breakdown cannot drift. Purely additive: the scalar
         // above is what the retention formula still reads by default.
-        if let Some(actor) = actor.filter(|a| !a.trim().is_empty()) {
+        if let Some(actor) = actor {
+            let actor = actor.storage_key();
             // The `WHERE EXISTS` guard is what keeps the documented idempotence
             // for unknown ids: `page_access.page_id` REFERENCES `pages(id)` and
             // the writer connection runs with `foreign_keys` ON, so a bare
@@ -1138,14 +1144,13 @@ pub fn bump_access_for_pages(
             // constraint conflicts, not FK violations. The predicate mirrors the
             // UPDATE above so the scalar and the breakdown cannot drift.
             let mut per_actor = tx.prepare(
-                "INSERT INTO page_access (page_id, actor, count, last_accessed_at) \
-                 SELECT ?1, ?2, 1, ?3 \
+                "INSERT INTO page_access (page_id, actor) \
+                 SELECT ?1, ?2 \
                  WHERE EXISTS (SELECT 1 FROM pages WHERE id = ?1 AND is_latest = 1) \
-                 ON CONFLICT(page_id, actor) DO UPDATE \
-                 SET count = count + 1, last_accessed_at = excluded.last_accessed_at",
+                 ON CONFLICT(page_id, actor) DO NOTHING",
             )?;
             for id in page_ids {
-                per_actor.execute(params![id.as_bytes(), actor, now])?;
+                per_actor.execute(params![id.as_bytes(), actor])?;
             }
         }
     }

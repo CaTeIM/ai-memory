@@ -222,8 +222,9 @@ exactly as it did before the column existed — so a single-operator server
 keeps its historical behaviour:
 
 - **Auto-improvement proposals.** Each records the operator who staged it (the
-  qualified identity key — `sub:<subject>` / `user:<name>` — so proxy-asserted
-  humans count too, and it shows up on the proposal detail), and the "one
+  qualified identity key — username or complete OIDC issuer/subject pair — so
+  proxy-asserted humans count too, and it shows up on the proposal detail),
+  and the "one
   pending proposal per page" rule applies per operator, so operators stop
   blocking each other. Only where the deployment distinguishes operators,
   though: elsewhere proposals stay unattributed and the original one-per-page
@@ -238,8 +239,9 @@ keeps its historical behaviour:
   and `/admin` responses, the CLI output, and the scheduler's log), so a run
   of N-1 proposals is never silently indistinguishable from a clean run of
   N-1.
-- **Page reinforcement.** Reads are counted per operator as well as in the
-  shared counter. `[decay] breadth_weight` (default `0.0`) optionally lets a
+- **Page reinforcement.** The first reinforced read by each identified
+  operator is recorded per page alongside the existing shared access counter.
+  `[decay] breadth_weight` (default `0.0`) optionally lets a
   page reinforced by many different people outrank one read repeatedly by a
   single person — the forget sweep reads the per-page count of distinct
   operators and feeds it into the retention score. At the default, and for

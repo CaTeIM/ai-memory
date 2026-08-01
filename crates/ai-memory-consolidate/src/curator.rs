@@ -83,6 +83,38 @@ pub async fn run_curator_report(
     project_name: &str,
     params: CuratorParams,
 ) -> ai_memory_store::StoreResult<CuratorReport> {
+    run_curator_report_with_breadth(
+        reader,
+        workspace_id,
+        project_id,
+        workspace_name,
+        project_name,
+        params,
+        0.0,
+    )
+    .await
+}
+
+/// Build a curator report using the same optional access-breadth term as the
+/// forget sweep.
+///
+/// # Errors
+/// Propagates store failures and rejects negative or non-finite breadth
+/// coefficients.
+pub async fn run_curator_report_with_breadth(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workspace_name: &str,
+    project_name: &str,
+    params: CuratorParams,
+    breadth_weight: f64,
+) -> ai_memory_store::StoreResult<CuratorReport> {
+    if !breadth_weight.is_finite() || breadth_weight < 0.0 {
+        return Err(ai_memory_store::StoreError::InvalidState(
+            "decay breadth_weight must be a finite number greater than or equal to zero".into(),
+        ));
+    }
     let now = Timestamp::now();
     let now_us = now.as_microsecond();
     let mut findings = Vec::new();
@@ -93,7 +125,7 @@ pub async fn run_curator_report(
     // breadth reported pages as cold that the sweep, with `breadth_weight > 0`,
     // will never touch.
     let breadth =
-        access_breadth_for_scoring(reader, workspace_id, project_id, &params.decay_params).await?;
+        access_breadth_for_scoring(reader, workspace_id, project_id, breadth_weight).await?;
     let mut cold = Vec::new();
     for c in &candidates {
         if c.tier != Tier::Episodic || c.pinned || frontmatter_pinned(&c.frontmatter_json) {
@@ -108,6 +140,7 @@ pub async fn run_curator_report(
             days_since_access,
             c.salience,
             breadth.get(&c.id).copied().unwrap_or(0),
+            breadth_weight,
         );
         if score < params.decay_params.cold_threshold {
             cold.push(CuratorFinding {

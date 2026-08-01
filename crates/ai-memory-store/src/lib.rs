@@ -33,8 +33,8 @@ pub use auto_improve::{
     AutoImproveProposalEvent, AutoImproveProposalOperation, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
     AutoImproveTelemetryCount, FailAutoImproveProposal, NewAutoImproveProposal,
-    RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun, StagedAutoImproveRun,
-    artifact_path_for,
+    OwnedAutoImproveProposalDetail, RejectAutoImproveProposal, SkippedProposal,
+    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use decay::{
     DecayParams, SALIENCE_MAX, SALIENCE_MIN, SALIENCE_STEP, retention_score,
@@ -199,7 +199,6 @@ mod tests {
             warnings_json: serde_json::json!([]),
             rejected_candidates_json: serde_json::json!([]),
             config_json: serde_json::json!({"mode":"stage"}),
-            staged_by_actor_user: None,
             proposal_actor: ActorContext {
                 agent: Some("auto_improve".into()),
                 ..ActorContext::default()
@@ -3228,7 +3227,6 @@ mod tests {
                 warnings_json: serde_json::json!([]),
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({ "trigger": "scheduler" }),
-                staged_by_actor_user: None,
                 proposal_actor: ActorContext {
                     agent: Some("auto_improve".into()),
                     ..ActorContext::default()

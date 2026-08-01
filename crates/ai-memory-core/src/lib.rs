@@ -40,7 +40,8 @@ pub use active_project::{
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
-    SKIP_ADMISSION_CHAIN_HEADER, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
+    SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp, parse_skip_admission_chain,
+    skip_admission_chain_for,
 };
 pub use error::{MemoryError, MemoryResult};
 pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};

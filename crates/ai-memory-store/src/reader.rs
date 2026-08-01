@@ -28,7 +28,8 @@ use uuid::Uuid;
 use crate::auto_improve::{
     AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalStatus,
     AutoImproveProposalSummary, AutoImproveRejectionSummary, AutoImproveTelemetryAggregate,
-    AutoImproveTelemetryCount, bytes32, opt_bytes32, summary_from_row, to_sql_err,
+    AutoImproveTelemetryCount, OwnedAutoImproveProposalDetail, bytes32, opt_bytes32,
+    summary_from_row, to_sql_err,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::fts_query::prepare_fts5_query;
@@ -2259,7 +2260,7 @@ impl ReaderPool {
     ) -> StoreResult<std::collections::HashMap<PageId, u32>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT pa.page_id, COUNT(DISTINCT pa.actor) \
+                "SELECT pa.page_id, COUNT(*) \
                  FROM page_access pa \
                  JOIN pages p ON p.id = pa.page_id \
                  WHERE p.workspace_id = ?1 AND p.project_id = ?2 AND p.is_latest = 1 \
@@ -4859,6 +4860,19 @@ impl ReaderPool {
         project_id: ProjectId,
         proposal_id: AutoImproveProposalId,
     ) -> StoreResult<Option<AutoImproveProposalDetail>> {
+        self.auto_improve_proposal_detail_with_owner(workspace_id, project_id, proposal_id)
+            .await
+            .map(|detail| detail.map(|owned| owned.detail))
+    }
+
+    /// Read one proposal plus the operator that staged it, failing closed when
+    /// the scope does not match.
+    pub async fn auto_improve_proposal_detail_with_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        proposal_id: AutoImproveProposalId,
+    ) -> StoreResult<Option<OwnedAutoImproveProposalDetail>> {
         self.with_conn(move |conn| {
             let row = conn
                 .query_row(
@@ -4901,37 +4915,39 @@ impl ReaderPool {
                             .transpose()
                             .map_err(to_sql_err)?;
                         let patch_raw: Option<String> = row.get(27)?;
-                        Ok(AutoImproveProposalDetail {
-                            summary,
-                            rationale: row.get(12)?,
-                            evidence_json: serde_json::from_str(&evidence_raw)
-                                .map_err(to_sql_err)?,
-                            body_markdown: row.get(14)?,
-                            body_sha256: body_hash,
-                            artifact_path: row.get(16)?,
-                            artifact_sha256: artifact_hash,
-                            target_latest_page_id_at_stage: staged_page_id,
-                            target_body_sha256_at_stage: staged_body_hash,
-                            target_updated_at_at_stage: row.get(20)?,
-                            decision_reason: row.get(21)?,
-                            decided_by_author_id: decided_author,
-                            decided_by_actor_json: decided_actor_raw
-                                .map(|raw| serde_json::from_str(&raw))
-                                .transpose()
-                                .map_err(to_sql_err)?,
-                            applied_page_id,
-                            checkpoint: row.get(25)?,
-                            edit_mode: row.get(26)?,
-                            patch_json: patch_raw
-                                .map(|raw| serde_json::from_str(&raw))
-                                .transpose()
-                                .map_err(to_sql_err)?,
-                            expected_base_body_sha256: opt_bytes32(row.get(28)?)
-                                .map_err(to_sql_err)?,
+                        Ok(OwnedAutoImproveProposalDetail {
+                            detail: AutoImproveProposalDetail {
+                                summary,
+                                rationale: row.get(12)?,
+                                evidence_json: serde_json::from_str(&evidence_raw)
+                                    .map_err(to_sql_err)?,
+                                body_markdown: row.get(14)?,
+                                body_sha256: body_hash,
+                                artifact_path: row.get(16)?,
+                                artifact_sha256: artifact_hash,
+                                target_latest_page_id_at_stage: staged_page_id,
+                                target_body_sha256_at_stage: staged_body_hash,
+                                target_updated_at_at_stage: row.get(20)?,
+                                decision_reason: row.get(21)?,
+                                decided_by_author_id: decided_author,
+                                decided_by_actor_json: decided_actor_raw
+                                    .map(|raw| serde_json::from_str(&raw))
+                                    .transpose()
+                                    .map_err(to_sql_err)?,
+                                applied_page_id,
+                                checkpoint: row.get(25)?,
+                                edit_mode: row.get(26)?,
+                                patch_json: patch_raw
+                                    .map(|raw| serde_json::from_str(&raw))
+                                    .transpose()
+                                    .map_err(to_sql_err)?,
+                                expected_base_body_sha256: opt_bytes32(row.get(28)?)
+                                    .map_err(to_sql_err)?,
+                                materialized_base_body_sha256: opt_bytes32(row.get(29)?)
+                                    .map_err(to_sql_err)?,
+                                events: Vec::new(),
+                            },
                             staged_by_actor_user: row.get(30)?,
-                            materialized_base_body_sha256: opt_bytes32(row.get(29)?)
-                                .map_err(to_sql_err)?,
-                            events: Vec::new(),
                         })
                     },
                 )
@@ -4965,7 +4981,7 @@ impl ReaderPool {
                 })
             })?;
             for row in rows {
-                detail.events.push(row?);
+                detail.detail.events.push(row?);
             }
             Ok(Some(detail))
         })

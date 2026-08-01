@@ -39,7 +39,6 @@ fn run(
         session_id: None,
         proposals,
         proposal_actor: ActorContext::anonymous(),
-        staged_by_actor_user: None,
         warnings_json: serde_json::json!([]),
         rejected_candidates_json: serde_json::json!([]),
         config_json: serde_json::json!({}),
@@ -63,6 +62,32 @@ async fn scope(store: &Store) -> (WorkspaceId, ProjectId) {
     (ws, proj)
 }
 
+#[tokio::test]
+async fn malformed_direct_owner_keys_cannot_create_hidden_pending_buckets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let error = store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            run(ws, proj, vec![proposal("_rules/hidden.md", "Hidden")]),
+            Some(IdentityKey::User(" ".into())),
+        )
+        .await
+        .expect_err("a directly constructed blank owner must be rejected");
+    assert!(error.to_string().contains("normalized identity"));
+    assert!(
+        store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "validation must happen before the run transaction is committed"
+    );
+}
+
 /// A second run targeting an already-pending path keeps its own run row and its
 /// unrelated proposal; only the duplicate is skipped, and it is reported.
 #[tokio::test]
@@ -73,11 +98,10 @@ async fn a_colliding_proposal_does_not_destroy_the_run() {
 
     let first = store
         .writer
-        .stage_auto_improve_run(run(
-            ws,
-            proj,
-            vec![proposal("_slots/current-focus.md", "Focus")],
-        ))
+        .stage_auto_improve_run_for_owner(
+            run(ws, proj, vec![proposal("_slots/current-focus.md", "Focus")]),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(first.proposal_ids.len(), 1);
@@ -86,14 +110,17 @@ async fn a_colliding_proposal_does_not_destroy_the_run() {
     // Second run: one duplicate target + one perfectly good new proposal.
     let second = store
         .writer
-        .stage_auto_improve_run(run(
-            ws,
-            proj,
-            vec![
-                proposal("_slots/current-focus.md", "Focus again"),
-                proposal("_rules/unrelated.md", "Unrelated"),
-            ],
-        ))
+        .stage_auto_improve_run_for_owner(
+            run(
+                ws,
+                proj,
+                vec![
+                    proposal("_slots/current-focus.md", "Focus again"),
+                    proposal("_rules/unrelated.md", "Unrelated"),
+                ],
+            ),
+            None,
+        )
         .await
         .unwrap();
 
@@ -123,14 +150,17 @@ async fn duplicate_targets_within_one_run_still_fail_the_run() {
 
     let result = store
         .writer
-        .stage_auto_improve_run(run(
-            ws,
-            proj,
-            vec![
-                proposal("_slots/current-focus.md", "First"),
-                proposal("_slots/current-focus.md", "Second"),
-            ],
-        ))
+        .stage_auto_improve_run_for_owner(
+            run(
+                ws,
+                proj,
+                vec![
+                    proposal("_slots/current-focus.md", "First"),
+                    proposal("_slots/current-focus.md", "Second"),
+                ],
+            ),
+            None,
+        )
         .await;
     assert!(result.is_err(), "a self-contradicting batch is refused");
 
@@ -169,22 +199,25 @@ async fn pending_uniqueness_is_per_operator_without_weakening_single_user() {
     // Buckets are the contract's storage keys, built through the API so this
     // test exercises the same encoding the servers stamp.
     let staged_by = |actor: Option<&str>| {
-        let mut r = run(ws, proj, vec![proposal("_rules/style.md", "Style")]);
-        r.staged_by_actor_user = actor.map(|name| IdentityKey::User(name.into()).storage_key());
-        r
+        (
+            run(ws, proj, vec![proposal("_rules/style.md", "Style")]),
+            actor.map(|name| IdentityKey::User(name.into())),
+        )
     };
 
     // --- single-operator behaviour is untouched: unattributed rows collapse
     // into one bucket, so the second pending proposal is still refused.
+    let (input, owner) = staged_by(None);
     let first = store
         .writer
-        .stage_auto_improve_run(staged_by(None))
+        .stage_auto_improve_run_for_owner(input, owner)
         .await
         .unwrap();
     assert_eq!(first.proposal_ids.len(), 1);
+    let (input, owner) = staged_by(None);
     let second = store
         .writer
-        .stage_auto_improve_run(staged_by(None))
+        .stage_auto_improve_run_for_owner(input, owner)
         .await
         .unwrap();
     assert!(
@@ -194,9 +227,10 @@ async fn pending_uniqueness_is_per_operator_without_weakening_single_user() {
 
     // --- multi-operator: two proxy-asserted humans, neither with a `users`
     // row, must not block each other on the same page.
+    let (input, owner) = staged_by(Some("alice"));
     let alices = store
         .writer
-        .stage_auto_improve_run(staged_by(Some("alice")))
+        .stage_auto_improve_run_for_owner(input, owner)
         .await
         .unwrap();
     assert_eq!(
@@ -206,18 +240,20 @@ async fn pending_uniqueness_is_per_operator_without_weakening_single_user() {
     );
     assert!(alices.skipped.is_empty());
 
+    let (input, owner) = staged_by(Some("bob"));
     let bobs = store
         .writer
-        .stage_auto_improve_run(staged_by(Some("bob")))
+        .stage_auto_improve_run_for_owner(input, owner)
         .await
         .unwrap();
     assert_eq!(bobs.proposal_ids.len(), 1);
     assert!(bobs.skipped.is_empty());
 
     // …and Alice still cannot stack two of her own.
+    let (input, owner) = staged_by(Some("alice"));
     let alice_again = store
         .writer
-        .stage_auto_improve_run(staged_by(Some("alice")))
+        .stage_auto_improve_run_for_owner(input, owner)
         .await
         .unwrap();
     assert_eq!(alice_again.skipped.len(), 1);
@@ -255,11 +291,10 @@ async fn a_non_unique_constraint_failure_is_not_reported_as_a_pending_collision(
 
     let err = store
         .writer
-        .stage_auto_improve_run(run(
-            ws,
-            proj,
-            vec![proposal("notes/contract.md", "Contract")],
-        ))
+        .stage_auto_improve_run_for_owner(
+            run(ws, proj, vec![proposal("notes/contract.md", "Contract")]),
+            None,
+        )
         .await
         .expect_err("a schema-contract failure must surface, not be skipped");
     assert!(
@@ -279,18 +314,67 @@ async fn a_non_unique_constraint_failure_is_not_reported_as_a_pending_collision(
     // The genuine collision is still tolerated per-proposal.
     let first = store
         .writer
-        .stage_auto_improve_run(run(ws, proj, vec![proposal("notes/ok.md", "Ok")]))
+        .stage_auto_improve_run_for_owner(run(ws, proj, vec![proposal("notes/ok.md", "Ok")]), None)
         .await
         .unwrap();
     assert_eq!(first.proposal_ids.len(), 1);
     let again = store
         .writer
-        .stage_auto_improve_run(run(ws, proj, vec![proposal("notes/ok.md", "Ok again")]))
+        .stage_auto_improve_run_for_owner(
+            run(ws, proj, vec![proposal("notes/ok.md", "Ok again")]),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(again.skipped.len(), 1);
     assert_eq!(
         again.skipped[0].reason,
         "a proposal is already pending review for this path"
+    );
+}
+
+/// A UNIQUE failure is not necessarily the pending-target index. Confirm the
+/// actual target/owner row before swallowing it so future schema constraints
+/// cannot silently discard proposals.
+#[tokio::test]
+async fn an_unrelated_unique_failure_is_not_reported_as_a_pending_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            run(ws, proj, vec![proposal("notes/first.md", "Repeated title")]),
+            None,
+        )
+        .await
+        .unwrap();
+    {
+        let conn =
+            rusqlite::Connection::open(tmp.path().join("db").join(ai_memory_store::DB_FILENAME))
+                .unwrap();
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX test_unique_proposal_title \
+             ON auto_improve_proposals(title)",
+        )
+        .unwrap();
+    }
+
+    let error = store
+        .writer
+        .stage_auto_improve_run_for_owner(
+            run(
+                ws,
+                proj,
+                vec![proposal("notes/second.md", "Repeated title")],
+            ),
+            None,
+        )
+        .await
+        .expect_err("an unrelated UNIQUE constraint must surface");
+    assert!(
+        error.to_string().contains("UNIQUE constraint failed"),
+        "the real constraint must reach the caller: {error}"
     );
 }

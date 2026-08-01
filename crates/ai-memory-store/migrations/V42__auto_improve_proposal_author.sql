@@ -22,10 +22,10 @@
 --
 -- `staged_by_actor_user` is TEXT rather than a FK to `users(id)` for the same
 -- reason `handoffs.owner_user`, `sessions.actor_user` and `page_access.actor`
--- are: the identity that reaches a request is usually a username asserted by an
--- authenticating proxy, with no `users` row behind it. Keying on the row id
--- would make every proxied operator NULL and collapse them all into one bucket,
--- which is precisely the collision this index exists to break.
+-- are: the identity may be a proxy username or an issuer-qualified OIDC
+-- subject with no `users` row behind it. Keying on the row id would make every
+-- proxied operator NULL and collapse them all into one bucket, which is
+-- precisely the collision this index exists to break.
 --
 -- The COALESCE matters. A plain `UNIQUE (…, staged_by_actor_user)` would NOT
 -- work: SQLite treats NULLs as distinct in unique indexes, so every existing

@@ -84,6 +84,9 @@ pub enum SweepError {
     /// Underlying store error.
     #[error(transparent)]
     Store(#[from] ai_memory_store::StoreError),
+    /// The optional access-breadth coefficient was negative or non-finite.
+    #[error("decay breadth_weight must be a finite number greater than or equal to zero")]
+    InvalidBreadthWeight,
 }
 
 const US_PER_DAY: f64 = 86_400_000_000.0;
@@ -111,8 +114,41 @@ pub async fn run_sweep(
     params: &DecayParams,
     dry_run: bool,
 ) -> Result<SweepReport, SweepError> {
+    run_sweep_with_breadth(
+        reader,
+        writer,
+        wiki,
+        workspace_id,
+        project_id,
+        params,
+        0.0,
+        dry_run,
+    )
+    .await
+}
+
+/// Run a sweep with an opt-in access-breadth coefficient.
+///
+/// # Errors
+/// Returns [`SweepError::InvalidBreadthWeight`] for negative or non-finite
+/// coefficients, in addition to the errors documented by [`run_sweep`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sweep_with_breadth(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: Option<&Wiki>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    params: &DecayParams,
+    breadth_weight: f64,
+    dry_run: bool,
+) -> Result<SweepReport, SweepError> {
+    if !breadth_weight.is_finite() || breadth_weight < 0.0 {
+        return Err(SweepError::InvalidBreadthWeight);
+    }
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
-    let breadth = access_breadth_for_scoring(reader, workspace_id, project_id, params).await?;
+    let breadth =
+        access_breadth_for_scoring(reader, workspace_id, project_id, breadth_weight).await?;
     let now_us = Timestamp::now().as_microsecond();
 
     let mut evicted = Vec::new();
@@ -145,6 +181,7 @@ pub async fn run_sweep(
             days_since_access,
             c.salience,
             breadth.get(&c.id).copied().unwrap_or(0),
+            breadth_weight,
         );
         if score < params.cold_threshold {
             evicted.push(EvictedPage {
@@ -223,9 +260,9 @@ pub(crate) async fn access_breadth_for_scoring(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    params: &DecayParams,
+    breadth_weight: f64,
 ) -> ai_memory_store::StoreResult<HashMap<PageId, u32>> {
-    if params.breadth_weight == 0.0 {
+    if breadth_weight == 0.0 {
         return Ok(HashMap::new());
     }
     reader

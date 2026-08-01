@@ -13,8 +13,8 @@ use rusqlite::{Connection, params};
 /// The qualified TEXT the read path records operators under — built through
 /// the contract (`IdentityKey::storage_key()`), never hand-written, so these
 /// tests break if the storage encoding ever drifts from the API.
-fn actor_key(name: &str) -> String {
-    IdentityKey::User(name.into()).storage_key()
+fn actor(name: &str) -> IdentityKey {
+    IdentityKey::User(name.into())
 }
 
 /// Default parameters must reproduce the historical score exactly, whatever the
@@ -23,7 +23,7 @@ fn actor_key(name: &str) -> String {
 #[test]
 fn breadth_is_identity_at_the_default_weight() {
     let params = DecayParams::default();
-    assert_eq!(params.breadth_weight, 0.0);
+    let breadth_weight = 0.0;
 
     for actors in [0, 1, 2, 10, 500] {
         for (age, count, since) in [
@@ -32,7 +32,15 @@ fn breadth_is_identity_at_the_default_weight() {
             (365.0, 100, Some(200.0)),
         ] {
             assert_eq!(
-                retention_score_with_breadth(&params, age, count, since, None, actors),
+                retention_score_with_breadth(
+                    &params,
+                    age,
+                    count,
+                    since,
+                    None,
+                    actors,
+                    breadth_weight,
+                ),
                 retention_score(&params, age, count, since, None),
                 "default weight must be identity (actors={actors})"
             );
@@ -46,21 +54,19 @@ fn breadth_is_identity_at_the_default_weight() {
 /// is what removes the eviction cliff and the need for any backfill.
 #[test]
 fn zero_and_one_actor_score_identically_even_when_weighted() {
-    let params = DecayParams {
-        breadth_weight: 1.5,
-        ..DecayParams::default()
-    };
+    let params = DecayParams::default();
+    let breadth_weight = 1.5;
     let baseline = retention_score(&params, 30.0, 5, Some(3.0), None);
     for actors in [0, 1] {
         assert_eq!(
-            retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, actors),
+            retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, actors, breadth_weight,),
             baseline,
             "actors={actors} must not change the score"
         );
     }
     // More readers is worth strictly more, and monotonically so.
-    let two = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 2);
-    let ten = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 10);
+    let two = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 2, breadth_weight);
+    let ten = retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 10, breadth_weight);
     assert!(two > baseline);
     assert!(ten > two);
 }
@@ -69,14 +75,23 @@ fn zero_and_one_actor_score_identically_even_when_weighted() {
 /// timestamp there is no access term to weight.
 #[test]
 fn never_accessed_pages_are_unaffected_by_breadth() {
-    let params = DecayParams {
-        breadth_weight: 2.0,
-        ..DecayParams::default()
-    };
+    let params = DecayParams::default();
     assert_eq!(
-        retention_score_with_breadth(&params, 10.0, 0, None, None, 9),
+        retention_score_with_breadth(&params, 10.0, 0, None, None, 9, 2.0),
         retention_score(&params, 10.0, 0, None, None)
     );
+}
+
+#[test]
+fn invalid_breadth_weights_fail_closed_to_the_historical_score() {
+    let params = DecayParams::default();
+    let baseline = retention_score(&params, 30.0, 5, Some(3.0), None);
+    for weight in [-1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            retention_score_with_breadth(&params, 30.0, 5, Some(3.0), None, 50, weight),
+            baseline,
+        );
+    }
 }
 
 /// The breakdown is written in the same transaction as the scalar, so the two
@@ -116,21 +131,27 @@ async fn per_actor_rows_accumulate_without_replacing_the_scalar() {
 
     store
         .writer
-        .bump_access(vec![page], Some(actor_key("alice")))
+        .bump_access_for_actor(vec![page], Some(actor("alice")))
         .await
         .unwrap();
     store
         .writer
-        .bump_access(vec![page], Some(actor_key("alice")))
+        .bump_access_for_actor(vec![page], Some(actor("alice")))
         .await
         .unwrap();
     store
         .writer
-        .bump_access(vec![page], Some(actor_key("bob")))
+        .bump_access_for_actor(vec![page], Some(actor("bob")))
         .await
         .unwrap();
     // An unattributed read: still counted in the shared scalar.
-    store.writer.bump_access(vec![page], None).await.unwrap();
+    store.writer.bump_access(vec![page]).await.unwrap();
+    let error = store
+        .writer
+        .bump_access_for_actor(vec![page], Some(IdentityKey::User(" ".into())))
+        .await
+        .expect_err("a directly constructed blank identity must be rejected");
+    assert!(error.to_string().contains("normalized identity"));
 
     let conn = Connection::open(store.db_path()).unwrap();
     let scalar: i64 = conn
@@ -140,7 +161,10 @@ async fn per_actor_rows_accumulate_without_replacing_the_scalar() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(scalar, 4, "the historical counter still counts every read");
+    assert_eq!(
+        scalar, 4,
+        "the historical counter counts valid reads, not rejected identities"
+    );
 
     let distinct: i64 = conn
         .query_row(
@@ -151,14 +175,14 @@ async fn per_actor_rows_accumulate_without_replacing_the_scalar() {
         .unwrap();
     assert_eq!(distinct, 2, "two named operators, the anonymous read aside");
 
-    let alice: i64 = conn
+    let alice_exists: bool = conn
         .query_row(
-            "SELECT count FROM page_access WHERE page_id = ?1 AND actor = ?2",
-            params![page.as_bytes(), actor_key("alice")],
+            "SELECT EXISTS(SELECT 1 FROM page_access WHERE page_id = ?1 AND actor = ?2)",
+            params![page.as_bytes(), actor("alice").storage_key()],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(alice, 2);
+    assert!(alice_exists);
 }
 
 /// The bump is fired from a detached task AFTER the search responded, so a page
@@ -215,7 +239,7 @@ async fn a_stale_page_id_does_not_cost_the_rest_of_the_batch_its_bump() {
 
     store
         .writer
-        .bump_access(ids.clone(), Some(actor_key("alice")))
+        .bump_access_for_actor(ids.clone(), Some(actor("alice")))
         .await
         .unwrap();
 
@@ -230,14 +254,14 @@ async fn a_stale_page_id_does_not_cost_the_rest_of_the_batch_its_bump() {
             .unwrap();
         assert_eq!(scalar, 1, "{label} lost its bump to the stale sibling");
 
-        let per_actor: i64 = conn
+        let per_actor: bool = conn
             .query_row(
-                "SELECT count FROM page_access WHERE page_id = ?1 AND actor = ?2",
-                params![id.as_bytes(), actor_key("alice")],
+                "SELECT EXISTS(SELECT 1 FROM page_access WHERE page_id = ?1 AND actor = ?2)",
+                params![id.as_bytes(), actor("alice").storage_key()],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(per_actor, 1, "{label} lost its per-operator row");
+        assert!(per_actor, "{label} lost its per-operator row");
     }
 
     // The unknown id stays a no-op, exactly as it was before per-actor rows.

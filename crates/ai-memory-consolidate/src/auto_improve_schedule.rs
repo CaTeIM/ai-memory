@@ -282,56 +282,49 @@ async fn run_scheduled_auto_improve(
             .await?;
     let staged = ctx
         .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ctx.workspace_id,
-            project_id: ctx.project_id,
-            session_id: Some(session_id),
-            provider: Some(report.provider.clone()),
-            model: Some(report.model.clone()),
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::to_value(&report.warnings)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            config_json: serde_json::json!({
-                "trigger": "scheduler",
-                "min_observations": cfg.min_observations,
-                "min_session_duration_secs": cfg.min_session_duration_secs,
-                "min_confidence": cfg.min_confidence,
-                "max_input_tokens": cfg.max_input_tokens,
-                "max_proposals_per_run": cfg.max_proposals_per_run,
-                "include_raw_fallback": cfg.include_raw_fallback,
-                "max_patchable_pages": cfg.max_patchable_pages,
-                "max_patchable_body_chars": cfg.max_patchable_body_chars,
-                "max_edits_per_proposal": cfg.max_edits_per_proposal,
-                "max_edit_content_chars": cfg.max_edit_content_chars,
-                "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
-                "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
-                "max_rejection_context": cfg.max_rejection_context,
-                "rejection_context_days": cfg.rejection_context_days,
-                "max_final_body_chars": cfg.max_final_body_chars,
-                "max_rule_page_tokens": cfg.max_rule_page_tokens,
-                "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
-                "eval": cfg.eval,
-                "require_approval": ctx.settings.require_approval,
-            }),
-            proposal_actor: ActorContext {
-                agent: Some(cfg.proposal_actor.clone()),
-                ..ActorContext::default()
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: ctx.workspace_id,
+                project_id: ctx.project_id,
+                session_id: Some(session_id),
+                provider: Some(report.provider.clone()),
+                model: Some(report.model.clone()),
+                summary: Some(report.summary.clone()),
+                warnings_json: serde_json::to_value(&report.warnings)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                config_json: serde_json::json!({
+                    "trigger": "scheduler",
+                    "min_observations": cfg.min_observations,
+                    "min_session_duration_secs": cfg.min_session_duration_secs,
+                    "min_confidence": cfg.min_confidence,
+                    "max_input_tokens": cfg.max_input_tokens,
+                    "max_proposals_per_run": cfg.max_proposals_per_run,
+                    "include_raw_fallback": cfg.include_raw_fallback,
+                    "max_patchable_pages": cfg.max_patchable_pages,
+                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                    "max_edit_content_chars": cfg.max_edit_content_chars,
+                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                    "max_rejection_context": cfg.max_rejection_context,
+                    "rejection_context_days": cfg.rejection_context_days,
+                    "max_final_body_chars": cfg.max_final_body_chars,
+                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                    "eval": cfg.eval,
+                    "require_approval": ctx.settings.require_approval,
+                }),
+                proposal_actor: ActorContext {
+                    agent: Some(cfg.proposal_actor.clone()),
+                    ..ActorContext::default()
+                },
+                proposals,
             },
-            proposals,
-            // The scheduler stands in for nobody: an unattended run has no
-            // caller to attribute, so it stages into the unattributed bucket of
-            // the one-pending-per-target rule (V42). On a single-operator
-            // server the interactive doors land in that same bucket too
-            // (`owner_stamp` reports nobody unless the deployment distinguishes
-            // operators) — bucketing either side differently would leave two
-            // proposals pending for one page, the exact collision V42 promises
-            // cannot happen.
-            staged_by_actor_user: None,
-        })
+            None,
+        )
         .await?;
-
     for id in &staged.proposal_ids {
         ctx.wiki
             .write_auto_improve_sidecar(ctx.workspace_id, ctx.project_id, *id)
@@ -677,6 +670,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -725,7 +719,6 @@ mod tests {
                 rejected_candidates_json: serde_json::json!([]),
                 config_json: serde_json::json!({}),
                 proposal_actor: ActorContext::default(),
-                staged_by_actor_user: None,
                 proposals: vec![NewAutoImproveProposal {
                     operation: AutoImproveProposalOperation::Create,
                     target_path: PagePath::new(COLLIDING_PATH.to_string()).unwrap(),
