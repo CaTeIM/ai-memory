@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Trusted-proxy identity now has a dedicated
+  `[auth].actor_proxy_bearer_token`, distinct from the root bearer. Proxy
+  requests must assert either a username or the complete OIDC issuer/subject
+  pair; missing, partial, duplicated, or comma-folded identity headers fail
+  closed. Proxied root access requires the configured OIDC issuer/subject pair;
+  a display username never grants root. Ordinary root and DB-user requests
+  continue to ignore raw actor headers, and leaving the proxy token unset
+  preserves existing behavior (#333).
+- Qualified identity keys now keep usernames separate from OIDC
+  `(issuer, subject)` pairs and drive active-project routing consistently for
+  hook and MCP requests. The stable OIDC pair outranks display usernames, so
+  same-subject users from different issuers cannot alias each other (#333).
+- The `/admin/*` route layer and the MCP `memory_forget_sweep` tool now ask
+  "does this deployment distinguish operators" instead of "do `users` rows
+  exist", so a trusted-proxy deployment — which never writes a `users` row —
+  gets root-only admin gating instead of waving every proxied caller through
+  the single-operator escape hatch (#333).
+
 ## [1.21.0] - 2026-07-31
 
 ### Added

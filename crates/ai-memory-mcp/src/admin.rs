@@ -140,6 +140,17 @@ pub struct AdminState {
     /// stale cached pair. `None` when no hook router is attached (stdio /
     /// admin-only tests).
     pub scope_invalidator: Option<ScopeInvalidator>,
+    /// True when a trusted authenticating proxy is configured to assert
+    /// end-user identities (`[auth].actor_proxy_bearer_token`).
+    ///
+    /// Proxy-asserted operators never get a `users` row, so `users_exist()`
+    /// alone answers "does this deployment distinguish operators" with a
+    /// permanent no — and every proxied caller walks through the
+    /// single-operator escape hatch on the `/admin/*` gate. Static config, set
+    /// once at startup; `false` for every deployment that never configures a
+    /// proxy secret, which is what keeps single-operator servers on their
+    /// historical behaviour.
+    pub trusted_proxy_identity: bool,
 }
 
 /// Async hook-router project-cache invalidator installed by the serve command.
@@ -584,7 +595,17 @@ async fn require_root_for_multiuser_admin(
     // Read this for every request rather than caching a post-creation flag: a
     // committed first user immediately closes bootstrap admin access, including
     // across concurrent requests and without a server restart.
-    let multi_user_enabled = match state.reader.users_exist().await {
+    //
+    // Same notion of "this deployment distinguishes operators" the MCP admin
+    // gate uses. Keyed on `users_exist()` alone, a trusted-proxy deployment
+    // with no `users` rows would wave a proxy-asserted `AuthLevel::User` caller
+    // through every operational route below — purge, delete-page, backup — and
+    // only `/admin/users*` would survive on its own inner root check.
+    let multi_user_enabled = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
         Ok(exists) => exists,
         Err(error) => {
             tracing::error!(%error, "admin authorization could not determine whether users exist");
@@ -5158,6 +5179,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         let resp = router
@@ -5243,6 +5265,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         // Default: only the newest open session for the scope + agent.
@@ -5347,6 +5370,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         (tmp, router)
     }
@@ -5379,6 +5403,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         }
     }
 
@@ -6437,6 +6462,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6545,6 +6571,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6646,6 +6673,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6753,6 +6781,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page_with_actor(
@@ -7299,6 +7328,7 @@ mod tests {
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -7590,6 +7620,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trusted_proxy_topology_gates_admin_without_db_users() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: true,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match req
+                    .headers()
+                    .get("x-test-auth-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => ai_memory_core::AuthLevel::Root,
+                    Some("user") => ai_memory_core::AuthLevel::User,
+                    _ => ai_memory_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        for (level, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("user"), StatusCode::FORBIDDEN),
+            (Some("root"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(level) = level {
+                request = request.header("x-test-auth-level", level);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "level={level:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn admin_mode_switches_after_first_user_without_restart() {
         let (_tmp, router) = user_admin_test_router("root-token");
 
@@ -7683,6 +7775,7 @@ mod tests {
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         })
         .layer(axum::middleware::from_fn(
             |mut req: Request<Body>, next: axum::middleware::Next| async move {
@@ -7988,6 +8081,7 @@ mod tests {
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         // Inject a Root level so we're past the require_root gate;
         // the 503 must come from require_pepper.

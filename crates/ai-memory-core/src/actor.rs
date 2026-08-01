@@ -72,10 +72,12 @@ pub struct ActorContext {
     /// in this session" against `audit_log` + `observations`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Reserved for the external-auth-proxy rung: the JWT `sub` claim
-    /// (stable user UUID). Kept `Option<String>` so payloads to the
-    /// future admission webhook chain stay forward-compatible with the
-    /// shape PR #55 documents — we don't fill it from rungs 0-3.
+    /// Issuer for the external-auth-proxy rung's OIDC subject. A subject is
+    /// unique only within its issuer, so proxy authentication accepts these
+    /// two fields only as a pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// OIDC `sub` claim asserted by an external authenticating proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
     /// Reserved for the external-auth-proxy rung: the DCR client UUID
@@ -202,6 +204,45 @@ impl AuthLevel {
     }
 }
 
+/// Canonical name of the admission-chain loop-prevention header.
+pub const SKIP_ADMISSION_CHAIN_HEADER: &str = "x-memory-skip-admission-chain";
+
+/// Parse the admission-chain skip list from the raw
+/// `X-Memory-Skip-Admission-Chain` header value (comma-separated webhook
+/// names). Entries are trimmed and empty tokens dropped, so `"a, ,b,"` →
+/// `["a", "b"]`; `None` yields an empty list.
+#[must_use]
+pub fn parse_skip_admission_chain(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The same list, but honoured only for a caller that holds
+/// [`Capability::SkipAdmissionChain`].
+///
+/// The header is client-controlled, so a regular DB user must not be able to
+/// set it and walk past a `reject`-policy admission webhook. Every transport
+/// that forwards the skip list (MCP tools, admin routes, hook ingress) goes
+/// through this one predicate rather than re-deriving the tier rule.
+#[must_use]
+pub fn skip_admission_chain_for(level: AuthLevel, raw: Option<&str>) -> Vec<String> {
+    if level
+        .authorize(Capability::SkipAdmissionChain, true)
+        .is_ok()
+    {
+        parse_skip_admission_chain(raw)
+    } else {
+        Vec::new()
+    }
+}
+
 impl ActorContext {
     /// `true` if at least one identity field is set.
     ///
@@ -216,6 +257,7 @@ impl ActorContext {
             || self.name.is_some()
             || self.email.is_some()
             || self.session_id.is_some()
+            || self.issuer.is_some()
             || self.sub.is_some()
             || self.client.is_some()
     }
@@ -226,6 +268,92 @@ impl ActorContext {
     #[must_use]
     pub fn anonymous() -> Self {
         Self::default()
+    }
+
+    /// Does this actor name a specific human, and under what key?
+    ///
+    /// Every ownership decision in the engine — which rows a caller may read,
+    /// which name a new row is stamped with — goes through here rather than
+    /// reaching for [`Self::user`] directly, because "identified" is not the
+    /// same question as "has a username". An ingress that terminates OIDC and
+    /// forwards only the issuer and subject claims asserts no
+    /// `preferred_username`; the auth middleware already resolves that request
+    /// to `AuthLevel::User`, so a per-site `.user` check would call the same
+    /// request identified for authorization and anonymous for ownership — and
+    /// the operator would stop seeing rows they had just written.
+    ///
+    /// The key is *qualified* — [`IdentityKey::Subject`] or
+    /// [`IdentityKey::User`], never a bare string — because the two name
+    /// spaces are populated by different parties. A username is chosen by a
+    /// person; an OIDC subject is issued by an IdP. Stored raw in one TEXT
+    /// column, a username equal to somebody else's subject would silently
+    /// share that person's rows. Qualification makes the collision
+    /// unrepresentable rather than unlikely.
+    ///
+    /// An `(issuer, sub)` pair wins whenever both fields are present. OIDC pins
+    /// this ordering: the spec defines that pair as the stable identifier and
+    /// explicitly forbids relying on `preferred_username` for identity. It is
+    /// also the direction that stays stable through the common upgrade — an
+    /// ingress that forwarded only `sub` and later starts forwarding a
+    /// username keeps the same key. The reverse upgrade (username-only, later
+    /// adding the OIDC pair) re-buckets once, at the moment the deployment starts
+    /// asserting the stronger identifier; `docs/users.md` tells operators to
+    /// forward `sub` from day one exactly so that moment never comes.
+    ///
+    /// Blank and whitespace-only values name nobody. A partial OIDC pair is
+    /// deliberately not an identity; trusted-proxy ingress rejects it.
+    #[must_use]
+    pub fn identity_key(&self) -> Option<IdentityKey> {
+        let trimmed = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        if let (Some(issuer), Some(subject)) = (trimmed(&self.issuer), trimmed(&self.sub)) {
+            return Some(IdentityKey::Subject { issuer, subject });
+        }
+        trimmed(&self.user).map(IdentityKey::User)
+    }
+}
+
+/// A qualified operator identity — the one value ownership is keyed on.
+///
+/// The variant is part of the identity: a username and an OIDC subject with
+/// equal text are different operators. Everything that persists or compares
+/// an identity goes through [`Self::storage_key`], so call sites cannot flatten
+/// the namespaces or discard an OIDC issuer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IdentityKey {
+    /// Named by the OIDC issuer and subject pair. `sub` alone is not globally
+    /// unique when a proxy accepts tokens from more than one issuer.
+    Subject {
+        /// Exact OIDC `iss` value validated by the proxy.
+        issuer: String,
+        /// Exact OIDC `sub` value validated by the proxy.
+        subject: String,
+    },
+    /// Named by an asserted or configured username. Usernames are display
+    /// names in OIDC terms — present, human-readable, and explicitly not
+    /// guaranteed stable — so this variant keys a caller only when no
+    /// subject was asserted.
+    User(String),
+}
+
+impl IdentityKey {
+    /// The TEXT form used for in-memory routing and future owner columns:
+    /// `oidc:<issuer-byte-length>:<issuer><subject>` or `user:<name>`.
+    ///
+    /// Length-prefixing the issuer makes the OIDC form unambiguous without
+    /// constraining either value or adding an encoding dependency.
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        match self {
+            Self::Subject { issuer, subject } => {
+                format!("oidc:{}:{issuer}{subject}", issuer.len())
+            }
+            Self::User(user) => format!("user:{user}"),
+        }
     }
 }
 
@@ -303,6 +431,26 @@ mod tests {
     }
 
     #[test]
+    fn skip_admission_chain_parses_csv_and_honours_the_tier_rule() {
+        assert_eq!(
+            parse_skip_admission_chain(Some("a, ,b,")),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(parse_skip_admission_chain(None).is_empty());
+        for level in [AuthLevel::Root, AuthLevel::Anonymous] {
+            assert_eq!(
+                skip_admission_chain_for(level, Some("mirror")),
+                vec!["mirror".to_string()],
+                "{level:?} may skip a webhook it re-entered from",
+            );
+        }
+        assert!(
+            skip_admission_chain_for(AuthLevel::User, Some("mirror")).is_empty(),
+            "a DB user must not bypass a reject-policy webhook via a header",
+        );
+    }
+
+    #[test]
     fn has_any_truth_table() {
         // Each field individually flips has_any() to true. Catches an
         // accidental omission if someone adds a new field and forgets
@@ -330,12 +478,105 @@ mod tests {
         assert!(a.has_any());
         a = ActorContext::default();
 
+        a.issuer = Some("https://idp.example".into());
+        assert!(a.has_any());
+        a = ActorContext::default();
+
         a.sub = Some("8f3a".into());
         assert!(a.has_any());
         a = ActorContext::default();
 
         a.client = Some("72836f52".into());
         assert!(a.has_any());
+    }
+
+    /// OIDC identity is the issuer and subject pair, never the subject alone.
+    #[test]
+    fn identity_key_accepts_oidc_pair_without_username() {
+        let oidc = ActorContext {
+            issuer: Some("https://idp.example".into()),
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(
+            oidc.identity_key(),
+            Some(IdentityKey::Subject {
+                issuer: "https://idp.example".into(),
+                subject: "oidc-subject-123".into(),
+            })
+        );
+    }
+
+    /// The stable OIDC pair outranks the display username.
+    #[test]
+    fn identity_key_prefers_oidc_pair_over_user() {
+        let both = ActorContext {
+            user: Some("alice".into()),
+            issuer: Some("https://idp.example".into()),
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(
+            both.identity_key(),
+            Some(IdentityKey::Subject {
+                issuer: "https://idp.example".into(),
+                subject: "oidc-subject-123".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn identity_storage_keys_keep_namespaces_and_issuers_distinct() {
+        let by_name = IdentityKey::User("alice".into());
+        let issuer_a = IdentityKey::Subject {
+            issuer: "https://idp-a.example".into(),
+            subject: "alice".into(),
+        };
+        let issuer_b = IdentityKey::Subject {
+            issuer: "https://idp-b.example".into(),
+            subject: "alice".into(),
+        };
+        assert_ne!(by_name.storage_key(), issuer_a.storage_key());
+        assert_ne!(issuer_a.storage_key(), issuer_b.storage_key());
+    }
+
+    /// Naming nobody stays naming nobody: an agent/session-only actor carries
+    /// transport detail, not identity, and blanks are not names.
+    #[test]
+    fn identity_key_is_none_without_a_named_human() {
+        assert_eq!(ActorContext::anonymous().identity_key(), None);
+        let transport_only = ActorContext {
+            agent: Some("claude-code".into()),
+            session_id: Some("s-1".into()),
+            client: Some("72836f52".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(transport_only.identity_key(), None);
+        let blank = ActorContext {
+            user: Some("   ".into()),
+            issuer: Some("\n".into()),
+            sub: Some("\t".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(blank.identity_key(), None);
+    }
+
+    #[test]
+    fn partial_oidc_pair_does_not_override_username() {
+        let actor = ActorContext {
+            user: Some("alice".into()),
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(
+            actor.identity_key(),
+            Some(IdentityKey::User("alice".into()))
+        );
+        let sub_only = ActorContext {
+            sub: Some("oidc-subject-123".into()),
+            ..ActorContext::default()
+        };
+        assert_eq!(sub_only.identity_key(), None);
     }
 
     #[test]
@@ -367,6 +608,7 @@ mod tests {
             name: Some("Alice Smith".into()),
             email: Some("alice@home".into()),
             session_id: Some("019e6d".into()),
+            issuer: Some("https://idp.example".into()),
             sub: Some("8f3a-uuid".into()),
             client: Some("72836f52-uuid".into()),
         };

@@ -9,8 +9,9 @@ there is no per-page RBAC, no per-user data scoping, no group
 permissions. What multi-user mode adds is *who-did-this*: every write
 attributes to a named user, audit-log rows carry that identity, and the
 web UI can show "Last edited by Alice Smith" instead of the anonymous
-default. Every `/admin/*` endpoint stays root-only once at least one user
-row exists, including read-only status/search/read-page helpers.
+default. Every `/admin/*` endpoint stays root-only once the deployment has a
+DB user or trusted-proxy identities, including read-only
+status/search/read-page helpers.
 
 If you run ai-memory alone, you can skip this page — your install
 keeps working unchanged.
@@ -45,12 +46,69 @@ Every HTTP request is resolved to one of four authentication tiers:
 |---|---|---|
 | **0 — Anonymous** | No `[auth].bearer_token` set. | Allowed, no identity. Same as pre-multi-user defaults. |
 | **1 — Root** | Bearer matches `[auth].bearer_token`. | Allowed as **root**. When `[auth].root_username` is set, writes attribute to that name; otherwise attribution stays anonymous. |
+| **1b — Proxy-asserted user** | Bearer matches the distinct `[auth].actor_proxy_bearer_token`. | Identity is taken from trusted `X-Memory-Actor-*` headers. The request is a **user** unless its OIDC issuer/subject pair exactly matches the configured root pair. Missing or malformed identity is rejected. |
 | **2 — DB user** | Bearer doesn't match root, matches a `users.token_hash` row (via SHA-256 of token + `[auth].token_pepper`). | Allowed as **that user** for normal read/write APIs. All `/admin/*` endpoints are root-only in multi-user mode. The audit log records the username/email/name. |
 | **3 — 401** | Bearer present but matches nothing. | Rejected. Closes the bypass — unknown bearers can't slip through as anonymous. |
 
-The rungs are sticky: a request is matched at the lowest tier that
-applies, never escalates. Root token always wins over any users-row
-collision; the two namespaces are intentionally distinct.
+The rungs are sticky: a request is matched at the first credential that
+applies, never escalates. Startup rejects equal root and proxy credentials;
+root and proxy credentials take precedence over any accidental DB-token
+collision.
+
+## Trusted proxy identity
+
+A deployment that terminates SSO validates the end user's credential, then
+authenticates upstream with a proxy-only bearer and describes the human in
+`X-Memory-Actor-*` headers. Those headers are **ignored by default** on root
+and DB-user requests because anything that can reach the port could otherwise
+claim any identity.
+
+Configure a distinct proxy credential:
+
+```toml
+[auth]
+bearer_token = "<root-token>"                    # direct administration
+actor_proxy_bearer_token = "<different-token>"  # SSO proxy only
+
+# Optional stable identity for the root human behind an OIDC proxy.
+root_issuer = "https://idp.example"
+root_subject = "<root-subject>"
+```
+
+- The proxy token **is** the switch. A blank value counts as unset. It must
+  differ from `bearer_token`, and `serve` refuses startup otherwise or when the
+  root bearer is absent.
+- Only set it when the server is reachable *only* through that proxy.
+- **The proxy MUST strip client-supplied `X-Memory-Actor-*` headers before
+  setting its own.** Use a directive that *replaces* the header rather than
+  appending to it (nginx `proxy_set_header`, Traefik `customRequestHeaders`) —
+  with an appending ingress the client's value arrives first and would be the
+  one read. Repeated headers and comma-folded values are rejected with `400`
+  rather than resolved to one identity.
+- Every proxy request must assert `X-Memory-Actor-User`, or both
+  `X-Memory-Actor-Issuer` and `X-Memory-Actor-Sub`. The OIDC fields are a pair:
+  the standard guarantees subject uniqueness only within an issuer. A partial
+  pair or a request that names nobody is rejected with `400`.
+- Proxy callers are users by default. A username-only assertion can never
+  become root, including one equal to `root_username`, because an OIDC display
+  username is not a stable unique identifier. Proxied root access requires an
+  exact match with `root_issuer` plus `root_subject`.
+- Origin health checks or maintenance calls that need root should use the root
+  bearer, not the proxy bearer. Raw actor headers on the root rung are ignored.
+
+## Identity keys
+
+Identity-sensitive routing uses a *qualified* identity, never a bare string.
+`ActorContext::identity_key()` resolves a request to the OIDC
+`(issuer, subject)` pair when both are present, or to `user:<name>` for a
+username-only identity. The namespaces are disjoint, and identical subjects
+from different issuers stay different.
+
+The OIDC pair outranks `user` because OIDC defines `(iss, sub)` as the stable
+identifier and explicitly forbids relying on `preferred_username` for
+uniqueness. Configure the proxy to forward both values from day one. Adding a
+display username later then preserves the same identity; moving from a
+username-only assertion to the OIDC pair deliberately changes it once.
 
 ## Implementation contract
 

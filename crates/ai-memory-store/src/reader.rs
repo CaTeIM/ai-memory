@@ -5348,6 +5348,30 @@ impl ReaderPool {
         self.with_conn(crate::users::users_exist).await
     }
 
+    /// Does this deployment tell its operators apart?
+    ///
+    /// Two independent routes produce distinct operators: rows in `users`, and
+    /// usernames asserted by a trusted authenticating proxy. Only the first is
+    /// visible from the store, so the caller passes the second in — a
+    /// proxy-only deployment reports `users_exist() == false` forever.
+    ///
+    /// One notion, several gates: the admin authorization boundaries all key
+    /// on this, so a single-operator server keeps the exact behaviour it had
+    /// before either route existed.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error so callers can fail closed.
+    pub async fn distinguishes_operators(&self, trusted_proxy_identity: bool) -> StoreResult<bool> {
+        // Short-circuits the DB round-trip when the static config bit already
+        // settles it. The users table is otherwise consulted per call rather
+        // than cached, so committing a first user tightens access without a
+        // restart.
+        if trusted_proxy_identity {
+            return Ok(true);
+        }
+        self.users_exist().await
+    }
+
     /// Return the last successful global maintenance completion for `job`.
     pub async fn maintenance_job_last_success(
         &self,

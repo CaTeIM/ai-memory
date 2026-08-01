@@ -610,7 +610,10 @@ page view UI. Data stays single-tenant — there is no per-page RBAC. A
 first user row is what immediately switches every `/admin/*` endpoint to
 root-only, including status/search/read-page and user-management routes.
 `ai-memory init` generates a pepper for new installs without changing
-single-user behavior until a user is added. See
+single-user behavior until a user is added. An SSO gateway can instead use a
+dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
+headers; its credential is deliberately separate from the root bearer so a
+missing identity cannot become root. See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
 four-rung auth ladder.
 

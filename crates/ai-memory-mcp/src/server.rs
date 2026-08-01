@@ -390,6 +390,17 @@ pub struct AiMemoryServer {
     /// actor with redundant reinforcement writes. Shared across `Clone`s
     /// so every request handler consults the same clock.
     access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
+    /// True when a trusted authenticating proxy is configured to assert end-user
+    /// identities (`[auth].actor_proxy_bearer_token`).
+    ///
+    /// Distinct operators reach this server by two independent routes: rows in
+    /// `users` (rung 2) and proxy-asserted usernames (rung 1b). Only the first
+    /// is visible to `users_exist()`, so the admin gates need this flag too —
+    /// see [`AiMemoryServer::require_admin_capability`]. Static config, set
+    /// once at startup; `false` for stdio and for every deployment that never
+    /// configures a proxy secret, which is what keeps single-operator servers
+    /// on their historical behaviour.
+    trusted_proxy_identity: bool,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -959,8 +970,20 @@ impl AiMemoryServer {
             auto_improve_require_approval: false,
             auto_improve_review_config: default_auto_improve_review_config(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
+            trusted_proxy_identity: false,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Declare that a trusted proxy may assert end-user identities — mirror of
+    /// `AuthState::with_trusted_proxy_bearer`, which owns the credential.
+    ///
+    /// Without this the admin gates cannot tell a proxied deployment apart from
+    /// a single-operator one; see [`Self::trusted_proxy_identity`].
+    #[must_use]
+    pub fn with_trusted_proxy_identity(mut self, enabled: bool) -> Self {
+        self.trusted_proxy_identity = enabled;
+        self
     }
 
     /// Configure whether auto-improvement requires manual pending-writes approval.
@@ -1006,10 +1029,9 @@ impl AiMemoryServer {
     /// Build the [`ActorKey`] for a tool call from the request's stored
     /// extensions and headers.
     ///
-    /// - `user` is taken from the middleware-injected
-    ///   [`ai_memory_core::ActorContext`] (rung 1 root, rung 2 DB user) —
-    ///   never from raw client-supplied headers, since user identity is
-    ///   security-critical.
+    /// - `user` is the qualified key derived from the middleware-injected
+    ///   [`ai_memory_core::ActorContext`] (root, proxy, or DB user), never from
+    ///   raw client-supplied headers.
     /// - `session_id` comes from the same `ActorContext` when the auth
     ///   middleware filled it; if not, falls back to the rung-4
     ///   `X-Memory-Actor-Session-Id` request header, then to the standard
@@ -1028,7 +1050,9 @@ impl AiMemoryServer {
             return ai_memory_core::ActorKey::default();
         };
         let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
-        let user = ctx.and_then(|c| c.user.clone());
+        let user = ctx
+            .and_then(ai_memory_core::ActorContext::identity_key)
+            .map(|identity| identity.storage_key());
         let header_session = |name: &str| {
             parts
                 .headers
@@ -1827,6 +1851,50 @@ impl AiMemoryServer {
         }
     }
 
+    /// Does this deployment tell its operators apart?
+    ///
+    /// "Several operators" is not the same question as "are there `users` rows".
+    /// A trusted proxy asserts usernames that never get a row, so a deployment
+    /// on that rung would report `users_exist() == false` forever.
+    ///
+    /// One notion, several call sites: the admin gates ask it, so a
+    /// single-operator server behaves exactly as it did before either route
+    /// existed.
+    async fn deployment_distinguishes_operators(&self) -> ai_memory_store::StoreResult<bool> {
+        self.reader
+            .distinguishes_operators(self.trusted_proxy_identity)
+            .await
+    }
+
+    /// Gate an operation behind [`ai_memory_core::Capability::Admin`].
+    ///
+    /// Mirrors the `/admin/*` middleware: operator topology is resolved per
+    /// call rather than cached, so committing a first user immediately tightens
+    /// access without a restart, and a deployment that distinguishes nobody
+    /// keeps its historical single-operator behaviour — see
+    /// [`Self::deployment_distinguishes_operators`].
+    async fn require_admin_capability(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<(), McpError> {
+        // An absent AuthLevel means no auth middleware ran at all — the stdio /
+        // in-process transport, where the caller already has the data directory.
+        // Over HTTP `require_bearer` always inserts a level (rung 0 inserts
+        // Anonymous), so this cannot mask a real unauthenticated request.
+        // Treating "absent" as Anonymous instead would make this tool
+        // permanently unusable over stdio the moment any user row exists.
+        let Some(level) = parts.extensions.get::<ai_memory_core::AuthLevel>().copied() else {
+            return Ok(());
+        };
+        let multi_user_enabled = self
+            .deployment_distinguishes_operators()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        level
+            .authorize(ai_memory_core::Capability::Admin, multi_user_enabled)
+            .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
+    }
+
     /// Run the M8 forget sweep over episodic pages.
     #[tool(description = "Run the retention sweep: walk is_latest=1 \
         episodic pages, score them with the agentmemory-style retention \
@@ -1839,6 +1907,10 @@ impl AiMemoryServer {
         Parameters(args): Parameters<SweepArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        // The sweep permanently removes page versions. On a server with real
+        // operators that makes it an admin operation; with nobody to tell
+        // apart this is a no-op, preserving single-user behaviour.
+        self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let (ws, proj) = self
             .effective_ids_for_read_args_with_actor(
@@ -3388,7 +3460,7 @@ mod tests {
         assert_eq!(
             AiMemoryServer::actor_key_from_parts(Some(&parts)),
             ai_memory_core::ActorKey {
-                user: Some("alice".into()),
+                user: Some("user:alice".into()),
                 session_id: Some("session-from-header".into()),
             },
             "real HTTP request parts must preserve auth identity and routing session"
@@ -3921,8 +3993,26 @@ mod tests {
 
         let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
 
-        assert_eq!(actor.user.as_deref(), Some("alice"));
+        assert_eq!(actor.user.as_deref(), Some("user:alice"));
         assert_eq!(actor.session_id.as_deref(), Some("context-session"));
+    }
+
+    #[test]
+    fn actor_key_uses_issuer_qualified_subject() {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(ai_memory_core::ActorContext {
+            user: Some("display-name".into()),
+            issuer: Some("https://idp.example".into()),
+            sub: Some("subject-123".into()),
+            ..ai_memory_core::ActorContext::default()
+        });
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(
+            actor.user.as_deref(),
+            Some("oidc:19:https://idp.examplesubject-123")
+        );
     }
 
     #[tokio::test]
@@ -8109,6 +8199,34 @@ mod tests {
         assert_eq!(
             baked, 0,
             "sweep of the baked project must not see another project's page, got {baked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_admin_capability_honors_trusted_proxy_topology() {
+        let (_tmp, _store, server, _ws, _project) = setup_server().await;
+        let proxied = server.with_trusted_proxy_identity(true);
+
+        for (level, allowed) in [
+            (AuthLevel::Anonymous, false),
+            (AuthLevel::User, false),
+            (AuthLevel::Root, true),
+        ] {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(level);
+            assert_eq!(
+                proxied.require_admin_capability(&parts).await.is_ok(),
+                allowed,
+                "level={level:?}"
+            );
+        }
+
+        assert!(
+            proxied
+                .require_admin_capability(&test_parts_default())
+                .await
+                .is_ok(),
+            "stdio/in-process calls have no HTTP auth extension and retain local admin access"
         );
     }
 
