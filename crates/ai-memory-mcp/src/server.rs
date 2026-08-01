@@ -242,9 +242,10 @@ developer, user, and canonical project instructions.\n\
 - `memory_auto_improve` — when the user asks what durable lessons \
 should be proposed from a completed session, or at explicit wrap-up \
   when learning review is useful. It is the manual version of the server's \
-  all-project scheduled auto-improvement loop, reads the latest completed session by \
-  default, and applies or stages validated edits through the auto-improvement \
-  approval path. Admins can set `[auto_improve.scheduler] enabled = false` \
+  all-project scheduled auto-improvement loop, reads the latest completed \
+  session without a persisted review run by default, and applies or stages \
+  validated edits through the auto-improvement approval path. Admins can set \
+  `[auto_improve.scheduler] enabled = false` \
   to stop scheduling, or `[auto_improve] require_approval = true` to leave \
   scheduled and manual proposals in pending-writes for review.\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
@@ -690,7 +691,8 @@ struct ConsolidateArgs {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct AutoImproveArgs {
     /// Completed session UUID to review. Omit to review the latest completed
-    /// session in the resolved current project.
+    /// session without a persisted auto-improvement run in the resolved
+    /// current project.
     #[serde(default)]
     session_id: Option<String>,
     /// Removed compatibility field. Hidden from the tool schema; if an old
@@ -2230,7 +2232,7 @@ impl AiMemoryServer {
 
     /// Stage durable wiki edit proposals for a completed session.
     #[tool(
-        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session in the current project. The server also schedules background review for newly completed sessions in every project when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
+        description = "Run manual auto-improvement for one completed session and apply or stage validated wiki edit proposals through the auto-improvement approval path. Use when the user asks what durable lessons should be captured, what memory pages this session suggests, or at explicit wrap-up when a learning review is useful. Omit `session_id` to review the latest completed session that has not already produced an auto-improvement run in the current project; repeated implicit calls advance through the remaining sessions, including after a preflight skip. Pass `session_id` to rerun a specific session. The server also schedules background review for newly completed sessions in every project when an LLM provider is configured. Admins can set `[auto_improve.scheduler] enabled = false` to stop automatic review, or `[auto_improve] require_approval = true` to leave scheduled and manual proposals pending for review."
     )]
     async fn memory_auto_improve(
         &self,
@@ -2274,12 +2276,12 @@ impl AiMemoryServer {
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
                 .reader
-                .latest_completed_session_for_project(ws, proj)
+                .latest_unreviewed_completed_session_for_project(ws, proj)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 .ok_or_else(|| {
                     McpError::internal_error(
-                        "no completed session found for the resolved project",
+                        "no completed session without an auto-improvement run found for the resolved project; pass session_id to rerun a specific session",
                         None,
                     )
                 })?,
@@ -8813,6 +8815,165 @@ mod tests {
             msg.contains("not configured"),
             "error should mention configuration: {msg}",
         );
+    }
+
+    struct PreflightMustNotCallLlm;
+
+    #[async_trait::async_trait]
+    impl ai_memory_llm::LlmProvider for PreflightMustNotCallLlm {
+        fn name(&self) -> &'static str {
+            "preflight-must-not-call"
+        }
+
+        fn model(&self) -> &str {
+            "preflight-must-not-call"
+        }
+
+        async fn complete(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            panic!("preflight-skipped manual review must not call the LLM")
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            _request: ai_memory_llm::ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            panic!("preflight-skipped manual review must not call the LLM")
+        }
+    }
+
+    fn auto_improve_args(session_id: Option<SessionId>) -> AutoImproveArgs {
+        AutoImproveArgs {
+            session_id: session_id.map(|id| id.to_string()),
+            dry_run: None,
+            stage: None,
+            mode: None,
+            project: None,
+            workspace: None,
+            min_observations: None,
+            min_session_duration_secs: None,
+            min_confidence: None,
+            max_input_tokens: None,
+            max_proposals: None,
+            include_raw_fallback: None,
+        }
+    }
+
+    async fn seed_short_completed_session(
+        store: &Store,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::SessionStart,
+                    extension: None,
+                    source_event: None,
+                    title: "session start".into(),
+                    body: String::new(),
+                    importance: 1,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    #[tokio::test]
+    async fn implicit_auto_improve_advances_past_preflight_skips() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let mut sessions = Vec::new();
+        for _ in 0..3 {
+            sessions.push(seed_short_completed_session(&store, ws, proj).await);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for expected in sessions.iter().rev() {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(auto_improve_args(None)),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(response["session_id"], expected.to_string());
+            assert_eq!(response["summary"], "session skipped by preflight filters");
+        }
+
+        let err = server
+            .memory_auto_improve(
+                Parameters(auto_improve_args(None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("all implicit candidates have persisted review runs");
+        assert!(
+            err.to_string().contains("no completed session without"),
+            "the exhausted queue should explain how to rerun: {err}"
+        );
+
+        let explicit = call_tool_json(
+            server
+                .memory_auto_improve(
+                    Parameters(auto_improve_args(Some(sessions[0]))),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .expect("an explicit session remains rerunnable"),
+        );
+        assert_eq!(explicit["session_id"], sessions[0].to_string());
     }
 
     /// Reviewer that always proposes the same two pages, so one of them can be

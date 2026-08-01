@@ -384,7 +384,7 @@ them by default through the wiki mutation path. With `require_approval = true`,
 | Background scheduler | Reviews newly completed sessions after the first-run watermark and applies or stages validated proposals according to approval policy. |
 | `ai-memory auto-improve --session-id <id>` | Manually review one session and apply or stage validated proposals through the auto-improvement approval path. |
 | `ai-memory auto-improve-report --workspace <w> --project <p> [--days N] [--limit N] [--stage]` | Read-only telemetry report for recent auto-improvement runs, proposal outcomes, terminal rates, and findings by default. `--stage` creates exactly one pending telemetry report page for audit/approval. |
-| `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
+| `memory_auto_improve` | Manually review the newest completed session with no persisted auto-improvement run, or explicitly rerun a named session, and apply or stage validated proposals through the same path. An empty run records a preflight skip so the next implicit call advances. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |

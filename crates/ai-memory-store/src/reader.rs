@@ -1649,6 +1649,45 @@ impl ReaderPool {
         .await
     }
 
+    /// Return the latest completed session that has no persisted
+    /// auto-improvement run in the same project.
+    ///
+    /// This is the implicit queue used by manual auto-improvement. Explicitly
+    /// named sessions remain rerunnable, while an omitted session id advances
+    /// past both full reviews and preflight-skipped runs.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn latest_unreviewed_completed_session_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<SessionId>> {
+        self.with_conn(move |conn| {
+            let row_opt: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT s.id FROM sessions s \
+                     WHERE s.workspace_id = ?1 \
+                       AND s.project_id = ?2 \
+                       AND s.ended_at IS NOT NULL \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM auto_improve_runs r \
+                           WHERE r.workspace_id = s.workspace_id \
+                             AND r.project_id = s.project_id \
+                             AND r.session_id = s.id \
+                       ) \
+                     ORDER BY s.ended_at DESC, s.started_at DESC LIMIT 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            row_opt
+                .map(|bytes| SessionId::from_slice(&bytes).map_err(StoreError::from))
+                .transpose()
+        })
+        .await
+    }
+
     /// Return open sessions matching one scoped project and agent.
     ///
     /// Results are newest-first so callers can default to finalizing only the

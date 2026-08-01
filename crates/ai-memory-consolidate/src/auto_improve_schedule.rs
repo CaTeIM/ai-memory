@@ -99,6 +99,9 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub scopes_with_candidates: usize,
     /// Sessions whose review completed (staged or empty).
     pub reviewed: usize,
+    /// Proposals that were reviewed but could not be staged, usually because
+    /// another proposal is already pending for the same target.
+    pub skipped: usize,
     /// Per-scope/per-session failures, logged and counted, not fatal.
     pub errors: usize,
 }
@@ -219,6 +222,7 @@ pub async fn run_auto_improve_scheduler_tick(
             match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
                 Ok(run) => {
                     outcome.reviewed += 1;
+                    outcome.skipped += run.skipped.len();
                     info!(
                         workspace = %scope.workspace_name,
                         project = %scope.project_name,
@@ -561,6 +565,7 @@ mod tests {
         assert_eq!(outcome.scopes, 2);
         assert_eq!(outcome.scopes_with_candidates, 2);
         assert_eq!(outcome.reviewed, 4);
+        assert_eq!(outcome.skipped, 0);
         assert_eq!(outcome.errors, 0);
 
         for (project_id, session_id) in first_interval_sessions {
@@ -740,9 +745,9 @@ mod tests {
     }
 
     /// The unattended path has no response for anyone to read, so a proposal the
-    /// store declines has exactly two places left to surface: the run outcome
-    /// and the log. Without both, a run that lost its only proposal to a
-    /// collision is byte-identical to a run that produced nothing.
+    /// store declines has exactly two places left to surface: the typed tick
+    /// outcome and the warning log. Without both, a run that lost its only
+    /// proposal to a collision is byte-identical to a run that produced nothing.
     #[tokio::test]
     async fn a_scheduled_run_reports_a_collision_in_its_outcome_and_its_log() {
         let tmp = TempDir::new().unwrap();
@@ -815,13 +820,10 @@ mod tests {
             tick.reviewed >= 1,
             "the new session must have been reviewed"
         );
+        assert_eq!(tick.skipped, 1, "the tick must count the dropped proposal");
         assert_ne!(tick_session, session_id);
 
         let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            captured.contains("skipped=1"),
-            "the completion line must count the drop: {captured}"
-        );
         assert!(
             captured.contains("scheduled auto-improve proposal was not staged")
                 && captured.contains(COLLIDING_PATH),

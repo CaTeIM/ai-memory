@@ -106,6 +106,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default or for pages with zero or one identified reader (#336).
 
 ### Fixed
+- `memory_auto_improve` without a `session_id` now selects the newest
+  completed session that has no persisted auto-improvement run. Preflight-
+  skipped sessions therefore advance the implicit manual-review queue instead
+  of permanently starving older sessions; passing an explicit session ID still
+  permits a targeted rerun (#338).
 - Handoff and session ownership is stamped only where the deployment actually
   distinguishes operators. A server with `[auth].bearer_token` +
   `[auth].root_username`, no `users` rows and no proxy has one operator and two
