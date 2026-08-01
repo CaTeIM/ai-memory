@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-08-01
+
 ### Added
 - Added `ai-memory show`, a project-first managed launcher that joins private
   client-local checkout links with public server project metadata and a bounded
@@ -2898,7 +2900,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Consolidator used server startup default project instead of the
   session's actual project.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.21.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v1.22.0...HEAD
+[1.22.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.22.0
 [1.21.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.21.0
 [1.20.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.2
 [1.20.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v1.20.1
