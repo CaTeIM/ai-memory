@@ -46,6 +46,44 @@ and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls, not harness-switch controls.
 
+## Project-first launcher
+
+`ai-memory show` reverses the usual `cd` then `run` flow: choose a local
+checkout, choose an installed managed harness, and launch from that checkout.
+
+```bash
+cd ~/Projects
+ai-memory show
+
+# Structured discovery only; never launches a harness.
+ai-memory show --json
+ai-memory show --json --no-scan
+```
+
+A successful managed prepare refreshes `<data_dir>/client-projects.json`, a
+private client-local registry keyed by a normalized, credential-free server URL
+and `(workspace, project)`. The server's `/api/v1/projects` response supplies
+only project metadata; it never exposes or chooses a server-host checkout path.
+This lets a laptop and desktop map the same remote homeserver project to
+different local directories without syncing path precedence or conflicts.
+
+By default the picker combines valid saved links with a bounded depth-1 scan of
+the current directory. The scan recognizes common project markers, ignores
+symlinks plus dependency/build directories, and resolves each candidate through
+the same marker and repository rules as `run`. `--no-scan` uses saved links
+only, while `--workspace NAME` filters both sources. Stale, retargeted, or
+scope-mismatched links are skipped and a successful later `run` repairs the
+entry. If the server is temporarily unavailable, saved links and scan results
+remain selectable, but managed `run` still fails closed if it cannot prepare a
+workstream before launching the agent.
+
+Interactive mode begins with `+ New project`. The launcher accepts a portable
+lowercase ASCII directory name, builds the marker, instruction routing, and
+Agent Skills in a hidden staging directory, and renames it into place only when
+all setup succeeds. `--yolo`, `--fresh`, and trailing native arguments apply to
+the selected harness. Non-terminal callers must use `--json`; JSON cannot be
+combined with launch arguments.
+
 ## Automatic harness selection
 
 With no harness name, `ai-memory run` inspects checkout-local sessions for
@@ -282,14 +320,15 @@ only after the child starts, so a spawn failure cannot lose the packet. The
 original config is not modified. ai-memory opens the project database read-only;
 the launched Crush process continues its normal native session writes.
 
-The Linux/macOS Docker shell wrapper cannot execute a host agent from inside its
-helper container. For `run` only, it downloads the matching native release into
+The Linux/macOS Docker shell wrapper cannot inspect host projects or execute a
+host agent from inside its helper container. For `run` and `show`, it downloads
+the matching native release into
 `~/.cache/ai-memory/native-runner`, verifies the published SHA-256 checksum, and
 executes that host client. Set `AI_MEMORY_NATIVE_BIN=/path/to/ai-memory` to use a
 specific native build. Native package, release, and source installs need no
 shim. On native Windows, use the published `ai-memory.exe` or a source build.
 
-The wrapper intercepts `run` before Docker and preserves the host `PATH`,
+The wrapper intercepts both commands before Docker and preserves the host `PATH`,
 `AI_MEMORY_SERVER_URL`, and authentication environment. The native client's
 startup log shows `server_url` as well as its local config paths; `data_dir` and
 `bind` describe local defaults and do not override a configured remote server.

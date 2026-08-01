@@ -185,6 +185,40 @@ priors are at the [bottom](#influences-and-prior-art).
   ai-memory run --fresh codex
   ```
 
+- **"Pick the project instead of remembering where it lives."** Start from a
+  directory containing your checkouts and choose the checkout before the
+  managed harness:
+
+  ```bash
+  ai-memory show
+
+  # Machine-readable discovery without launching anything.
+  ai-memory show --json
+  ```
+
+  Each successful `ai-memory run` saves a client-local checkout link keyed by
+  the configured server plus workspace/project. `show` joins those links with
+  the server's public activity and page-count metadata. A fast, bounded depth-1
+  scan of the current directory also finds new checkouts carrying a project
+  marker (`.git`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, and
+  friends), while skipping dependency and build directories. The server never
+  exposes a checkout path, so two client machines can safely use different
+  local paths for the same project on a remote homeserver.
+
+  The list always leads with **`+ New project`**: type a name and ai-memory
+  validates a portable directory name, stages the new checkout privately, pins
+  its workspace and project in `.ai-memory.toml`, and installs the routing block
+  and managed Agent Skills for the chosen agent. The final directory appears
+  only after every setup step succeeds, then `show` launches from it.
+
+  The harness menu only offers agents actually installed on the host, using the
+  same `PATH` lookup `run` enforces at launch.
+
+  `--no-scan` uses only saved links; `--workspace` filters both sources;
+  `--yolo`, `--fresh`, and trailing native arguments are forwarded unchanged.
+  Non-terminal use must pass `--json`; JSON mode is discovery-only and never
+  launches a harness.
+
   The first explicit run can offer an existing session from this exact checkout
   or start a new one. Switching harnesses starts or resumes the native session
   linked to the shared workstream, so an obsolete local session cannot replace
@@ -506,10 +540,10 @@ one matching entry.
   MCP/hooks. Explicit `--server-url` flags still work, but are no longer
   required when the env vars are set. Any non-loopback server should use
   bearer auth.
-- **Managed-run wrapper:** `ai-memory run` must be intercepted by the current
-  host wrapper so the native harness and its session store remain accessible.
-  An old wrapper may pass `run` into Docker and fail with `No such file or
-  directory` for `codex`, `claude`, or another host executable. Run
+- **Managed-launch wrapper:** `ai-memory run` and `ai-memory show` must be
+  intercepted by the current host wrapper so local checkouts, native harnesses,
+  and session stores remain accessible. An old wrapper may pass either command
+  into Docker and fail to find a checkout or host executable. Run
   `ai-memory upgrade` on the agent machine to refresh it. The host-native runner
   inherits `AI_MEMORY_SERVER_URL`, `AI_MEMORY_AUTH_TOKEN`, and the host `PATH`.
 - **Upgrades:** for Docker-wrapper installs, run `ai-memory upgrade` on each

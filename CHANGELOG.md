@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `ai-memory show`, a project-first managed launcher that joins private
+  client-local checkout links with public server project metadata and a bounded
+  local scan, then launches an installed harness without changing the parent
+  process directory. It supports discovery-only `--json`, stages new projects
+  atomically with routing and Agent Skills, keeps remote-server filesystem paths
+  private, refreshes links after successful managed prepares and CLI
+  rename/move operations, and runs host-side through the Docker wrapper (#342).
 - Hook ingestion now recognizes Hermes Agent as a concrete session kind and
   understands its documented shell-hook `tool_name` / `tool_input` envelope
   for bounded tool-family titles and capture exclusions. Migration V44 expands

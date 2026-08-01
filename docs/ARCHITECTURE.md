@@ -245,6 +245,10 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 * `<data_dir>/logs/` - rolling daily `tracing` output.
 * `<data_dir>/models/` - reserved for bundled embedding models
   (M9.5+, when local `ort` lands).
+* `<data_dir>/client-projects.json` - private, client-local checkout links for
+  `ai-memory show`, keyed by credential-free server identity plus workspace and
+  project. It is not part of the SQLite/wiki source of truth, and no server API
+  exposes host paths.
 
 **Schema (current head):**
 
@@ -407,19 +411,20 @@ the explicit `install-mcp --client claude-code --session-aware` option.
 
 ```
 init                 status               run
-workstream-search    audit-contamination  search
-read-page            write-page           delete-page
-serve                reset                backup
-restore              reindex              install-hooks
-hook                 install-mcp          commit
-checkpoints          restore-page         llm-test
-forget-sweep         lint                 curator
-auto-improve-report  auto-improve         finalize-session
-pending-writes       embed                generate-auth-token
-setup-agent          bootstrap            install-instructions
-install-skills       reorg                purge-project
-rename-project       move-project         uninstall
-auth                 user                 completions
+show                 workstream-search    audit-contamination
+search               read-page            write-page
+delete-page          serve                reset
+backup               restore              reindex
+install-hooks        hook                 install-mcp
+commit               checkpoints          restore-page
+llm-test             forget-sweep         lint
+curator              auto-improve-report  auto-improve
+finalize-session     pending-writes       embed
+generate-auth-token  setup-agent          bootstrap
+install-instructions install-skills       reorg
+purge-project        rename-project       move-project
+uninstall            auth                 user
+completions
 ```
 
 Run `ai-memory --help` for the full tree.

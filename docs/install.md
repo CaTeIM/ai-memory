@@ -1258,6 +1258,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
 | `run [harness] [args...]` | host wrapper or native binary | Opt into one managed cross-harness workstream; omit the harness to resume the newest usable local session, or name Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, OMP, Grok Build CLI, or Antigravity CLI explicitly; exact `--yolo` and `--fresh` flags are wrapper-owned and other native arguments pass through |
+| `show [--json]` | host wrapper or native binary | Choose a client-local checkout and installed managed harness, or return structured discovery data without launching; remote servers never provide checkout paths |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
@@ -1521,12 +1522,13 @@ warns that relabeling system directories such as `/home` can make the host
 inoperable. Docker documents `label=disable` in the
 [`docker run` security options](https://docs.docker.com/reference/cli/docker/container/run/#security-opt).
 
-`ai-memory run` is the exception: the current wrapper intercepts it and starts a
-cached checksum-verified native client on the host, where harness executables
-and session stores exist. It preserves an explicit remote
-`AI_MEMORY_SERVER_URL`. If `run` logs `data_dir=/data` and then cannot find
-`codex`, `claude`, or another harness executable, refresh the stale wrapper with
-`ai-memory upgrade` on that client machine.
+`ai-memory run` and `ai-memory show` are the exceptions: the current wrapper
+intercepts them and starts a cached checksum-verified native client on the host,
+where local checkouts, harness executables, and session stores exist. It
+preserves an explicit remote `AI_MEMORY_SERVER_URL`. If either command logs
+`data_dir=/data`, cannot find a checkout, or cannot find `codex`, `claude`, or
+another host executable, refresh the stale wrapper with `ai-memory upgrade` on
+that client machine.
 
 ### Docker compose alternative
 
