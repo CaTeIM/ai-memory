@@ -100,6 +100,15 @@ hard_delete_after_days = 180
 extra_patterns = []
 allowlist = []
 
+# Optional per-operator memory slots. Enable only when HTTP requests carry
+# consistent DB-user or trusted-proxy identities. Shared `_slots/<name>.md`
+# pages remain project-wide; engine-written slots are placed under the
+# operator's bounded namespace and only shared plus own slots are injected into
+# that operator's session brief and consolidation prompt. Exact page reads and
+# searches remain project-wide: this is context-injection isolation, not RBAC.
+[slots]
+per_user = false
+
 # Auto-improvement reviewer.
 #
 # The background scheduler reviews newly-completed sessions in every project

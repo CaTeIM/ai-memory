@@ -283,6 +283,13 @@ context, identity, rules, or user preferences; consolidation should not
 rewrite an existing invariant slot unless new observations directly
 contradict specific existing content.
 
+Shared servers may opt into `[slots] per_user = true`. Engine and MCP slot
+writes then use a bounded namespace derived from the authenticated
+`IdentityKey`; session briefs and consolidation prompts include shared slots
+plus the caller's namespace. Existing unnamespaced slots stay shared and the
+default remains off. Exact wiki reads and searches are deliberately unchanged:
+this boundary limits prompt injection, not page access.
+
 ## Cross-project links
 
 Pages normally link within their own project (`[[decisions/0001.md]]`, or a
@@ -477,6 +484,9 @@ sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
+
+[slots]                           # optional shared-server injection boundary
+per_user = false                  # shared + own slots in agent context
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

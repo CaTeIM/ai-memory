@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exist", so a trusted-proxy deployment — which never writes a `users` row —
   gets root-only admin gating instead of waving every proxied caller through
   the single-operator escape hatch (#333).
+- Optional `[slots] per_user` namespaced engine-written memory slots by the
+  authenticated operator. Session briefs and consolidation prompts now receive
+  shared slots plus that operator's own bounded namespace, while foreign slot
+  writes are refused. The feature defaults off, preserves existing shared
+  slots, and intentionally leaves exact wiki reads and searches project-wide
+  because it is an agent-context injection boundary rather than RBAC (#335).
 - Handoffs now belong to the operator that created them (migration V39). On a
   server shared by several people the open-handoff lookup was scoped by
   `(workspace, project, state)` alone, so the next session to start — whoever it
