@@ -38,11 +38,11 @@ pub use active_project::{
     ActiveProject, ActiveProjectMode, ActorKey, DEFAULT_MAX_ENTRIES, DEFAULT_PER_KEY_TTL,
 };
 pub use actor::{
-    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, SKIP_ADMISSION_CHAIN_HEADER,
-    parse_skip_admission_chain, skip_admission_chain_for,
+    ActorContext, AuthLevel, AuthzError, Capability, IdentityKey, OwnerFilter,
+    SKIP_ADMISSION_CHAIN_HEADER, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use error::{MemoryError, MemoryResult};
-pub use handoff::{Handoff, HandoffState, NewHandoff};
+pub use handoff::{Handoff, HandoffAcceptance, HandoffState, NewHandoff};
 pub use ids::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId, ManagedRunId,
     ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId, WorkspaceId,

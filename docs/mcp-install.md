@@ -540,9 +540,11 @@ The rendered hooks config looks like:
   the conversation. After the final turn, run
   `ai-memory finalize-session --agent antigravity-cli` to create the final
   summary and automatic handoff and to queue opt-in SessionEnd consolidation.
-- `memory_handoff_begin` always creates an explicit, project-wide manual
-  handoff with no `from_session_id` and `from_agent = other`; that
-  session-neutral shape is the same for every MCP client. Handoffs carrying a
+- `memory_handoff_begin` always creates an explicit manual handoff with no
+  `from_session_id` and `from_agent = other`; it is project-wide for cwd
+  matching but belongs to the creating operator by default. Pass `shared=true`
+  only to publish it to every operator in the project. That session-neutral
+  shape is the same for every MCP client. Handoffs carrying a
   Codex or Claude session id came from canonical SessionEnd processing, not
   from the manual tool. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.

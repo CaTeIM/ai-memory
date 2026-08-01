@@ -342,6 +342,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();
@@ -373,6 +374,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             project_id: scratch,
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
+            actor_user: None,
         })
         .await
         .unwrap();

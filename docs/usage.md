@@ -40,6 +40,14 @@ If an agent has MCP but no lifecycle hook surface, ask it to call
 `memory_handoff_begin` before quitting. The next hooked agent can still
 consume that handoff automatically.
 
+On a server that distinguishes operators, handoffs belong to their creator by
+default: the next session for that operator sees their own plus deliberately
+shared rows, never a teammate's. Use `shared: true` on
+`memory_handoff_begin` only when the baton is intended for anyone in the
+project. Root-authorized recovery can pass `any_owner: true` to
+`memory_handoff_accept` or `memory_handoff_cancel`; normal callers cannot use
+that switch.
+
 Handoffs are next-session transfer, not a live message bus between agents that
 are still running. In particular, Antigravity CLI exposes `PreInvocation`
 before every model call; ai-memory fetches a handoff only on invocation zero,

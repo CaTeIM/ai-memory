@@ -167,6 +167,7 @@ impl Harness {
                 ai_memory_hooks::IngestRateLimiter::disabled(),
             )),
             home_dir: None,
+            trusted_proxy_identity: false,
         });
 
         let router = Router::new()

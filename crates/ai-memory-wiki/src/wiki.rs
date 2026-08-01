@@ -657,6 +657,74 @@ impl Wiki {
         }
     }
 
+    /// Ask the admission chain about an operation that has no page and no body
+    /// — a handoff lifecycle event.
+    ///
+    /// Handoffs live outside the wiki tree (they have their own table), so they
+    /// never passed through `write_page` and were invisible to admission
+    /// webhooks. That left the operations that move prompt-derived text between
+    /// operators unauthorizable: a webhook that decides who may touch which
+    /// scope could not see them at all.
+    ///
+    /// Only the webhooks that can refuse the operation are awaited — that is
+    /// what the caller has to know before doing destructive work, and a
+    /// `reject` policy is the operator asking to be waited for. The observers
+    /// are handed back with the resolved context: pass it to
+    /// [`Self::notify_operation_observers`] once the operation is durable, or
+    /// drop it if the operation was abandoned, so no webhook is told about work
+    /// that never happened. Every path that raises one of these ops owes its
+    /// webhooks the same three steps in the same order — decide, act, notify —
+    /// or the same event reaches a mirror from one caller and not from another.
+    ///
+    /// Returns `None` when no chain is attached (nothing left to notify).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses.
+    pub async fn authorize_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        let Some(chain) = &self.admission_chain else {
+            return Ok(None);
+        };
+        let ctx = self
+            .operation_admission_ctx(workspace_id, project_id, op, actor, skip_webhooks)
+            .await;
+        chain.authorize(None, &ctx).await?;
+        Ok(Some(ctx))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation previously gated
+    /// by [`Self::authorize_operation`] and since committed.
+    pub fn notify_operation_observers(&self, ctx: &AdmissionContext) {
+        if let Some(chain) = &self.admission_chain {
+            chain.dispatch_notify_observers(None, ctx);
+        }
+    }
+
+    async fn operation_admission_ctx(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> AdmissionContext {
+        let mut ctx = AdmissionContext {
+            op,
+            actor,
+            skip_webhooks,
+            ..Default::default()
+        };
+        self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+            .await;
+        ctx
+    }
+
     /// Run just the blocking admission chain for a would-be write, without
     /// touching the store, disk, or any upstream cost (e.g. an LLM call). A
     /// `failure_policy = reject` webhook can still abort here, so callers use

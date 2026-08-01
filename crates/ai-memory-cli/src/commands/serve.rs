@@ -594,6 +594,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     ),
                 )),
                 home_dir: config.home_dir.clone(),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
             });
             let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
@@ -2174,6 +2175,7 @@ mod tests {
                 project_id,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

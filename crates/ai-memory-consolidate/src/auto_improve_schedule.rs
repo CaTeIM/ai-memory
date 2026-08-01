@@ -481,6 +481,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
@@ -510,6 +511,7 @@ mod tests {
                     project_id,
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
+                    actor_user: None,
                 })
                 .await
                 .unwrap();

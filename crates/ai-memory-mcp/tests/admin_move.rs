@@ -598,6 +598,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
             project_id: src_proj,
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
+            actor_user: None,
         })
         .await
         .unwrap();

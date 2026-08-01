@@ -151,7 +151,9 @@ priors are at the [bottom](#influences-and-prior-art).
   provider health from the last real provider call. Server is the
   single source of truth. `finalize-session` lists matching open
   sessions through `GET /admin/open-sessions`, then posts synthetic
-  `session-end` hooks back to the server.
+  `session-end` hooks back to the server. On shared deployments it defaults to
+  the caller's own plus unattributed sessions; root can pass `--all-owners` for
+  explicit cross-operator recovery.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5, manually declared
   entity, and graph-neighbor search plus rule-based summarisation. Add a
   provider when you want consolidated pages, lint contradictions, or staged
@@ -649,12 +651,15 @@ Useful entry points:
   GET  /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=...
   GET  /api/v1/workspaces/{workspace}/overview?limit=...
   GET  /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=...
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=...&limit=...
   GET  /api/v1/search?q=...&workspace=...&project=...&limit=...
   POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
   ```
 
   `overview` bundles the open handoff + briefing + memory-health for a workspace
-  or project in one call (the data a project overview screen needs).
+  or project in one call (the data a project overview screen needs). The
+  handoff history defaults to the caller's own plus shared rows; root can use
+  `all_owners=true` for recovery across operators.
 
   **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
   for auth setup, response schemas, error model, limits/pagination,

@@ -52,7 +52,7 @@ pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind, SessionId};
+    use ai_memory_core::{AgentKind, HandoffId, NewObservation, ObservationKind, SessionId};
     use rusqlite::{Connection, params};
 
     /// A store migrated by a newer build (an applied version above anything
@@ -363,15 +363,21 @@ mod tests {
         let project_id =
             crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
         let session_id = SessionId::new();
-        crate::ops::begin_session(
-            &mut conn,
-            &NewSession {
-                id: session_id,
-                workspace_id,
-                project_id,
-                agent_kind: AgentKind::Codex,
-                cwd: None,
-            },
+        // Era-appropriate raw insert. This fixture deliberately stops at V33
+        // and then migrates forward, so it must not go through `begin_session`:
+        // that writes whatever columns the CURRENT schema has, and every later
+        // migration that adds one would break a test about an older era.
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![
+                session_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                AgentKind::Codex.as_str(),
+                jiff::Timestamp::now().as_microsecond(),
+            ],
         )
         .unwrap();
         crate::ops::insert_observation(
@@ -426,5 +432,74 @@ mod tests {
             crate::session_consolidation::enqueue(&mut conn, workspace_id, project_id, session_id,)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn v39_to_v41_preserve_existing_rows_as_shared_and_add_listing_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 38).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let session_id = SessionId::new();
+        let handoff_id = HandoffId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 1)",
+            params![
+                session_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                AgentKind::Codex.as_str(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO handoffs \
+             (id, workspace_id, project_id, from_agent, summary, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                AgentKind::Codex.as_str(),
+                "legacy baton",
+            ],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let actor_user: Option<String> = conn
+            .query_row(
+                "SELECT actor_user FROM sessions WHERE id = ?1",
+                params![session_id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (owner_user, accepted_by_user): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT owner_user, accepted_by_user FROM handoffs WHERE id = ?1",
+                params![handoff_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(actor_user, None, "legacy sessions remain shared");
+        assert_eq!(owner_user, None, "legacy handoffs remain shared");
+        assert_eq!(accepted_by_user, None);
+        for index in [
+            "idx_handoffs_open_owner",
+            "idx_sessions_open_owner",
+            "idx_handoffs_project_recent",
+            "idx_handoffs_project_owner_recent",
+        ] {
+            assert_eq!(
+                schema_object_count(&conn, "index", index),
+                1,
+                "missing ownership/listing index {index}",
+            );
+        }
     }
 }

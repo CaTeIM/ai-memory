@@ -601,7 +601,7 @@ async fn require_root_for_multiuser_admin(
     // with no `users` rows would wave a proxy-asserted `AuthLevel::User` caller
     // through every operational route below — purge, delete-page, backup — and
     // only `/admin/users*` would survive on its own inner root check.
-    let multi_user_enabled = match state
+    let distinguishes_operators = match state
         .reader
         .distinguishes_operators(state.trusted_proxy_identity)
         .await
@@ -618,7 +618,7 @@ async fn require_root_for_multiuser_admin(
                 .into_response();
         }
     };
-    match level.authorize(Capability::Admin, multi_user_enabled) {
+    match level.authorize(Capability::Admin, distinguishes_operators) {
         Ok(()) => next.run(req).await,
         Err(e) => (
             authz_status(e),
@@ -864,6 +864,17 @@ struct OpenSessionsQuery {
     /// When true, return every open session; otherwise just the newest.
     #[serde(default)]
     all: bool,
+    /// Include sessions belonging to OTHER operators.
+    ///
+    /// Off by default because the caller of this endpoint (`finalize-session`)
+    /// acts destructively on what it returns: it ends the session, synthesises
+    /// a page from its observations and mints a handoff carrying its raw
+    /// prompts. Picking "the newest open session in the scope" across everyone
+    /// would do all of that to a colleague's live session. Sessions with no
+    /// recorded operator stay visible either way, so a single-operator server
+    /// is unaffected.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 /// Wire shape for one open session in the `GET /admin/open-sessions`
@@ -881,6 +892,7 @@ fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
 
 async fn handle_open_sessions(
     State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Query(query): Query<OpenSessionsQuery>,
 ) -> impl IntoResponse {
     let Some(agent) = parse_agent_kind(&query.agent) else {
@@ -897,9 +909,16 @@ async fn handle_open_sessions(
         Err(e) => return e,
     };
     let limit = if query.all { None } else { Some(1) };
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
     match state
         .reader
-        .open_sessions_for_scope_agent(ws, proj, agent, limit)
+        .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
         .await
     {
         Ok(sessions) => {
@@ -5091,7 +5110,9 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_core::{
+        ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
+    };
     use ai_memory_core::{Sanitized, Sanitizer};
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
@@ -5226,6 +5247,8 @@ mod tests {
         let other_agent = SessionId::new();
         let other_scope = SessionId::new();
         let ended = SessionId::new();
+        let alice = SessionId::new();
+        let bob = SessionId::new();
         for (id, project_id, agent) in [
             (older, target, AgentKind::Codex),
             (other_agent, target, AgentKind::ClaudeCode),
@@ -5241,11 +5264,26 @@ mod tests {
                     project_id,
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
                 })
                 .await
                 .unwrap();
         }
         store.writer.end_session(ended, None).await.unwrap();
+        for (id, user) in [(alice, "alice"), (bob, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: AgentKind::Codex,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
 
         let router = admin_router(AdminState {
             writer: store.writer.clone(),
@@ -5310,6 +5348,37 @@ mod tests {
             .collect();
         assert!(ids.contains(&latest.to_string().as_str()));
         assert!(ids.contains(&older.to_string().as_str()));
+
+        // A named operator gets their own open sessions plus shared legacy
+        // sessions, never a colleague's. This is the exact route consumed by
+        // the destructive `finalize-session` command.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&alice.to_string().as_str()));
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+        assert!(!ids.contains(&bob.to_string().as_str()));
 
         // Unknown agent kind fails closed with a 400.
         let resp = router
@@ -5675,6 +5744,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5805,6 +5875,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -5903,6 +5974,7 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();

@@ -1,7 +1,9 @@
 //! Per-request actor identity — who triggered an operation.
 //!
-//! ai-memory's data is single-tenant (no RBAC; everyone with auth sees the
-//! same pages), but writes can be **attributed** to the user who made them.
+//! ai-memory's wiki is single-tenant (no per-page RBAC; everyone with auth sees
+//! the same pages), but writes can be **attributed** to the user who made them.
+//! Operational session and handoff state is owner-scoped so one operator
+//! cannot accidentally finalize or consume another operator's live context.
 //! [`ActorContext`] is the typed carrier for that identity, injected once
 //! per request by the auth middleware and threaded through to the writer
 //! actor so attribution lands in the same SQL transaction as the data.
@@ -16,11 +18,10 @@
 //!    from `[auth].root_username` / `root_email` (and optional `root_name`).
 //! 3. **Identified multi-user** — bearer token matches an active
 //!    `users.token_hash` row. Middleware fills the actor from the row.
-//! 4. **External auth proxy** — operator runs an auth sidecar that injects
-//!    pre-validated `X-Memory-Actor-*` headers; the middleware overlays
-//!    them onto the rung 2/3 actor. (Scaffolding only in v1 — the `sub`
-//!    and `client` fields below exist for this use case and the eventual
-//!    admission webhook chain payload contract.)
+//! 4. **External auth proxy** — a trusted sidecar authenticates with the
+//!    dedicated proxy bearer and asserts a username or complete OIDC
+//!    issuer/subject pair in `X-Memory-Actor-*` headers. Proxy callers are users
+//!    unless the stable OIDC pair exactly matches the configured root pair.
 //!
 //! ## Why not RBAC
 //!
@@ -163,13 +164,14 @@ impl AuthzError {
 impl AuthLevel {
     /// Check whether this auth tier can use `capability`.
     ///
-    /// `multi_user_enabled` is the store-backed presence of any user row:
-    /// operational admin routes keep their historical bootstrap behavior until
-    /// the first user is created, while user-management is always root-only.
+    /// `distinguishes_operators` is true when the deployment has DB users or a
+    /// configured trusted identity proxy. Operational admin routes keep their
+    /// historical bootstrap behavior until either mode is active, while user
+    /// management is always root-only.
     pub fn authorize(
         self,
         capability: Capability,
-        multi_user_enabled: bool,
+        distinguishes_operators: bool,
     ) -> Result<(), AuthzError> {
         match capability {
             Capability::NormalRead | Capability::NormalWrite => Ok(()),
@@ -179,7 +181,7 @@ impl AuthLevel {
                 }
                 AuthLevel::Anonymous | AuthLevel::Root => Ok(()),
             },
-            Capability::Admin if !multi_user_enabled => Ok(()),
+            Capability::Admin if !distinguishes_operators => Ok(()),
             Capability::Admin => self.require_root(
                 "admin operation requires authentication in multi-user mode",
                 "admin operation is root-only in multi-user mode",
@@ -297,8 +299,8 @@ impl ActorContext {
     /// ingress that forwarded only `sub` and later starts forwarding a
     /// username keeps the same key. The reverse upgrade (username-only, later
     /// adding the OIDC pair) re-buckets once, at the moment the deployment starts
-    /// asserting the stronger identifier; `docs/users.md` tells operators to
-    /// forward `sub` from day one exactly so that moment never comes.
+    /// asserting the stronger identifier. Trusted-proxy ingress requires the
+    /// complete issuer/subject pair and rejects either field on its own.
     ///
     /// Blank and whitespace-only values name nobody. A partial OIDC pair is
     /// deliberately not an identity; trusted-proxy ingress rejects it.
@@ -355,6 +357,98 @@ impl IdentityKey {
             Self::User(user) => format!("user:{user}"),
         }
     }
+
+    /// Parse the qualified TEXT form produced by [`Self::storage_key`].
+    ///
+    /// Stored owners sometimes need to be turned back into a typed actor. The
+    /// OIDC form uses the encoded issuer byte length, so neither colons nor
+    /// non-ASCII text in the issuer or subject make the split ambiguous.
+    #[must_use]
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        let parsed = if let Some(user) = key.strip_prefix("user:") {
+            Self::User(user.to_owned())
+        } else {
+            let encoded = key.strip_prefix("oidc:")?;
+            let (issuer_len, remainder) = encoded.split_once(':')?;
+            let issuer_len = issuer_len.parse::<usize>().ok()?;
+            let issuer = remainder.get(..issuer_len)?;
+            let subject = remainder.get(issuer_len..)?;
+            Self::Subject {
+                issuer: issuer.to_owned(),
+                subject: subject.to_owned(),
+            }
+        };
+        // Production keys originate in `ActorContext::identity_key`, which
+        // trims and rejects blanks. Enforce the same invariant on persisted
+        // data so a corrupt `user:` / partial OIDC key cannot become a new
+        // ownership bucket when a session is finalized.
+        (parsed.to_actor_context().identity_key().as_ref() == Some(&parsed)).then_some(parsed)
+    }
+
+    /// Build an actor that round-trips through [`ActorContext::identity_key`].
+    #[must_use]
+    pub fn to_actor_context(&self) -> ActorContext {
+        match self {
+            Self::Subject { issuer, subject } => ActorContext {
+                issuer: Some(issuer.clone()),
+                sub: Some(subject.clone()),
+                ..ActorContext::default()
+            },
+            Self::User(user) => ActorContext {
+                user: Some(user.clone()),
+                ..ActorContext::default()
+            },
+        }
+    }
+}
+
+/// Which owned rows a caller is allowed to see or act on.
+///
+/// A row whose owner is `None` is shared: it predates ownership, was written
+/// without an actor, or was deliberately published to the whole project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerFilter {
+    /// The caller's own rows plus shared rows. The value is a qualified
+    /// [`IdentityKey::storage_key`].
+    User(String),
+    /// A caller with no identity: shared rows only.
+    Unattributed,
+    /// Explicit cross-owner access for authorized recovery paths.
+    Any,
+}
+
+impl OwnerFilter {
+    /// Build the owner filter from the canonical actor identity.
+    #[must_use]
+    pub fn for_actor_context(actor: &ActorContext) -> Self {
+        actor.identity_key().map_or(Self::Unattributed, |identity| {
+            Self::User(identity.storage_key())
+        })
+    }
+
+    /// Whether a stored owner passes this filter.
+    #[must_use]
+    pub fn admits(&self, owner: Option<&str>) -> bool {
+        match (self, owner) {
+            (_, None) | (Self::Any, _) => true,
+            (Self::User(me), Some(owner)) => me == owner,
+            (Self::Unattributed, Some(_)) => false,
+        }
+    }
+}
+
+/// Derive the owner stored by an operator-distinguishing deployment.
+///
+/// A single-operator server leaves rows shared even when its HTTP root has a
+/// username, because the same operator's stdio transport carries no actor.
+#[must_use]
+pub fn owner_stamp(
+    identity: Option<&IdentityKey>,
+    distinguishes_operators: bool,
+) -> Option<String> {
+    distinguishes_operators
+        .then(|| identity.map(IdentityKey::storage_key))
+        .flatten()
 }
 
 #[cfg(test)]
@@ -538,6 +632,75 @@ mod tests {
         };
         assert_ne!(by_name.storage_key(), issuer_a.storage_key());
         assert_ne!(issuer_a.storage_key(), issuer_b.storage_key());
+        let names_filter = OwnerFilter::User(by_name.storage_key());
+        assert!(!names_filter.admits(Some(&issuer_a.storage_key())));
+    }
+
+    #[test]
+    fn storage_key_round_trips_to_actor_without_losing_issuer() {
+        for key in [
+            IdentityKey::User("alice".into()),
+            IdentityKey::User("oidc:4:idpalice".into()),
+            IdentityKey::Subject {
+                issuer: "https://idp.example/é".into(),
+                subject: "subject:42".into(),
+            },
+        ] {
+            assert_eq!(
+                IdentityKey::from_storage_key(&key.storage_key()),
+                Some(key.clone())
+            );
+            assert_eq!(key.to_actor_context().identity_key(), Some(key));
+        }
+        for malformed in [
+            "",
+            "alice",
+            "user:",
+            "user:   ",
+            "user: alice ",
+            "oidc:",
+            "oidc:0:subject",
+            "oidc:3:idp",
+            "oidc:3: idsubject",
+            "oidc:x:idpsub",
+            "oidc:99:idpsub",
+            "oidc:1:ésub",
+        ] {
+            assert_eq!(
+                IdentityKey::from_storage_key(malformed),
+                None,
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_stamp_requires_identity_and_operator_distinction() {
+        let key = IdentityKey::Subject {
+            issuer: "https://idp.example".into(),
+            subject: "oidc-subject-123".into(),
+        };
+        assert_eq!(owner_stamp(Some(&key), false), None);
+        assert_eq!(owner_stamp(None, true), None);
+        assert_eq!(owner_stamp(Some(&key), true), Some(key.storage_key()));
+    }
+
+    #[test]
+    fn owner_filter_admit_matrix() {
+        let alice = OwnerFilter::for_actor_context(&ActorContext {
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        });
+        let owned = IdentityKey::User("alice".into()).storage_key();
+        let other = IdentityKey::User("bob".into()).storage_key();
+
+        for filter in [&alice, &OwnerFilter::Unattributed, &OwnerFilter::Any] {
+            assert!(filter.admits(None));
+        }
+        assert!(alice.admits(Some(&owned)));
+        assert!(!alice.admits(Some(&other)));
+        assert!(!OwnerFilter::Unattributed.admits(Some(&owned)));
+        assert!(OwnerFilter::Any.admits(Some(&other)));
     }
 
     /// Naming nobody stays naming nobody: an agent/session-only actor carries

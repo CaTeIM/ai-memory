@@ -135,6 +135,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 project_id: proj,
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
@@ -173,6 +174,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                     open_questions: vec![],
                     next_steps: vec![],
                     files_touched: vec![],
+                    owner_user: None,
                 })
                 .await
                 .unwrap();
