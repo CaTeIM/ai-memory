@@ -164,6 +164,8 @@ pub(crate) enum WriteCmd {
     },
     AcceptHandoff {
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         accepting_user: Option<String>,
@@ -173,6 +175,8 @@ pub(crate) enum WriteCmd {
     },
     CancelHandoff {
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
@@ -368,6 +372,8 @@ pub(crate) enum WriteCmd {
     },
     AcceptStartupContext {
         handoff_id: Option<HandoffId>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         accepting_user: Option<String>,
@@ -758,16 +764,18 @@ impl WriterHandle {
     /// Mark a handoff accepted by the given agent / session.
     ///
     /// Returns whether this call is the one that claimed it; `false` means the
-    /// row was already taken or its owner does not admit this caller, and the
-    /// body must not reach the agent. `receiving_cwd` is where the claiming
-    /// session is starting, and bounds the sweep of superseded automatic
-    /// handoffs.
+    /// row was already taken, does not belong to the expected workspace and
+    /// project, or its owner does not admit this caller. The body must not reach
+    /// the agent on `false`. `receiving_cwd` is where the claiming session is
+    /// starting, and bounds the sweep of superseded automatic handoffs.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
     pub async fn accept_handoff(
         &self,
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         accepting_user: Option<String>,
@@ -777,6 +785,8 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
             handoff_id,
+            workspace_id,
+            project_id,
             accepting_agent,
             accepting_session,
             accepting_user,
@@ -791,18 +801,23 @@ impl WriterHandle {
     /// Mark an open handoff expired so it will no longer be consumed.
     ///
     /// Returns `true` when an open handoff was changed, `false` when the id was
-    /// already accepted/expired or missing.
+    /// already accepted/expired, outside the expected workspace and project,
+    /// or missing.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
     pub async fn cancel_handoff(
         &self,
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         owner_filter: OwnerFilter,
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CancelHandoff {
             handoff_id,
+            workspace_id,
+            project_id,
             owner_filter,
             reply: tx,
         })
@@ -1465,6 +1480,8 @@ impl WriterHandle {
     pub async fn accept_startup_context(
         &self,
         handoff_id: Option<HandoffId>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
         accepting_agent: AgentKind,
         accepting_session: Option<SessionId>,
         accepting_user: Option<String>,
@@ -1475,6 +1492,8 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
             handoff_id,
+            workspace_id,
+            project_id,
             accepting_agent,
             accepting_session,
             accepting_user,
@@ -1727,6 +1746,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::AcceptHandoff {
                 handoff_id,
+                workspace_id,
+                project_id,
                 accepting_agent,
                 accepting_session,
                 accepting_user,
@@ -1737,6 +1758,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::accept_handoff(
                     &mut conn,
                     &handoff_id,
+                    &workspace_id,
+                    &project_id,
                     accepting_agent,
                     accepting_session.as_ref(),
                     accepting_user.as_deref(),
@@ -1747,10 +1770,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::CancelHandoff {
                 handoff_id,
+                workspace_id,
+                project_id,
                 owner_filter,
                 reply,
             } => {
-                let result = ops::cancel_handoff(&mut conn, &handoff_id, &owner_filter);
+                let result = ops::cancel_handoff(
+                    &mut conn,
+                    &handoff_id,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                );
                 send_or_warn(reply, result, "cancel_handoff");
             }
             WriteCmd::Reorg {
@@ -2029,6 +2060,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::AcceptStartupContext {
                 handoff_id,
+                workspace_id,
+                project_id,
                 accepting_agent,
                 accepting_session,
                 accepting_user,
@@ -2052,6 +2085,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         Some(handoff_id) => ops::accept_handoff_in_transaction(
                             &tx,
                             &handoff_id,
+                            &workspace_id,
+                            &project_id,
                             accepting_agent,
                             accepting_session.as_ref(),
                             accepting_user.as_deref(),

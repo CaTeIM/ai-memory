@@ -1,7 +1,8 @@
 # Admission webhooks: pre-persistence HTTP hooks
 
 > Operator-configured HTTP hooks invoked on the engine's write path
-> (`Wiki::write_page`, `delete_page`, `purge_project`, `purge_workspace`, `move_project`)
+> (`Wiki::write_page`, `delete_page`, `purge_project`, `purge_workspace`,
+> `move_project`, and handoff lifecycle operations)
 > just before the durable mutation commits. Write hooks can mutate the page
 > (return a new frontmatter / body); delete/purge/move hooks are notifications
 > that can observe, mirror, or reject. Sourced from
@@ -101,20 +102,23 @@ refusal degrades the lifecycle event instead of failing it:
 - SessionEnd asks before `end_session` commits; a refusal skips the baton, is
   logged, and the session page / opt-in consolidation / auto-commit still run.
   The session ends without a handoff rather than ending with no summary at all.
-- The session-start claim is served by the hook path, whose script hard-timeouts
-  at ≤200 ms — which is why only the deciding webhooks are awaited there. A
-  refusal, a timeout or an unreachable host leaves the handoff **open** for the
-  next session; it never fails the session start.
+- The session-start claim is served by the synchronous hook path. The shortest
+  shipped caller is the shell hook's one-second curl deadline (native hook
+  commands allow three seconds), so the server caps admission at 750 ms. A
+  refusal, that server deadline, a per-webhook timeout or an unreachable host
+  leaves the handoff **open** for the next session; it never fails the session
+  start or consumes context after the caller has disconnected.
 
 Budgeting the session-start claim: the deciding webhooks are awaited
 **sequentially**, and the chain stops at the first refusal, so what the operator
 waits for in the worst case is the **sum** of the `timeout_ms` of every
 `reject`-policy webhook subscribed to `handoff_accept` — not the largest of them.
-`timeout_ms` **defaults to 2000 ms**, ten times the hook budget, so each such
-webhook needs an explicit value and the values have to add up to the budget: one
-hook can have `150`, but two need roughly `75` each. The engine does not enforce
-the budget for you — nothing server-side knows about the hook script's deadline —
-so a chain that overshoots it is the operator's own configuration to fix.
+That sum is then capped by the server's 750 ms automatic-claim deadline.
+`timeout_ms` still defaults to 2000 ms per webhook for ordinary MCP and write
+paths; on automatic session-start acceptance, a chain that cannot approve
+within 750 ms is treated as a refusal and the baton remains open. Configure
+smaller per-webhook values when you need logs to identify which decider timed
+out rather than the aggregate deadline firing first.
 
 `delete` / `purge_project` / `purge_workspace` / `move_project` are notifications — there is no
 body to mutate; a `Reject`-policy webhook still aborts the operation
@@ -288,7 +292,7 @@ Constants are exported from the `ai-memory-wiki` crate root:
 |---|---|---|
 | `MAX_ADMISSION_WEBHOOKS` | `16` | Chain length. `AdmissionChain::new` errors out beyond this — a misconfigured template (helm loop, duplicated block) can't push N hooks into the write-path. |
 | `MAX_RESPONSE_BYTES` | `1 MiB` | Webhook response body. Beyond this the response is dropped (treated as no-op + `warn`). |
-| Per-webhook `timeout_ms` | operator-set (default `2000`) | Single request. The chain is sequential, so total worst case ≈ `Σ timeout_ms`. |
+| Per-webhook `timeout_ms` | operator-set (default `2000`) | Single request. The chain is sequential, so total worst case ≈ `Σ timeout_ms`; automatic session-start handoff acceptance additionally caps the whole deciding chain at 750 ms. |
 
 ## 8. Configuration
 

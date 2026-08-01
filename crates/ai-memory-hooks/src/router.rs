@@ -60,6 +60,14 @@ pub const DEFAULT_INGEST_GATE_MAX_ENTRIES: usize = 4096;
 /// allocate/process an unbounded vector of hook events.
 pub const MAX_HOOK_BATCH_ITEMS: usize = 256;
 
+/// Upper bound for reject-policy admission on the synchronous `/handoff`
+/// path. The shortest shipped client deadline is the shell hook's one-second
+/// curl timeout, so the server must decide earlier or leave the baton open;
+/// otherwise an approved response can consume context after the client has
+/// already disconnected and can no longer receive it.
+const AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(750);
+
 /// Maximum cwd-resolution cache entries kept per server process. The cache is
 /// an optimization only; evicted entries are re-resolved through the writer.
 pub const DEFAULT_PROJECT_CACHE_MAX_ENTRIES: usize = 4096;
@@ -474,7 +482,7 @@ pub struct HookState {
     /// to this, so `$HOME` cannot become a catch-all (issue #103). `None`
     /// disables the guard. Held here so the hooks crate makes no env reads.
     pub home_dir: Option<String>,
-    /// `[auth].actor_proxy_secret` + `[auth].bearer_token`: can a trusted proxy
+    /// `[auth].actor_proxy_bearer_token`: can a trusted proxy
     /// assert identities on this server?
     ///
     /// Half of "does this deployment distinguish operators" — the other half
@@ -524,8 +532,8 @@ async fn owner_stamp_for_event(
 /// The human this request names, if any — as the typed [`IdentityKey`].
 ///
 /// [`ai_memory_core::ActorContext::identity_key`] rather than `ctx.user`, so
-/// the ingress that forwards only an OIDC subject claim is identified here in
-/// the same way the auth middleware already treats it — reading `user` alone
+/// the ingress that forwards an OIDC issuer/subject pair is identified here in
+/// the same way the auth middleware already treats it. Reading `user` alone
 /// would file every operator behind such a proxy as anonymous and hand them all
 /// one shared bucket.
 fn actor_identity(
@@ -598,9 +606,9 @@ async fn handle_hook(
     // Same reason: the skip-list header is read here, while the request
     // extensions still exist, and travels with the event into `process()`.
     let skip_webhooks = admission_skips(level_ext, &headers);
-    let actor_user = actor.as_ref().map(IdentityKey::storage_key);
+    let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let actor_key = ActorKey {
-        user: actor_user.clone(),
+        user: actor_storage_key.clone(),
         session_id: env.session_id.clone(),
     };
     if should_drop_subagent(&state, &env, &actor_key).await {
@@ -610,7 +618,7 @@ async fn handle_hook(
         warn!("hook ingest saturated; dropping event with 429");
         return (StatusCode::TOO_MANY_REQUESTS, "hook queue full");
     };
-    let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+    let rate_key = ingest_rate_key(&env, actor_storage_key.as_deref());
     if !state
         .ingest_rate
         .lock()
@@ -740,7 +748,7 @@ async fn handle_hook_batch(
     // captured once from the batch request (mirrors `handle_hook`).
     let actor = actor_identity(actor_ext);
     let skip_webhooks = admission_skips(level_ext, &headers);
-    let actor_user = actor.as_ref().map(IdentityKey::storage_key);
+    let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
     let mut accepted_indices = Vec::new();
     for (idx, mut item) in items.into_iter().enumerate() {
         // Same unconditional assistant-message backstop as `handle_hook`, applied
@@ -760,7 +768,7 @@ async fn handle_hook_batch(
             continue;
         };
         let actor_key = ActorKey {
-            user: actor_user.clone(),
+            user: actor_storage_key.clone(),
             session_id: env.session_id.clone(),
         };
         // Accept-but-drop subagent captures (see `handle_hook`): count the item
@@ -780,7 +788,7 @@ async fn handle_hook_batch(
                 Json(HookBatchAck::indexed(accepted_indices)),
             );
         };
-        let rate_key = ingest_rate_key(&env, actor_user.as_deref());
+        let rate_key = ingest_rate_key(&env, actor_storage_key.as_deref());
         if !state
             .ingest_rate
             .lock()
@@ -1229,28 +1237,22 @@ async fn fetch_and_accept_handoff(
     // most handoffs are consumed, so a webhook must be able to see it. Two
     // properties keep that policy call from costing the operator the baton:
     //
-    // - Only a webhook the operator set to `reject` is waited for. This
-    //   endpoint sits on the session-start hook path, whose script hard-timeouts
-    //   at ≤200 ms (AGENTS.md invariant 5), and an ignore-policy webhook cannot
-    //   refuse anything — waiting for one would spend that budget to learn
-    //   nothing, and losing the baton to an observer's round trip is exactly the
-    //   outcome admission on this path exists to avoid. Observers are notified
-    //   below, off the critical path, once the claim is durable. What is left
-    //   waiting is the SUM of the deciding webhooks' own `timeout_ms` — the
-    //   chain awaits them one after another — each defaulting to 2 s: the budget
-    //   is not enforced here, and `docs/admission-webhooks.md` tells the
-    //   operator to lower them on every `reject` hook that subscribes to this
-    //   op. Cutting it short instead would refuse a claim the webhook was
-    //   about to admit, on the path where the baton is normally consumed.
+    // - Only a webhook the operator set to `reject` is waited for. An
+    //   ignore-policy webhook cannot refuse anything, so observers are notified
+    //   below, off the critical path, once the claim is durable. The deciding
+    //   chain is also capped by `AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT`, below the
+    //   shortest shipped client's one-second deadline. Without that server-side
+    //   bound, a slow approval could consume the single-use baton after the
+    //   client had disconnected and could no longer receive it.
     // - A refusal (or a down reject-policy host, which a reject chain cannot
     //   tell apart) cancels only the CLAIM. The handoff stays open for the next
     //   session and the brief is still served, instead of the whole endpoint
     //   erroring out.
     let (handoff, admission_ctx) = match handoff {
         Some(pending) => {
-            let authorized = state
-                .wiki
-                .authorize_operation(
+            let authorized = tokio::time::timeout(
+                AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT,
+                state.wiki.authorize_operation(
                     ws,
                     proj,
                     ai_memory_wiki::AdmissionOp::HandoffAccept,
@@ -1259,12 +1261,20 @@ async fn fetch_and_accept_handoff(
                         .map(IdentityKey::to_actor_context)
                         .unwrap_or_default(),
                     skip_webhooks,
-                )
-                .await;
+                ),
+            )
+            .await;
             match authorized {
-                Ok(ctx) => (Some(pending), ctx),
-                Err(e) => {
+                Ok(Ok(ctx)) => (Some(pending), ctx),
+                Ok(Err(e)) => {
                     warn!(error = %e, "handoff claim refused by admission chain; leaving it open");
+                    (None, None)
+                }
+                Err(_) => {
+                    warn!(
+                        timeout_ms = AUTOMATIC_HANDOFF_ADMISSION_TIMEOUT.as_millis(),
+                        "handoff admission exceeded the session-start deadline; leaving it open"
+                    );
                     (None, None)
                 }
             }
@@ -1276,6 +1286,8 @@ async fn fetch_and_accept_handoff(
             .writer
             .accept_startup_context(
                 handoff.as_ref().map(|handoff| handoff.id),
+                ws,
+                proj,
                 agent,
                 None,
                 actor.as_ref().map(IdentityKey::storage_key),
@@ -2389,22 +2401,14 @@ async fn process(
         HookEvent::PostCompaction => Some("post-compaction"),
         _ => None,
     };
-    // Whose session this is, as recorded at session start (a qualified
-    // storage key). Everything written on its behalf is attributed to them
-    // rather than to whoever delivered the event; falls back to the request
-    // actor when the row predates owner recording (or the lookup fails),
-    // which is the previous behaviour.
-    let session_owner: Option<IdentityKey> = match state.reader.session_actor_user(session_id).await
-    {
-        // A stored owner is always a storage key this branch wrote; a value
-        // that does not parse names nobody rather than a guessed operator.
-        Ok(Some(owner)) => IdentityKey::from_storage_key(&owner),
-        Ok(None) => actor.clone(),
-        Err(e) => {
-            warn!(error = %e, "session owner lookup failed; attributing to the request actor");
-            actor.clone()
-        }
-    };
+    // Whose session this is, as recorded at session start (a qualified storage
+    // key). Everything written on its behalf is attributed to that owner, not
+    // to whoever delivered the event. A NULL owner stays shared. V40
+    // deliberately migrated legacy rows to NULL,
+    // and current actorless sessions use the same value; attributing either to
+    // whoever delivers SessionEnd would silently rebucket shared context. A
+    // store failure aborts this event rather than guessing an owner.
+    let session_owner = parse_session_owner(state.reader.session_actor_user(session_id).await?)?;
     let session_actor = session_owner
         .as_ref()
         .map(IdentityKey::to_actor_context)
@@ -2445,20 +2449,17 @@ async fn process(
                 // from the session row, not to whoever delivered this
                 // SessionEnd — a spool drain, an operator finalizing a stuck
                 // session, or a shared hook token can all carry a different
-                // identity. Falls back to the request actor for sessions that
-                // predate owner recording, and stays anonymous on a server
-                // without authentication.
+                // identity. NULL stays anonymous/shared, including rows that
+                // predate owner recording.
                 actor: session_actor.clone(),
             })
             .await?;
         // The baton follows the SESSION's owner, so it reaches the person who
         // was working, not whoever flushed the event. Run through the ownership
-        // gate again because `session_owner` above is an ATTRIBUTION value: it
-        // falls back to the request actor for sessions with no recorded owner,
-        // and a fallback name must not become an owner on a deployment that
-        // does not tell its operators apart — that is exactly the case where
-        // the baton would land in a bucket the operator's other transport
-        // cannot read.
+        // gate again because even an attributed session remains shared on a
+        // deployment that does not tell its operators apart — otherwise the
+        // baton lands in a bucket the operator's actorless transport cannot
+        // read.
         let handoff_owner = owner_stamp_for_event(state, session_owner.as_ref()).await;
         let handoff = (!managed).then(|| {
             build_auto_handoff(
@@ -2583,6 +2584,17 @@ async fn process(
     }
 
     Ok(())
+}
+
+/// Parse the persisted owner without turning corrupt owned data into shared
+/// data. Only SQL NULL has the intentional legacy/shared meaning.
+fn parse_session_owner(owner: Option<String>) -> anyhow::Result<Option<IdentityKey>> {
+    owner
+        .map(|owner| {
+            IdentityKey::from_storage_key(&owner)
+                .ok_or_else(|| anyhow::anyhow!("malformed stored session owner identity"))
+        })
+        .transpose()
 }
 
 fn resolve_session_id(env: &HookEnvelope) -> anyhow::Result<SessionId> {
@@ -5874,12 +5886,12 @@ mod tests {
     }
 
     /// `GET /handoff` is the session-start delivery path, and it filters by the
-    /// human the request names. An ingress that forwards only the OIDC subject
-    /// claim names one — the auth layer resolves it to `AuthLevel::User` — so
+    /// human the request names. An ingress that forwards an OIDC issuer/subject
+    /// pair names one — the auth layer resolves it to `AuthLevel::User` — so
     /// reading `actor.user` here left a proxied operator unable to pick up the
     /// baton their own previous session left them.
     #[tokio::test]
-    async fn sub_only_proxy_session_start_claims_its_own_baton() {
+    async fn oidc_proxy_session_start_claims_its_own_baton() {
         let tmp = TempDir::new().unwrap();
         let state = make_state(&tmp).await;
         state
@@ -5898,7 +5910,10 @@ mod tests {
                 // Stamped through the contract, exactly as this operator's own
                 // previous SessionEnd would have: a qualified subject key.
                 owner_user: ai_memory_core::owner_stamp(
-                    Some(&IdentityKey::Subject("oidc-subject-alice".into())),
+                    Some(&IdentityKey::Subject {
+                        issuer: "https://idp.example".into(),
+                        subject: "oidc-subject-alice".into(),
+                    }),
                     true,
                 ),
             })
@@ -5920,6 +5935,7 @@ mod tests {
                     session_id: None,
                 }),
                 Some(axum::Extension(ai_memory_core::ActorContext {
+                    issuer: Some("https://idp.example".into()),
                     sub: Some("oidc-subject-alice".into()),
                     ..ai_memory_core::ActorContext::default()
                 })),
@@ -6010,6 +6026,61 @@ mod tests {
                 .is_some(),
             "the operator's own stdio transport cannot see the baton it produced",
         );
+    }
+
+    /// A shared session stays shared even when a named operator delivers its
+    /// SessionEnd. NULL is both the migration value for pre-V40 sessions and
+    /// the intentional owner of current actorless sessions; neither may be
+    /// reassigned to the finalizer.
+    #[tokio::test]
+    async fn shared_session_end_is_not_rebucketed_to_the_delivery_actor() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+
+        process(
+            &state,
+            session_envelope("user-prompt-submit", "shared-session", "/tmp/scratch"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            session_envelope("session-end", "shared-session", "/tmp/scratch"),
+            Some(IdentityKey::User("alice".into())),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let handoff = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("SessionEnd writes a handoff");
+        assert_eq!(
+            handoff.owner_user, None,
+            "the delivery actor took ownership of a shared session's baton",
+        );
+    }
+
+    #[test]
+    fn malformed_session_owner_does_not_become_shared() {
+        assert_eq!(parse_session_owner(None).unwrap(), None);
+        assert_eq!(
+            parse_session_owner(Some("user:alice".into())).unwrap(),
+            Some(IdentityKey::User("alice".into()))
+        );
+        assert!(parse_session_owner(Some("user:   ".into())).is_err());
+        assert!(parse_session_owner(Some("oidc:3:idp".into())).is_err());
     }
 
     /// A blocking, `Reject`-policy webhook on an address nothing answers. To a
@@ -6501,8 +6572,7 @@ mod tests {
         (body, started.elapsed())
     }
 
-    /// `GET /handoff` is called synchronously by the session-start hook, which
-    /// hard-timeouts at ≤200 ms (AGENTS.md invariant 5). Under the default
+    /// `GET /handoff` is called synchronously by the session-start hook. Under the default
     /// `ignore` policy a webhook has nothing to decide — one ordinary observer
     /// on a host that stalls must therefore neither hold the endpoint nor cost
     /// the operator the baton, which is the whole point of admitting this op.
@@ -6541,10 +6611,9 @@ mod tests {
     /// deliberate request to gate the claim, so it is still waited for and a
     /// host that never answers still leaves the baton open.
     ///
-    /// The 200 ms below is this test's own choice, not the engine's: what the
-    /// endpoint actually waits for is the hook's `timeout_ms`, whose default is
-    /// ten times that — see
-    /// [`a_reject_webhook_on_its_default_timeout_outlasts_the_hook_budget`].
+    /// The 200 ms below is this test's own webhook timeout choice. It completes
+    /// before the aggregate server deadline, so the webhook's refusal is what
+    /// decides the result.
     #[tokio::test]
     async fn reject_policy_webhook_still_gates_the_session_start_claim() {
         let addr = hung_webhook_host().await;
@@ -6572,15 +6641,11 @@ mod tests {
         );
     }
 
-    /// What actually bounds the session-start claim, on the config an operator
-    /// gets by writing no `timeout_ms` at all: the webhook's own default, 2 s —
-    /// an order of magnitude past the ≤200 ms budget of the script calling this
-    /// endpoint. `docs/admission-webhooks.md` says so and tells operators to set
-    /// `timeout_ms` themselves if they want the round trip to fit; this pins the
-    /// number that documentation quotes, since only a `reject` hook is waited
-    /// for and nothing else in the chain shortens it.
+    /// The webhook default is longer than the shortest client deadline. The
+    /// server must stop first and leave the baton open; otherwise a late
+    /// approval can consume context after the client has disconnected.
     #[tokio::test]
-    async fn a_reject_webhook_on_its_default_timeout_outlasts_the_hook_budget() {
+    async fn default_reject_timeout_is_capped_before_the_client_disconnects() {
         let addr = hung_webhook_host().await;
         // Built the way the operator's config is: through serde, so the
         // omitted `timeout_ms` is the engine's default and not a literal
@@ -6607,12 +6672,8 @@ mod tests {
 
         let (body, elapsed) = session_start_handoff(&state, &cwd).await;
         assert!(
-            elapsed > Duration::from_millis(200),
-            "the claim is NOT bounded by the 200 ms hook budget; it waited {elapsed:?}",
-        );
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "but it is bounded by the hook's own timeout_ms: {elapsed:?}",
+            elapsed < Duration::from_millis(1_500),
+            "the server must abandon admission before the shell client is long gone: {elapsed:?}",
         );
         assert!(
             body.is_empty(),

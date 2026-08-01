@@ -124,7 +124,7 @@ fn guarded_chain(addr: std::net::SocketAddr) -> ai_memory_wiki::AdmissionChain {
 }
 
 const ROOT_TOKEN: &str = "the-root-token";
-const PROXY_SECRET: &str = "proxy-shared-secret";
+const PROXY_TOKEN: &str = "the-proxy-token";
 
 struct Harness {
     router: Router,
@@ -139,9 +139,9 @@ async fn harness(chain: ai_memory_wiki::AdmissionChain) -> Harness {
 }
 
 /// The same server behind the production `require_bearer` layer with
-/// `[auth].actor_proxy_secret` configured: the only configuration in which a
-/// caller can be BOTH named and non-admin, and therefore the only one where the
-/// `any_owner` gate has anybody to refuse.
+/// `[auth].actor_proxy_bearer_token` configured: the only configuration in
+/// which a caller can be BOTH named and non-admin, and therefore the only one
+/// where the `any_owner` gate has anybody to refuse.
 async fn proxied_harness(chain: ai_memory_wiki::AdmissionChain) -> Harness {
     build_harness(chain, true).await
 }
@@ -180,7 +180,7 @@ async fn build_harness(chain: ai_memory_wiki::AdmissionChain, proxy_auth: bool) 
                 user: Some("dj".to_string()),
                 ..ai_memory_core::ActorContext::default()
             })
-            .with_trusted_proxy(PROXY_SECRET);
+            .with_trusted_proxy_bearer(PROXY_TOKEN);
         router = router.layer(axum::middleware::from_fn_with_state(
             Arc::new(auth_state),
             require_bearer,
@@ -198,8 +198,7 @@ async fn build_harness(chain: ai_memory_wiki::AdmissionChain, proxy_auth: bool) 
 /// Headers a trusted proxy sends for a named, non-root end user.
 fn proxied_as(user: &'static str) -> Vec<(&'static str, &'static str)> {
     vec![
-        ("authorization", "Bearer the-root-token"),
-        ("x-memory-actor-proxy-secret", PROXY_SECRET),
+        ("authorization", "Bearer the-proxy-token"),
         ("x-memory-actor-user", user),
     ]
 }

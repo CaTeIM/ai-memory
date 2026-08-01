@@ -141,7 +141,7 @@ pub struct AdminState {
     /// admin-only tests).
     pub scope_invalidator: Option<ScopeInvalidator>,
     /// True when a trusted authenticating proxy is configured to assert
-    /// end-user identities (`[auth].actor_proxy_secret`).
+    /// end-user identities (`[auth].actor_proxy_bearer_token`).
     ///
     /// Proxy-asserted operators never get a `users` row, so `users_exist()`
     /// alone answers "does this deployment distinguish operators" with a
@@ -601,7 +601,7 @@ async fn require_root_for_multiuser_admin(
     // with no `users` rows would wave a proxy-asserted `AuthLevel::User` caller
     // through every operational route below — purge, delete-page, backup — and
     // only `/admin/users*` would survive on its own inner root check.
-    let multi_user_enabled = match state
+    let distinguishes_operators = match state
         .reader
         .distinguishes_operators(state.trusted_proxy_identity)
         .await
@@ -618,7 +618,7 @@ async fn require_root_for_multiuser_admin(
                 .into_response();
         }
     };
-    match level.authorize(Capability::Admin, multi_user_enabled) {
+    match level.authorize(Capability::Admin, distinguishes_operators) {
         Ok(()) => next.run(req).await,
         Err(e) => (
             authz_status(e),
@@ -5110,7 +5110,9 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_core::{
+        ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
+    };
     use ai_memory_core::{Sanitized, Sanitizer};
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
@@ -5245,6 +5247,8 @@ mod tests {
         let other_agent = SessionId::new();
         let other_scope = SessionId::new();
         let ended = SessionId::new();
+        let alice = SessionId::new();
+        let bob = SessionId::new();
         for (id, project_id, agent) in [
             (older, target, AgentKind::Codex),
             (other_agent, target, AgentKind::ClaudeCode),
@@ -5266,6 +5270,20 @@ mod tests {
                 .unwrap();
         }
         store.writer.end_session(ended, None).await.unwrap();
+        for (id, user) in [(alice, "alice"), (bob, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: AgentKind::Codex,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
 
         let router = admin_router(AdminState {
             writer: store.writer.clone(),
@@ -5330,6 +5348,37 @@ mod tests {
             .collect();
         assert!(ids.contains(&latest.to_string().as_str()));
         assert!(ids.contains(&older.to_string().as_str()));
+
+        // A named operator gets their own open sessions plus shared legacy
+        // sessions, never a colleague's. This is the exact route consumed by
+        // the destructive `finalize-session` command.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&alice.to_string().as_str()));
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+        assert!(!ids.contains(&bob.to_string().as_str()));
 
         // Unknown agent kind fails closed with a 400.
         let resp = router
@@ -7640,6 +7689,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_topology_gates_admin_without_db_users() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: true,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match req
+                    .headers()
+                    .get("x-test-auth-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => ai_memory_core::AuthLevel::Root,
+                    Some("user") => ai_memory_core::AuthLevel::User,
+                    _ => ai_memory_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        for (level, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("user"), StatusCode::FORBIDDEN),
+            (Some("root"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(level) = level {
+                request = request.header("x-test-auth-level", level);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "level={level:?}");
+        }
     }
 
     #[tokio::test]

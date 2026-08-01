@@ -7,7 +7,7 @@
 //! handoff was simply lost.
 //!
 //! Owners are stored as qualified [`IdentityKey::storage_key`] TEXT
-//! (`user:alice`, `sub:…`), never raw names. Every owner and filter here is
+//! (`user:alice`, `oidc:…`), never raw names. Every owner and filter here is
 //! built through the contract's own API — `owner_stamp`,
 //! [`OwnerFilter::for_actor_context`], [`IdentityKey::storage_key`] — so these
 //! tests exercise the same encoding production uses rather than a hand-written
@@ -115,6 +115,127 @@ async fn one_operators_handoff_is_not_delivered_to_another() {
     assert_eq!(alice.owner_user, Some(operator("alice")));
 }
 
+/// The SQL query must exclude foreign rows before it deserializes any of their
+/// prompt-derived fields. Besides avoiding unnecessary exposure and work, this
+/// means corruption in Bob's private row cannot deny Alice access to her own
+/// valid baton.
+#[tokio::test]
+async fn latest_lookup_filters_foreign_rows_before_deserialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    store
+        .writer
+        .insert_handoff(handoff(ws, proj, "alice's valid baton", Some("alice")))
+        .await
+        .unwrap();
+    let bob = store
+        .writer
+        .insert_handoff(handoff(ws, proj, "bob's private baton", Some("bob")))
+        .await
+        .unwrap();
+
+    // Simulate a corrupt row without routing invalid JSON through the typed
+    // writer. With post-fetch filtering this row is deserialized first and the
+    // whole lookup fails, even though Alice is not authorized to read it.
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE handoffs SET open_questions = '{' WHERE id = ?1",
+        rusqlite::params![bob.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let alice = store
+        .reader
+        .latest_open_handoff(ws, proj, None, filter_for("alice"))
+        .await
+        .expect("a foreign corrupt row must not affect Alice's lookup")
+        .expect("Alice keeps her valid baton");
+    assert_eq!(alice.summary, "alice's valid baton");
+}
+
+#[tokio::test]
+async fn ownership_writes_reject_malformed_identity_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let invalid_session = ai_memory_core::SessionId::new();
+    assert!(
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: invalid_session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: Some("alice".into()),
+            })
+            .await
+            .is_err()
+    );
+    let mut invalid_handoff = handoff(ws, proj, "invalid", None);
+    invalid_handoff.owner_user = Some("user:   ".into());
+    assert!(store.writer.insert_handoff(invalid_handoff).await.is_err());
+
+    let id = store
+        .writer
+        .insert_handoff(handoff(ws, proj, "valid", Some("alice")))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .accept_handoff(
+                id,
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                None,
+                Some("alice".into()),
+                filter_for("alice"),
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .writer
+            .accept_handoff(
+                id,
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                None,
+                Some(operator("bob")),
+                filter_for("alice"),
+                None,
+            )
+            .await
+            .is_err(),
+        "the accepting identity and owner filter must not disagree"
+    );
+    assert_eq!(
+        store.reader.handoff_by_id(id).await.unwrap().unwrap().state,
+        ai_memory_core::HandoffState::Open
+    );
+
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE handoffs SET owner_user = 'user:   ' WHERE id = ?1",
+        rusqlite::params![id.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(
+        store.reader.handoff_by_id(id).await.is_err(),
+        "raw database corruption must not materialize an invalid owner"
+    );
+}
+
 /// The variant is part of the identity: a username equal to somebody else's
 /// OIDC subject is a DIFFERENT operator, and neither may drain the other's
 /// baton. Raw TEXT owners would have merged these two people.
@@ -124,7 +245,10 @@ async fn a_username_does_not_alias_an_equal_subject() {
     let store = Store::open(tmp.path()).unwrap();
     let (ws, proj) = scope(&store).await;
 
-    let by_subject = IdentityKey::Subject("alice".into());
+    let by_subject = IdentityKey::Subject {
+        issuer: "https://idp.example".into(),
+        subject: "alice".into(),
+    };
     let mut owned = handoff(ws, proj, "the subject's baton", None);
     owned.owner_user = owner_stamp(Some(&by_subject), true);
     store.writer.insert_handoff(owned).await.unwrap();
@@ -137,11 +261,12 @@ async fn a_username_does_not_alias_an_equal_subject() {
             .await
             .unwrap()
             .is_none(),
-        "user:alice must not receive sub:alice's baton"
+        "user:alice must not receive the OIDC-owned baton"
     );
     // The subject-identified caller — the filter the auth layer builds for an
-    // ingress that forwards only the `sub` claim.
+    // ingress that forwards the complete issuer/subject pair.
     let sub_filter = OwnerFilter::for_actor_context(&ActorContext {
+        issuer: Some("https://idp.example".into()),
         sub: Some("alice".into()),
         ..ActorContext::default()
     });
@@ -208,6 +333,8 @@ async fn another_operator_cannot_claim_the_handoff() {
         .writer
         .accept_handoff(
             id,
+            ws,
+            proj,
             AgentKind::ClaudeCode,
             None,
             Some(operator("bob")),
@@ -223,6 +350,8 @@ async fn another_operator_cannot_claim_the_handoff() {
         .writer
         .accept_handoff(
             id,
+            ws,
+            proj,
             AgentKind::ClaudeCode,
             None,
             Some(operator("alice")),
@@ -237,6 +366,8 @@ async fn another_operator_cannot_claim_the_handoff() {
         .writer
         .accept_handoff(
             id,
+            ws,
+            proj,
             AgentKind::ClaudeCode,
             None,
             Some(operator("alice")),
@@ -313,7 +444,7 @@ async fn another_operator_cannot_cancel_the_handoff() {
     assert!(
         !store
             .writer
-            .cancel_handoff(id, filter_for("bob"))
+            .cancel_handoff(id, ws, proj, filter_for("bob"))
             .await
             .unwrap(),
         "Bob must not cancel Alice's handoff"
@@ -321,10 +452,78 @@ async fn another_operator_cannot_cancel_the_handoff() {
     assert!(
         store
             .writer
-            .cancel_handoff(id, filter_for("alice"))
+            .cancel_handoff(id, ws, proj, filter_for("alice"))
             .await
             .unwrap(),
         "the owner can cancel her own"
+    );
+}
+
+/// Destructive operations must recheck the resolved scope in the same UPDATE
+/// that changes state. A preceding scoped read is not sufficient because a
+/// concurrent lifecycle operation could move the project between that read and
+/// the writer command.
+#[tokio::test]
+async fn destructive_handoff_updates_recheck_scope_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app".to_string(), None)
+        .await
+        .unwrap();
+    let id = store
+        .writer
+        .insert_handoff(handoff(ws, proj, "scoped baton", Some("alice")))
+        .await
+        .unwrap();
+
+    assert!(
+        !store
+            .writer
+            .accept_handoff(
+                id,
+                ws,
+                other_proj,
+                AgentKind::ClaudeCode,
+                None,
+                Some(operator("alice")),
+                OwnerFilter::Any,
+                None,
+            )
+            .await
+            .unwrap(),
+        "even a root recovery claim must not cross its resolved project"
+    );
+    assert!(
+        !store
+            .writer
+            .cancel_handoff(id, ws, other_proj, OwnerFilter::Any)
+            .await
+            .unwrap(),
+        "even a root recovery cancel must not cross its resolved project"
+    );
+    assert_eq!(
+        store.reader.handoff_by_id(id).await.unwrap().unwrap().state,
+        ai_memory_core::HandoffState::Open
+    );
+    assert!(
+        store
+            .writer
+            .accept_handoff(
+                id,
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                None,
+                Some(operator("alice")),
+                OwnerFilter::Any,
+                None,
+            )
+            .await
+            .unwrap(),
+        "the exact project can still claim the handoff"
     );
 }
 
@@ -412,6 +611,8 @@ async fn handoff_listing_is_owner_scoped_and_covers_every_state() {
         .writer
         .accept_handoff(
             alice,
+            ws,
+            proj,
             AgentKind::ClaudeCode,
             None,
             Some(operator("alice")),
@@ -431,8 +632,8 @@ async fn handoff_listing_is_owner_scoped_and_covers_every_state() {
 }
 
 /// The owner key is not a validated identifier: behind a trusted proxy what
-/// follows the `sub:` prefix is whatever `X-Memory-Actor-Sub` carried, an OIDC
-/// subject the engine never parses. A value carrying a single quote therefore
+/// follows the `oidc:` prefix includes the OIDC identity a trusted proxy
+/// asserted. A value carrying a single quote therefore
 /// has to filter exactly like any other one, on every surface that splices the
 /// owner predicate into SQL — the listing (with and without a state filter) and
 /// all three briefing counts.
@@ -607,6 +808,8 @@ async fn automatic_supersession_does_not_reach_across_operators() {
         .writer
         .accept_handoff(
             alice_newest,
+            ws,
+            proj,
             AgentKind::ClaudeCode,
             None,
             Some(operator("alice")),

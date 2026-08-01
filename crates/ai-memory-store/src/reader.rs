@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use ai_memory_core::{
     AgentKind, AutoImproveProposalId, AutoImproveRunId, Handoff, HandoffId, HandoffState,
-    ManagedRunId, Observation, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath,
-    ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
+    IdentityKey, ManagedRunId, Observation, ObservationId, ObservationKind, OwnerFilter, PageId,
+    PagePath, ProjectId, SessionId, User, UserId, WorkspaceId, WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -2969,19 +2969,26 @@ impl ReaderPool {
         owner_filter: OwnerFilter,
     ) -> StoreResult<Option<Handoff>> {
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare(
+            // Ownership belongs in the query, not just in
+            // `is_handoff_candidate`: prompt-derived fields from another
+            // operator must never be loaded or deserialized for this caller.
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 3);
+            let sql = format!(
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
                         owner_user, accepted_by_user \
                  FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open' \
-                 ORDER BY created_at DESC",
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
-                row_to_handoff,
-            )?;
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause} \
+                 ORDER BY created_at DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> =
+                vec![workspace_id.as_bytes(), project_id.as_bytes()];
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let rows = stmt.query_map(binds.as_slice(), row_to_handoff)?;
             let mut selected: Option<Handoff> = None;
             for r in rows {
                 let handoff = r??;
@@ -3018,32 +3025,12 @@ impl ReaderPool {
     ) -> StoreResult<Vec<Handoff>> {
         let state = state.map(|s| s.as_str().to_string());
         self.with_conn(move |conn| {
-            let state_clause = if state.is_some() {
-                " AND state = ?3"
-            } else {
-                ""
-            };
             // Push the owner predicate and the limit into SQL rather than
             // filtering a fully materialised result set in Rust: without them
             // this reads (and sorts) every handoff the project has ever
             // accumulated, and the caller's limit provides no protection
             // because it is applied after the rows are already loaded.
-            // The owner key takes the first index the state filter left free, so
-            // the two optional predicates cannot claim the same slot.
-            let owner_index = if state.is_some() { 4 } else { 3 };
-            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, owner_index);
-            // Bounded even when the caller asks for a large page.
-            let sql_limit = limit.clamp(1, 500);
-            let sql = format!(
-                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
-                        cwd, summary, open_questions, next_steps, files_touched, state, \
-                        created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
-                 FROM handoffs \
-                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause}{owner_clause} \
-                 ORDER BY created_at DESC \
-                 LIMIT {sql_limit}"
-            );
+            let (sql, owner_param) = handoff_listing_sql(state.is_some(), &owner_filter, limit);
             let mut stmt = conn.prepare(&sql)?;
             let mut binds: Vec<&dyn rusqlite::ToSql> =
                 vec![workspace_id.as_bytes(), project_id.as_bytes()];
@@ -3079,6 +3066,49 @@ impl ReaderPool {
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
                 )
+                .optional()?;
+            row.transpose()
+        })
+        .await
+    }
+
+    /// Look up a handoff by id within an exact scope and ownership boundary.
+    ///
+    /// This is the object-authorization form used by exact-id operations. The
+    /// scope and owner predicates run before prompt-derived columns are loaded,
+    /// so callers cannot distinguish a foreign id from an absent one or inspect
+    /// another operator's malformed/private row as a side effect of checking it.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn handoff_by_id_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        handoff_id: HandoffId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<Option<Handoff>> {
+        self.with_conn(move |conn| {
+            let (owner_clause, owner_param) = handoff_owner_sql(&owner_filter, 4);
+            let sql = format!(
+                "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                        cwd, summary, open_questions, next_steps, files_touched, state, \
+                        created_at, accepted_by, accepted_at, accepted_by_session, \
+                        owner_user, accepted_by_user \
+                 FROM handoffs \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND id = ?3{owner_clause}"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                handoff_id.as_bytes(),
+            ];
+            if let Some(owner) = owner_param.as_ref() {
+                binds.push(owner);
+            }
+            let row = stmt
+                .query_row(binds.as_slice(), row_to_handoff)
                 .optional()?;
             row.transpose()
         })
@@ -5538,6 +5568,56 @@ impl ReaderPool {
     }
 }
 
+/// Build the bounded history query and its optional owner binding.
+///
+/// A named operator reads two disjoint ranges: shared (`NULL`) and their own
+/// owner key. Expressing those ranges as `OR` makes SQLite prefer the
+/// project-wide timestamp index to satisfy `ORDER BY`, scanning other users'
+/// history until it finds enough visible rows. `UNION ALL` lets SQLite merge
+/// two already ordered owner-index ranges and stop at the requested limit.
+fn handoff_listing_sql(
+    has_state: bool,
+    owner_filter: &OwnerFilter,
+    limit: usize,
+) -> (String, Option<String>) {
+    const SELECT: &str = "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
+                cwd, summary, open_questions, next_steps, files_touched, state, \
+                created_at, accepted_by, accepted_at, accepted_by_session, \
+                owner_user, accepted_by_user \
+         FROM handoffs";
+    let state_clause = if has_state { " AND state = ?3" } else { "" };
+    let owner_index = if has_state { 4 } else { 3 };
+    let sql_limit = limit.clamp(1, 500);
+    match owner_filter {
+        OwnerFilter::User(owner) => (
+            format!(
+                "{SELECT} \
+                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause} \
+                   AND owner_user IS NULL \
+                 UNION ALL \
+                 {SELECT} \
+                 WHERE workspace_id = ?1 AND project_id = ?2{state_clause} \
+                   AND owner_user = ?{owner_index} \
+                 ORDER BY created_at DESC \
+                 LIMIT {sql_limit}"
+            ),
+            Some(owner.clone()),
+        ),
+        _ => {
+            let (owner_clause, owner_param) = handoff_owner_sql(owner_filter, owner_index);
+            (
+                format!(
+                    "{SELECT} \
+                     WHERE workspace_id = ?1 AND project_id = ?2{state_clause}{owner_clause} \
+                     ORDER BY created_at DESC \
+                     LIMIT {sql_limit}"
+                ),
+                owner_param,
+            )
+        }
+    }
+}
+
 /// Map a `(workspace, project, path, title, kind)` row to a [`HealthPage`].
 fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage> {
     Ok(HealthPage {
@@ -6116,6 +6196,16 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let accepted_by_user: Option<String> = row.get(17)?;
 
     Ok((|| {
+        for (label, value) in [
+            ("handoff owner", owner_user.as_deref()),
+            ("accepting handoff operator", accepted_by_user.as_deref()),
+        ] {
+            if value.is_some_and(|value| IdentityKey::from_storage_key(value).is_none()) {
+                return Err(StoreError::MalformedRecord(format!(
+                    "{label} is not a qualified identity storage key"
+                )));
+            }
+        }
         let open_questions: Vec<String> = serde_json::from_str(&open_q_json)?;
         let next_steps: Vec<String> = serde_json::from_str(&next_s_json)?;
         let files_touched: Vec<String> = serde_json::from_str(&files_json)?;
@@ -6399,13 +6489,40 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
 
 #[cfg(test)]
 mod tests {
-    use super::{entity_query_tokens, like_escape};
+    use super::{entity_query_tokens, handoff_listing_sql, like_escape};
     use crate::Store;
 
     use ai_memory_core::{
-        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, NewSession, ProjectId, SessionId,
-        WorkspaceId,
+        AgentKind, Handoff, HandoffId, HandoffState, NewHandoff, NewSession, OwnerFilter,
+        ProjectId, SessionId, WorkspaceId,
     };
+
+    #[test]
+    fn named_handoff_listing_uses_owner_index_for_both_ranges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let (sql, owner) = handoff_listing_sql(false, &OwnerFilter::User("user:alice".into()), 50);
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = stmt
+            .query_map(
+                rusqlite::params![ws.as_bytes(), proj.as_bytes(), owner.unwrap()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.contains("idx_handoffs_project_owner_recent"))
+                .count(),
+            2,
+            "shared and owned ranges must both use the owner index: {details:?}"
+        );
+    }
 
     #[test]
     fn authority_candidate_window_is_bounded_and_saturating() {
@@ -6785,6 +6902,8 @@ mod tests {
             .writer
             .accept_handoff(
                 selected.id,
+                ws,
+                proj,
                 AgentKind::Codex,
                 None,
                 None,

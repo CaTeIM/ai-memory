@@ -91,24 +91,28 @@ fn configured(value: Option<&String>) -> bool {
     value.is_some_and(|v| !v.trim().is_empty())
 }
 
-/// A trusted proxy that asserts end-user identities needs an operator to be
-/// root.
-///
-/// `require_bearer` downgrades every proxy-named caller to `AuthLevel::User`
-/// unless the asserted username matches `[auth].root_username`. With no root
-/// username configured that comparison can never succeed, so no request through
-/// the proxy — the only ingress such a deployment has — could ever reach a
-/// root-only capability: `/admin/users` would 403, the first DB user could
-/// never be created, and the server would come up permanently locked out of its
-/// own administration. Refuse to start instead of failing later, per request.
+/// Validate the trusted proxy's least-privilege credential and optional stable
+/// root identity before binding the server.
 fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
-    if configured(auth.actor_proxy_secret.as_ref()) && !configured(auth.root_username.as_ref()) {
+    let proxy_enabled = configured(auth.actor_proxy_bearer_token.as_ref());
+    if proxy_enabled && !configured(auth.bearer_token.as_ref()) {
         anyhow::bail!(
-            "[auth].actor_proxy_secret is set but [auth].root_username is not: every identity the \
-             proxy asserts is downgraded to a non-root user except the configured root operator, \
-             so with no root_username nothing could ever perform a root-only operation (user \
-             management, admin routes). Set [auth].root_username to the operator who administers \
-             this server, or unset [auth].actor_proxy_secret"
+            "[auth].actor_proxy_bearer_token requires [auth].bearer_token so administration keeps a distinct root credential"
+        );
+    }
+    if proxy_enabled
+        && auth.actor_proxy_bearer_token.as_deref().map(str::trim)
+            == auth.bearer_token.as_deref().map(str::trim)
+    {
+        anyhow::bail!(
+            "[auth].actor_proxy_bearer_token must differ from [auth].bearer_token; sharing the root credential would let a missing proxy identity fall through as root"
+        );
+    }
+    let root_issuer = configured(auth.root_issuer.as_ref());
+    let root_subject = configured(auth.root_subject.as_ref());
+    if root_issuer != root_subject {
+        anyhow::bail!(
+            "[auth].root_issuer and [auth].root_subject must be configured together because an OIDC subject is unique only within its issuer"
         );
     }
     Ok(())
@@ -116,13 +120,10 @@ fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
 
 /// Can a trusted proxy actually assert identities on this server?
 ///
-/// Both halves are required: the overlay only runs on requests that
-/// authenticated with the root bearer, so a proxy secret without
-/// `[auth].bearer_token` asserts nothing (and only warns, below). The MCP admin
-/// gates read this to know that distinct operators are in play even though a
-/// proxied deployment never writes a `users` row.
+/// The MCP admin gates read this to know that distinct operators are in play
+/// even when a proxied deployment never writes a `users` row.
 fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
-    configured(auth.actor_proxy_secret.as_ref()) && configured(auth.bearer_token.as_ref())
+    configured(auth.actor_proxy_bearer_token.as_ref())
 }
 
 struct ConsolidatorSetup {
@@ -638,38 +639,38 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             //     created. Admin mode separately switches on a fresh
             //     store-backed users-exist read.
             let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
-            let root_user = config.auth.root_username.clone();
-            if root_user.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            let root_user = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_issuer = config
+                .auth
+                .root_issuer
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_subject = config
+                .auth
+                .root_subject
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            if root_user.is_some() || root_issuer.is_some() {
                 auth_state = auth_state.with_root_actor(ai_memory_core::ActorContext {
                     user: root_user,
+                    issuer: root_issuer,
+                    sub: root_subject,
                     name: config.auth.root_name.clone(),
                     email: config.auth.root_email.clone(),
                     ..ai_memory_core::ActorContext::default()
                 });
             }
-            if let Some(secret) = config
+            if let Some(proxy_token) = config
                 .auth
-                .actor_proxy_secret
+                .actor_proxy_bearer_token
                 .as_ref()
                 .filter(|s| !s.trim().is_empty())
             {
-                // The overlay is only reachable from the root-bearer rung, so
-                // a proxy secret without a bearer token silently does nothing.
-                // Say so rather than leaving the operator believing per-user
-                // attribution is on.
-                if config
-                    .auth
-                    .bearer_token
-                    .as_deref()
-                    .is_none_or(|token| token.trim().is_empty())
-                {
-                    tracing::warn!(
-                        "[auth].actor_proxy_secret is set but [auth].bearer_token is not; \
-                         trusted-proxy identity is inactive because it only applies to \
-                         requests authenticated with the root bearer token"
-                    );
-                }
-                auth_state = auth_state.with_trusted_proxy(secret.clone());
+                auth_state = auth_state.with_trusted_proxy_bearer(proxy_token.clone());
             }
             if let Some(pepper) = config
                 .auth
@@ -1585,6 +1586,51 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_requires_distinct_credentials() {
+        let missing_root = AuthSettings {
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&missing_root).is_err());
+
+        let shared = AuthSettings {
+            bearer_token: Some("same-token".into()),
+            actor_proxy_bearer_token: Some(" same-token ".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&shared).is_err());
+
+        let valid = AuthSettings {
+            bearer_token: Some("root-token".into()),
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&valid).is_ok());
+        assert!(trusted_proxy_identity_enabled(&valid));
+    }
+
+    #[test]
+    fn root_oidc_identity_requires_issuer_and_subject_together() {
+        for (issuer, subject, valid) in [
+            (None, None, true),
+            (Some("https://idp.example"), None, false),
+            (None, Some("root-subject"), false),
+            (Some("https://idp.example"), Some("root-subject"), true),
+        ] {
+            let auth = AuthSettings {
+                root_issuer: issuer.map(str::to_string),
+                root_subject: subject.map(str::to_string),
+                ..AuthSettings::default()
+            };
+            assert_eq!(
+                validate_trusted_proxy_auth(&auth).is_ok(),
+                valid,
+                "issuer={issuer:?}, subject={subject:?}"
+            );
         }
     }
 

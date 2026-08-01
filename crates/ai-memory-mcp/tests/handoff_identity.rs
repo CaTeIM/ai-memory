@@ -4,8 +4,8 @@
 //! author cannot reach:
 //!
 //! 1. **Which field names the human.** The auth middleware resolves a proxy
-//!    that asserts only an OIDC subject claim to `AuthLevel::User` — it named
-//!    somebody. If ownership keys on `actor.user` alone, that same request is
+//!    that asserts a complete OIDC issuer/subject pair to `AuthLevel::User` —
+//!    it named somebody. If ownership keys on `actor.user` alone, that request is
 //!    "nobody" when a row is stamped, so every operator behind such a proxy
 //!    writes into the one shared bucket and reads each other's prompt trails.
 //! 2. **Whether the deployment tells operators apart at all.** A server with
@@ -36,7 +36,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 const ROOT_TOKEN: &str = "the-root-token";
-const PROXY_SECRET: &str = "proxy-shared-secret";
+const PROXY_TOKEN: &str = "the-proxy-token";
 
 struct Harness {
     /// The HTTP transport: production `require_bearer` in front of `/mcp`.
@@ -64,7 +64,7 @@ fn mount(server: AiMemoryServer) -> Router {
 }
 
 /// `root_username` is `[auth].root_username`; `proxy` is
-/// `[auth].actor_proxy_secret`, which is also what makes the deployment
+/// `[auth].actor_proxy_bearer_token`, which is also what makes the deployment
 /// distinguish operators without ever writing a `users` row.
 async fn harness(root_username: Option<&str>, proxy: bool) -> Harness {
     let tmp = TempDir::new().expect("tempdir");
@@ -93,7 +93,7 @@ async fn harness(root_username: Option<&str>, proxy: bool) -> Harness {
         });
     }
     if proxy {
-        auth_state = auth_state.with_trusted_proxy(PROXY_SECRET);
+        auth_state = auth_state.with_trusted_proxy_bearer(PROXY_TOKEN);
     }
     let http = mount(server.clone()).layer(axum::middleware::from_fn_with_state(
         Arc::new(auth_state),
@@ -155,11 +155,11 @@ fn root_headers() -> Vec<(&'static str, &'static str)> {
 }
 
 fn proxied(header: &'static str, value: &'static str) -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("authorization", "Bearer the-root-token"),
-        ("x-memory-actor-proxy-secret", PROXY_SECRET),
-        (header, value),
-    ]
+    let mut headers = vec![("authorization", "Bearer the-proxy-token"), (header, value)];
+    if header == "x-memory-actor-sub" {
+        headers.push(("x-memory-actor-issuer", "https://idp.example"));
+    }
+    headers
 }
 
 async fn begin(router: &Router, summary: &str, headers: &[(&str, &str)]) {
@@ -227,12 +227,11 @@ async fn single_operator_handoff_is_stamped_shared() {
     );
 }
 
-/// An ingress that terminates OIDC and forwards only the subject claim names a
-/// human — the auth layer already resolves it to `AuthLevel::User`. Ownership
-/// has to agree, or every proxied operator shares one bucket and reads batons
-/// synthesised from a colleague's prompts.
+/// An ingress that terminates OIDC and forwards the stable issuer/subject pair
+/// names a human. Ownership has to retain both parts or proxied operators can
+/// share a bucket and read batons synthesised from a colleague's prompts.
 #[tokio::test]
-async fn sub_only_proxy_operators_do_not_share_a_bucket() {
+async fn oidc_proxy_operators_do_not_share_a_bucket() {
     let h = harness(Some("dj"), true).await;
 
     begin(
@@ -314,7 +313,7 @@ async fn legacy_unowned_handoffs_stay_visible_to_everyone() {
     for (label, headers) in [
         ("named proxy user", proxied("x-memory-actor-user", "alice")),
         (
-            "sub-only proxy user",
+            "OIDC proxy user",
             proxied("x-memory-actor-sub", "oidc-subject-bob"),
         ),
         ("root with no assertion", root_headers()),

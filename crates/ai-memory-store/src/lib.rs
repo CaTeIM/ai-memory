@@ -2831,11 +2831,11 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Codex,
                 cwd: None,
-                actor_user: None,
+                actor_user: Some("user:alice".into()),
             })
             .await
             .unwrap();
-        let handoff = |project_id| NewHandoff {
+        let handoff = |project_id, owner: Option<&str>| NewHandoff {
             workspace_id: ws,
             project_id,
             from_session_id: Some(session_id),
@@ -2846,13 +2846,13 @@ mod tests {
             open_questions: Vec::new(),
             next_steps: Vec::new(),
             files_touched: Vec::new(),
-            owner_user: None,
+            owner_user: owner.map(str::to_string),
         };
 
         assert!(
             store
                 .writer
-                .end_session_with_handoff(session_id, None, handoff(other))
+                .end_session_with_handoff(session_id, None, handoff(other, Some("user:alice")),)
                 .await
                 .is_err(),
             "a mismatched handoff must reject the whole end transition"
@@ -2867,9 +2867,27 @@ mod tests {
             "failed handoff insertion must leave the session open"
         );
 
+        assert!(
+            store
+                .writer
+                .end_session_with_handoff(session_id, None, handoff(proj, Some("user:bob")),)
+                .await
+                .is_err(),
+            "a mismatched owner must reject the whole end transition"
+        );
+        assert_eq!(
+            store
+                .reader
+                .session_end_disposition(session_id, ws, proj, AgentKind::Codex)
+                .await
+                .unwrap(),
+            SessionEndDisposition::Open,
+            "an owner mismatch must leave the session open"
+        );
+
         store
             .writer
-            .end_session_with_handoff(session_id, None, handoff(proj))
+            .end_session_with_handoff(session_id, None, handoff(proj, Some("user:alice")))
             .await
             .unwrap();
         let conn = Connection::open(store.db_path()).unwrap();
@@ -4965,6 +4983,8 @@ mod tests {
             .writer
             .accept_startup_context(
                 Some(first_handoff),
+                ws,
+                proj,
                 AgentKind::Codex,
                 None,
                 None,
@@ -4995,6 +5015,8 @@ mod tests {
             .writer
             .accept_startup_context(
                 Some(second_handoff),
+                ws,
+                proj,
                 AgentKind::Codex,
                 None,
                 None,
@@ -5065,6 +5087,8 @@ mod tests {
             .writer
             .accept_startup_context(
                 Some(selected_auto),
+                ws,
+                proj,
                 AgentKind::Codex,
                 None,
                 None,

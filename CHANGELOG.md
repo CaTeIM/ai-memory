@@ -8,24 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Trusted-proxy identity: a proxy that terminates SSO can name the real end
-  user by echoing `[auth].actor_proxy_secret` in
-  `X-Memory-Actor-Proxy-Secret` beside the root bearer. Asserted callers drop
-  to the user tier (only the configured `root_username` keeps root), a
-  duplicated actor header is refused with 400 rather than resolved to either
-  value, and headers without the secret are ignored as before. The server
-  refuses to start with a proxy secret but no `root_username`, because no
-  proxied request could ever reach a root-only capability again. Unset — the
-  default — nothing changes (#333).
-- Qualified identity keys: every ownership decision resolves a request to
-  `sub:<subject>` or `user:<name>` via one accessor
-  (`ActorContext::identity_key`), never a bare string, so a username equal to
-  somebody else's OIDC subject can no longer alias their identity. `sub`
-  outranks `user` because OIDC defines it as the stable identifier; the
-  filesystem-safe `path_segment` derivation ships alongside for per-operator
-  wiki paths. `OwnerFilter` / `owner_stamp` carry the read and write sides of
-  the same contract, with "absent = shared" as the compatibility rule
-  (#333).
+- Trusted-proxy identity now has a dedicated
+  `[auth].actor_proxy_bearer_token`, distinct from the root bearer. Proxy
+  requests must assert either a username or the complete OIDC issuer/subject
+  pair; missing, partial, duplicated, or comma-folded identity headers fail
+  closed. Proxied root access requires the configured OIDC issuer/subject pair;
+  a display username never grants root. Ordinary root and DB-user requests
+  continue to ignore raw actor headers, and leaving the proxy token unset
+  preserves existing behavior (#333).
+- Qualified identity keys now keep usernames separate from OIDC
+  `(issuer, subject)` pairs and drive active-project routing consistently for
+  hook and MCP requests. The stable OIDC pair outranks display usernames, so
+  same-subject users from different issuers cannot alias each other (#333).
 - The `/admin/*` route layer and the MCP `memory_forget_sweep` tool now ask
   "does this deployment distinguish operators" instead of "do `users` rows
   exist", so a trusted-proxy deployment — which never writes a `users` row —
@@ -53,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newest open session in the scope" could do all of that to a colleague's live
   session. The new `--all-owners` flag exposes the server switch (#334).
 - New `GET /api/v1/workspaces/{workspace}/projects/{project}/handoffs` lists a
-  project's handoffs, filtered by `state` and scoped by owner, backed by a new
-  non-partial index (migration V41) since every pre-existing handoffs index is
+  project's handoffs, filtered by `state` and scoped by owner, backed by new
+  non-partial indexes (migration V41) since every pre-existing handoffs index is
   partial on `state = 'open'`. There was no handoff listing anywhere in the
   system: readers only ever fetched the single pending one and consumed it, so a
   mis-delivered baton could not be inspected or recovered. On a server that
@@ -63,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator, and are omitted with `redacted: true` for a caller it can place as
   neither — unowned rows are shared, so such a caller matches every one of them,
   and unlike the overview's single newest card this returns the project's whole
-  history. Cross-owner reads are root-only. The metadata is served either way,
+  history. Cross-owner reads require the explicit root-only
+  `all_owners=true` recovery switch. The metadata is served either way,
   which is what makes the listing useful; a server with no auth configured
   serves the bodies too, since it already serves every page body
   unauthenticated (#334).
@@ -100,7 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The automatic SessionEnd handoff, the session page and both consolidation
   paths attribute to the operator recorded on the **session**, not to whoever
   delivered the event — a spool drain, a shared hook token or an operator
-  finalizing a stuck session all carry a different identity (#334).
+  finalizing a stuck session all carry a different identity. The atomic store
+  operation also rejects a handoff whose owner differs from its source session
+  (#334).
 - Briefings and both read-only overviews — workspace and project — scope
   handoffs to the requesting actor instead of showing only unowned ones, and
   `pending_handoff_count` applies the same filter as the fetch — otherwise a
@@ -128,8 +125,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ai-memory finalize-session` (#334).
 - The `[auto_scope] per_actor` active-project map is keyed by the qualified
   identity on both sides — the hook ingress that publishes and the MCP tools
-  that read — so a sub-only proxied operator's writes and reads land on the
-  same slot instead of silently missing on every read (#334).
+  that read — so an OIDC-proxied operator's writes and reads land on the same
+  slot instead of silently missing on every read (#334).
+- Owner predicates for pending and exact-id handoff reads now execute in SQL
+  before prompt-derived fields are loaded. Exact-id cancellation returns the
+  same result for absent, wrong-scope and foreign-owner ids, so it no longer
+  discloses another operator's handoff state before authorization. Accept and
+  cancel also recheck the expected workspace and project in the atomic state
+  update, closing a lifecycle race between the scoped read and destructive
+  write (#334).
+- Ownership writes reject malformed identity keys, and malformed non-null
+  session-owner keys already present in the database fail closed during hook
+  processing instead of being converted to the shared `NULL` bucket.
+  Named-user handoff history uses two indexed shared/owned ranges, so a large
+  volume of another operator's rows cannot turn a bounded listing into a
+  project-wide scan (#334).
+- Actor-scoped briefing, overview and handoff-history responses now use
+  `Cache-Control: private, no-store`, preventing a browser from reusing one
+  operator's prompt-derived response after credentials at the same URL change
+  to another operator (#334).
+- Automatic session-start handoff admission is capped at 750 ms, below the
+  shortest shipped client's one-second fetch timeout. A slow deciding webhook
+  leaves the baton open instead of approving and consuming it after the caller
+  has disconnected (#334).
 
 ## [1.21.0] - 2026-07-31
 

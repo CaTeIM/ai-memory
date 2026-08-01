@@ -216,7 +216,9 @@ developer, user, and canonical project instructions.\n\
   THAT is the handoff — answer from it directly, don't re-call \
   this tool (it'll return null because handoffs are single-use). Pass \
   `workspace` + `project` together only when the user names a handoff \
-  in a sibling workspace/project.\n\
+  in a sibling workspace/project. On shared servers the default is your \
+  own plus deliberately shared handoffs; `any_owner=true` is root-only \
+  recovery and requires an explicit user request.\n\
 - `memory_handoff_begin` — ONLY when the user is wrapping up / ending \
   the current session and you want to ensure the next agent has context \
   (the SessionEnd hook also auto-captures this). DO NOT use this to \
@@ -224,11 +226,14 @@ developer, user, and canonical project instructions.\n\
   for a briefing. Keep the summary terse (2-3 sentences); put detail \
   in open_questions + next_steps bullets. Pass `workspace` + `project` \
   together only when leaving a handoff for a named sibling \
-  workspace/project.\n\
+  workspace/project. Handoffs belong to their creator by default; pass \
+  `shared=true` only when the user explicitly wants any operator in the \
+  project to receive it.\n\
 - `memory_handoff_cancel` — when you realize you mistakenly called \
   `memory_handoff_begin`, or the user explicitly asks to discard a \
   pending handoff. Requires the exact `handoff_id` from the begin call \
-  and marks it expired so the next session will not consume it.\n\
+  and marks it expired so the next session will not consume it. \
+  `any_owner=true` is root-only recovery and requires an explicit user request.\n\
 - `memory_consolidate` — when the user asks to compile session \
   observations into wiki pages. Also runs on PreCompact, and at \
   session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set. \
@@ -391,7 +396,7 @@ pub struct AiMemoryServer {
     /// so every request handler consults the same clock.
     access_bump_seen: Arc<Mutex<HashMap<PageId, Instant>>>,
     /// True when a trusted authenticating proxy is configured to assert end-user
-    /// identities (`[auth].actor_proxy_secret`).
+    /// identities (`[auth].actor_proxy_bearer_token`).
     ///
     /// Distinct operators reach this server by two independent routes: rows in
     /// `users` (rung 2) and proxy-asserted usernames (rung 1b). Only the first
@@ -995,7 +1000,7 @@ impl AiMemoryServer {
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
-    /// `AuthState::with_trusted_proxy`, which is where the secret itself lives.
+    /// `AuthState::with_trusted_proxy_bearer`, which owns the credential.
     ///
     /// Without this the admin gates cannot tell a proxied deployment apart from
     /// a single-operator one; see [`Self::trusted_proxy_identity`].
@@ -1048,10 +1053,9 @@ impl AiMemoryServer {
     /// Build the [`ActorKey`] for a tool call from the request's stored
     /// extensions and headers.
     ///
-    /// - `user` is taken from the middleware-injected
-    ///   [`ai_memory_core::ActorContext`] (rung 1 root, rung 2 DB user) —
-    ///   never from raw client-supplied headers, since user identity is
-    ///   security-critical.
+    /// - `user` is the qualified key derived from the middleware-injected
+    ///   [`ai_memory_core::ActorContext`] (root, proxy, or DB user), never from
+    ///   raw client-supplied headers.
     /// - `session_id` comes from the same `ActorContext` when the auth
     ///   middleware filled it; if not, falls back to the rung-4
     ///   `X-Memory-Actor-Session-Id` request header, then to the standard
@@ -1072,7 +1076,7 @@ impl AiMemoryServer {
         let ctx = parts.extensions.get::<ai_memory_core::ActorContext>();
         // Same identity rule as the hook ingress, which is the side that
         // PUBLISHES into this map: keying on `user` here while the router keyed
-        // on the whole qualified identity would put a sub-only proxied
+        // on the whole qualified identity would put an OIDC-proxied
         // operator's writes in one slot and their reads in another, so
         // `[auto_scope] per_actor` would silently miss on every read.
         let user = ctx
@@ -1955,12 +1959,12 @@ impl AiMemoryServer {
         let Some(level) = parts.extensions.get::<ai_memory_core::AuthLevel>().copied() else {
             return Ok(());
         };
-        let multi_user_enabled = self
+        let distinguishes_operators = self
             .deployment_distinguishes_operators()
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         level
-            .authorize(ai_memory_core::Capability::Admin, multi_user_enabled)
+            .authorize(ai_memory_core::Capability::Admin, distinguishes_operators)
             .map_err(|e| McpError::invalid_request(e.message().to_string(), None))
     }
 
@@ -2781,10 +2785,15 @@ impl AiMemoryServer {
             "handoff files_touched",
         );
         let creator = crate::actor::actor_from_parts(&parts);
-        let distinguishes = self
-            .deployment_distinguishes_operators()
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let owner_user = if args.shared.unwrap_or(false) {
+            None
+        } else {
+            let distinguishes = self
+                .deployment_distinguishes_operators()
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
+        };
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
@@ -2806,11 +2815,7 @@ impl AiMemoryServer {
             // project-wide, exactly as it behaved before ownership existed —
             // see [`ai_memory_core::owner_stamp`] for why naming the single
             // operator would split them across transports.
-            owner_user: if args.shared.unwrap_or(false) {
-                None
-            } else {
-                ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
-            },
+            owner_user,
         };
         let admission = self
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
@@ -2904,6 +2909,8 @@ impl AiMemoryServer {
                     .writer
                     .accept_handoff(
                         h.id,
+                        ws,
+                        proj,
                         AgentKind::Other,
                         None,
                         actor_user.clone(),
@@ -2946,18 +2953,26 @@ impl AiMemoryServer {
                 &aps_actor,
             )
             .await?;
+        // Resolve the cross-owner escape hatch before reading the object. A
+        // non-admin request must not trigger admission webhooks or learn that
+        // another operator's exact id exists.
+        let cancel_owner_filter = if args.any_owner.unwrap_or(false) {
+            self.require_admin_capability(&parts).await?;
+            ai_memory_core::OwnerFilter::Any
+        } else {
+            ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(&parts))
+        };
         let handoff = self
             .reader
-            .handoff_by_id(handoff_id)
+            .handoff_by_id_in_scope(ws, proj, handoff_id, cancel_owner_filter.clone())
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?
-            .ok_or_else(|| McpError::internal_error("handoff not found", None))?;
-        if handoff.workspace_id != ws || handoff.project_id != proj {
-            return Err(McpError::internal_error(
-                "handoff does not belong to the resolved project",
-                None,
-            ));
-        }
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "handoff not found in the resolved project or not visible to this operator",
+                    None,
+                )
+            })?;
         if handoff.state != HandoffState::Open {
             return ok_json(&serde_json::json!({
                 "handoff_id": handoff_id.to_string(),
@@ -2972,38 +2987,22 @@ impl AiMemoryServer {
         // caller, a departed teammate) stays cancellable instead of becoming
         // permanently stuck.
         //
-        // Resolved BEFORE the chain is consulted, the order
-        // `memory_handoff_accept` uses: a caller refused this escape hatch has
-        // no operation to admit, so the server must not POST one out to every
-        // reject-policy webhook on their behalf.
-        let cancel_owner_filter = if args.any_owner.unwrap_or(false) {
-            self.require_admin_capability(&parts).await?;
-            ai_memory_core::OwnerFilter::Any
-        } else {
-            ai_memory_core::OwnerFilter::for_actor_context(&crate::actor::actor_from_parts(&parts))
-        };
         let admission = self
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffCancel, &parts)
             .await?;
         let cancelled = self
             .writer
-            .cancel_handoff(handoff_id, cancel_owner_filter)
+            .cancel_handoff(handoff_id, ws, proj, cancel_owner_filter)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         if cancelled {
             self.notify_operation_observers(admission.as_ref());
         }
-        let mut result = serde_json::json!({
+        let result = serde_json::json!({
             "handoff_id": handoff_id.to_string(),
             "cancelled": cancelled,
             "state": if cancelled { "expired" } else { "open" },
         });
-        if !cancelled && handoff.owner_user.is_some() {
-            // Otherwise this reads as a plain no-op and the caller cannot tell
-            // that ownership is what refused it.
-            result["reason"] =
-                serde_json::json!("handoff belongs to another operator; retry with any_owner=true");
-        }
         ok_json(&result)
     }
 
@@ -4185,6 +4184,24 @@ mod tests {
         // the hook ingress publishes under — never the raw username.
         assert_eq!(actor.user.as_deref(), Some("user:alice"));
         assert_eq!(actor.session_id.as_deref(), Some("context-session"));
+    }
+
+    #[test]
+    fn actor_key_uses_issuer_qualified_subject() {
+        let mut parts = test_parts_default();
+        parts.extensions.insert(ai_memory_core::ActorContext {
+            user: Some("display-name".into()),
+            issuer: Some("https://idp.example".into()),
+            sub: Some("subject-123".into()),
+            ..ai_memory_core::ActorContext::default()
+        });
+
+        let actor = AiMemoryServer::actor_key_from_parts(Some(&parts));
+
+        assert_eq!(
+            actor.user.as_deref(),
+            Some("oidc:19:https://idp.examplesubject-123")
+        );
     }
 
     #[tokio::test]
@@ -8173,6 +8190,106 @@ mod tests {
         assert_eq!(stored.state, HandoffState::Expired);
     }
 
+    #[tokio::test]
+    async fn handoff_cancel_hides_foreign_ids_before_object_state_is_read() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let bob_id = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "Bob's private prompt-derived context".into(),
+                open_questions: vec!["private question".into()],
+                next_steps: vec!["private next step".into()],
+                files_touched: vec![],
+                owner_user: Some(ai_memory_core::IdentityKey::User("bob".into()).storage_key()),
+            })
+            .await
+            .unwrap();
+
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        });
+        let foreign = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: bob_id.to_string(),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+            .await
+            .expect_err("Alice must not inspect or cancel Bob's handoff");
+
+        let mut alice_parts = test_parts_default();
+        alice_parts.extensions.insert(AuthLevel::User);
+        alice_parts.extensions.insert(ActorContext {
+            user: Some("alice".into()),
+            ..ActorContext::default()
+        });
+        let absent = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: HandoffId::new().to_string(),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(alice_parts),
+            )
+            .await
+            .expect_err("an absent handoff must fail");
+
+        assert_eq!(
+            foreign.to_string(),
+            absent.to_string(),
+            "a known foreign id must be indistinguishable from an absent id"
+        );
+        assert!(!foreign.to_string().contains("Bob"));
+        assert!(!foreign.to_string().contains("state"));
+        assert_eq!(
+            store
+                .reader
+                .handoff_by_id(bob_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            HandoffState::Open,
+        );
+
+        let mut root_parts = test_parts_default();
+        root_parts.extensions.insert(AuthLevel::Root);
+        let result = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: bob_id.to_string(),
+                    project: None,
+                    workspace: None,
+                    any_owner: Some(true),
+                }),
+                OptionalParts(root_parts),
+            )
+            .await
+            .expect("root recovery can cancel a foreign handoff");
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|content| content.text.as_str())
+            .unwrap_or_default();
+        assert!(text.contains("\"cancelled\": true"), "{text}");
+    }
+
     // ----------------------------------------------------------------
     // Error / mis-configured paths — caught at the tool boundary so the
     // agent sees a clean McpError instead of a panic.
@@ -8387,6 +8504,34 @@ mod tests {
         assert_eq!(
             baked, 0,
             "sweep of the baked project must not see another project's page, got {baked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_admin_capability_honors_trusted_proxy_topology() {
+        let (_tmp, _store, server, _ws, _project) = setup_server().await;
+        let proxied = server.with_trusted_proxy_identity(true);
+
+        for (level, allowed) in [
+            (AuthLevel::Anonymous, false),
+            (AuthLevel::User, false),
+            (AuthLevel::Root, true),
+        ] {
+            let mut parts = test_parts_default();
+            parts.extensions.insert(level);
+            assert_eq!(
+                proxied.require_admin_capability(&parts).await.is_ok(),
+                allowed,
+                "level={level:?}"
+            );
+        }
+
+        assert!(
+            proxied
+                .require_admin_capability(&test_parts_default())
+                .await
+                .is_ok(),
+            "stdio/in-process calls have no HTTP auth extension and retain local admin access"
         );
     }
 

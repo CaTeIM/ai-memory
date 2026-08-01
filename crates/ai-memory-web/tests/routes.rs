@@ -1365,7 +1365,7 @@ fn api_req(
 }
 
 /// Same, for a rung whose identity is not a plain username — the proxy that
-/// asserts only an OIDC subject claim.
+/// asserts a complete OIDC issuer/subject pair.
 fn api_req_actor(
     uri: &str,
     actor: Option<ai_memory_core::ActorContext>,
@@ -1409,19 +1409,22 @@ fn user_key(name: &str) -> ai_memory_core::IdentityKey {
 }
 
 fn sub_key(sub: &str) -> ai_memory_core::IdentityKey {
-    ai_memory_core::IdentityKey::Subject(sub.into())
+    ai_memory_core::IdentityKey::Subject {
+        issuer: "https://idp.example".into(),
+        subject: sub.into(),
+    }
 }
 
-/// The sub-only proxy rung, end to end through the browser's own endpoint.
+/// The OIDC proxy rung, end to end through the browser's own endpoint.
 ///
-/// An ingress that terminates OIDC and forwards only the subject claim resolves
+/// An ingress that terminates OIDC and forwards the issuer/subject pair resolves
 /// to `AuthLevel::User` with `actor.user = None`. Keying ownership on `.user`
 /// made that caller `OwnerFilter::Unattributed`, which drops their own owned
 /// rows from the listing entirely AND trips the redaction gate on the shared
-/// ones — so on a sub-only deployment every operator lost every handoff body in
-/// the web UI, including their own.
+/// ones — so on an OIDC-proxy deployment every operator lost every handoff body
+/// in the web UI, including their own.
 #[tokio::test]
-async fn api_handoff_listing_serves_a_sub_only_proxy_caller_their_own_rows() {
+async fn api_handoff_listing_serves_an_oidc_proxy_caller_their_own_rows() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -1451,6 +1454,7 @@ async fn api_handoff_listing_serves_a_sub_only_proxy_caller_their_own_rows() {
         .oneshot(api_req_actor(
             "/workspaces/default/projects/scratch/handoffs",
             Some(ai_memory_core::ActorContext {
+                issuer: Some("https://idp.example".into()),
                 sub: Some("oidc-subject-alice".into()),
                 ..ai_memory_core::ActorContext::default()
             }),
@@ -1488,6 +1492,88 @@ async fn api_handoff_listing_serves_a_sub_only_proxy_caller_their_own_rows() {
         !text.contains("theirs_handoff_marker"),
         "another operator's handoff reached this caller: {text}",
     );
+}
+
+#[tokio::test]
+async fn api_handoff_all_owners_is_root_only_and_returns_every_owner() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    for (summary, owner) in [
+        ("alice_all_marker", Some(user_key("alice"))),
+        ("bob_all_marker", Some(user_key("bob"))),
+        ("shared_all_marker", None),
+    ] {
+        store
+            .writer
+            .insert_handoff(handoff_for(ws, proj, summary, owner.as_ref()))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for (actor, auth) in [
+        (
+            Some(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            }),
+            Some(ai_memory_core::AuthLevel::User),
+        ),
+        (None, Some(ai_memory_core::AuthLevel::Anonymous)),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(api_req_actor(
+                "/workspaces/default/projects/scratch/handoffs?all_owners=true",
+                actor,
+                auth,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("all_owners requires root authorization"));
+        assert!(!text.contains("alice_all_marker"));
+        assert!(!text.contains("bob_all_marker"));
+    }
+
+    let resp = app
+        .oneshot(api_req_actor(
+            "/workspaces/default/projects/scratch/handoffs?all_owners=true",
+            None,
+            Some(ai_memory_core::AuthLevel::Root),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for marker in ["alice_all_marker", "bob_all_marker", "shared_all_marker"] {
+        assert!(
+            text.contains(marker),
+            "root listing omitted {marker}: {text}"
+        );
+    }
 }
 
 /// With `[auth].root_username` set every automatic handoff carries an owner, so
@@ -2094,6 +2180,50 @@ async fn api_responses_set_cache_control_private() {
         cc.contains("max-age=30"),
         "Cache-Control must be max-age=30 for /workspaces: {cc}"
     );
+}
+
+#[tokio::test]
+async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    for uri in [
+        "/workspaces/default/projects/scratch/briefing",
+        "/workspaces/default/overview",
+        "/workspaces/default/projects/scratch/overview",
+        "/workspaces/default/projects/scratch/handoffs",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(api_req_actor(
+                uri,
+                Some(ai_memory_core::ActorContext {
+                    user: Some("alice".into()),
+                    ..ai_memory_core::ActorContext::default()
+                }),
+                Some(ai_memory_core::AuthLevel::User),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let cache = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .expect("actor-scoped responses need Cache-Control")
+            .to_str()
+            .unwrap();
+        assert_eq!(cache, "private, no-store", "{uri}");
+    }
 }
 
 #[tokio::test]

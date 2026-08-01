@@ -77,6 +77,21 @@ fn with_cache(resp: Response, max_age: u32) -> Response {
     resp
 }
 
+/// Prevent browser reuse of a response whose body depends on request identity.
+///
+/// `private` alone still permits a browser cache to serve Alice's response
+/// after credentials at the same URL switch to Bob. These endpoints contain
+/// owner-scoped prompt text, so successful responses must be revalidated by
+/// executing the authorization/filtering path on every request.
+fn with_no_store(resp: Response) -> Response {
+    let mut resp = resp;
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    resp
+}
+
 async fn workspaces_handler(State(state): State<Arc<WebState>>) -> Result<Response, Response> {
     let workspaces = state
         .reader
@@ -433,10 +448,7 @@ async fn briefing_handler(
         )
         .await
         .map_err(internal_error)?;
-    Ok(with_cache(
-        Json(briefing).into_response(),
-        LIST_CACHE_MAX_AGE,
-    ))
+    Ok(with_no_store(Json(briefing).into_response()))
 }
 
 async fn overview_handler(
@@ -513,14 +525,13 @@ async fn overview_handler(
         orphan_pages: detail.orphans,
     };
 
-    Ok(with_cache(
+    Ok(with_no_store(
         Json(ApiOverview {
             handoff,
             briefing,
             health,
         })
         .into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -531,8 +542,8 @@ async fn overview_handler(
 /// prompt-derived text inside it — never reaches someone it does not belong to.
 ///
 /// "Can name" is [`ai_memory_core::ActorContext::identity_key`], not
-/// `actor.user`: an ingress that forwards only the OIDC subject claim asserts
-/// `sub` alone, and reading `user` here would file every such operator as
+/// `actor.user`: an ingress that forwards a complete OIDC issuer/subject pair
+/// may leave `user` empty, and reading `user` here would file that operator as
 /// unattributed while the auth layer calls them a user — hiding their own
 /// handoffs, and the bodies of the shared ones, from them in their own UI.
 fn owner_filter_for(
@@ -545,8 +556,9 @@ fn owner_filter_for(
 
 /// May this request read the prompt-derived body of a handoff?
 ///
-/// Three ways to qualify: the caller resolved to an identity and is reading rows
-/// that are their own or shared; the caller holds root, which is the operator —
+/// Three ways to qualify: an authenticated caller resolved to an identity and
+/// is reading rows that are their own or shared; the caller holds root, which is
+/// the operator —
 /// they already read every page body through the wiki API, so redacting their
 /// own handoffs from their own UI costs them and protects nobody; or the server
 /// does not authenticate at all and the whole wiki is open by design.
@@ -559,10 +571,10 @@ fn owner_filter_for(
 /// metadata beside it.
 ///
 /// [`ai_memory_core::OwnerFilter::Any`] is the cross-owner recovery filter, so
-/// it is root-only here. Nothing on this route produces it today, but the
-/// sibling recovery switches exist elsewhere; making the check local to this
-/// gate means adding an `all_owners` query parameter later cannot quietly hand
-/// every operator's prompt trail to a caller the server cannot name.
+/// it is root-only here. The `all_owners` query switch produces it only after
+/// checking the request's resolved [`ai_memory_core::AuthLevel`]. Keeping the
+/// body check local as well prevents a future caller from constructing `Any`
+/// without the matching authorization gate.
 ///
 /// # What actually reaches the `Unattributed` arm
 ///
@@ -576,12 +588,13 @@ fn owner_filter_for(
 ///
 /// What has no producer is `Unattributed` at a NAMED tier: the DB-user rung
 /// fills `user` from the row, and the proxy downgrade only reaches
-/// [`ai_memory_core::AuthLevel::User`] when the proxy asserted `user` *or*
-/// `sub` — both of which [`ai_memory_core::ActorContext::identity_key`]
-/// resolves, so the filter is `User(_)` and the body is served by the arm
-/// above. That gap is the fail-safe: a future rung, or a mount that injects a
-/// tier without an actor, redacts by default instead of leaking. Weakening the
-/// arm because "nothing produces it" removes the fail-safe, not dead code.
+/// [`ai_memory_core::AuthLevel::User`] when it asserted a username or a
+/// complete issuer/subject pair. Both are resolved by
+/// [`ai_memory_core::ActorContext::identity_key`], so the filter is `User(_)`
+/// and the body is served by the arm above. That gap is the fail-safe: a future
+/// rung, or a mount that injects a tier without an actor, redacts by default
+/// instead of leaking. Weakening the arm because "nothing produces it" removes
+/// the fail-safe, not dead code.
 fn serves_handoff_body(
     owner_filter: &ai_memory_core::OwnerFilter,
     auth: Option<axum::Extension<ai_memory_core::AuthLevel>>,
@@ -589,7 +602,12 @@ fn serves_handoff_body(
     let level = auth.map(|axum::Extension(level)| level);
     let root = level == Some(ai_memory_core::AuthLevel::Root);
     match owner_filter {
-        ai_memory_core::OwnerFilter::User(_) => true,
+        ai_memory_core::OwnerFilter::User(_) => {
+            matches!(
+                level,
+                Some(ai_memory_core::AuthLevel::User | ai_memory_core::AuthLevel::Root)
+            )
+        }
         ai_memory_core::OwnerFilter::Any => root,
         ai_memory_core::OwnerFilter::Unattributed => {
             root || matches!(level, None | Some(ai_memory_core::AuthLevel::Anonymous))
@@ -621,7 +639,7 @@ struct ApiHandoffEntry {
     files_touched: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
-    /// Operator the handoff belongs to (qualified `sub:`/`user:` storage key);
+    /// Operator the handoff belongs to (qualified `oidc:`/`user:` storage key);
     /// absent when shared with the project.
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
@@ -640,6 +658,10 @@ struct HandoffListQuery {
     state: Option<String>,
     #[serde(default = "default_handoff_limit")]
     limit: usize,
+    /// Root-only recovery view across every operator. Omitted/false keeps the
+    /// normal own-plus-shared ownership boundary.
+    #[serde(default)]
+    all_owners: bool,
 }
 
 const fn default_handoff_limit() -> usize {
@@ -694,7 +716,18 @@ async fn handoffs_handler(
             )
         })?),
     };
-    let owner_filter = owner_filter_for(actor);
+    let level = auth.as_ref().map(|axum::Extension(level)| *level);
+    let owner_filter = if query.all_owners {
+        if level != Some(ai_memory_core::AuthLevel::Root) {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "all_owners requires root authorization",
+            ));
+        }
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        owner_filter_for(actor)
+    };
     let with_body = serves_handoff_body(&owner_filter, auth);
     let handoffs = state
         .reader
@@ -725,9 +758,8 @@ async fn handoffs_handler(
             accepted_at: h.accepted_at.map(|t| t.to_string()),
         })
         .collect();
-    Ok(with_cache(
+    Ok(with_no_store(
         Json(serde_json::json!({ "handoffs": entries })).into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -784,14 +816,13 @@ async fn project_overview_handler(
         orphan_pages: detail.orphans,
     };
 
-    Ok(with_cache(
+    Ok(with_no_store(
         Json(ApiOverview {
             handoff,
             briefing,
             health,
         })
         .into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -1134,8 +1165,7 @@ mod tests {
     use ai_memory_core::{AuthLevel, OwnerFilter};
     use axum::Extension;
 
-    /// Nothing routes an `Any` filter into the listing today; this is the trap
-    /// check for whoever wires the `all_owners` recovery switch onto it. Reading
+    /// The `all_owners` recovery switch routes `Any` into the listing. Reading
     /// past ownership must cost root — not merely a token the server accepted,
     /// and not a name the request happens to carry, since the rows returned then
     /// belong to other operators.
@@ -1151,6 +1181,20 @@ mod tests {
             &OwnerFilter::Any,
             Some(Extension(AuthLevel::Root))
         ));
+    }
+
+    #[test]
+    fn named_owner_filter_requires_an_authenticated_tier() {
+        let filter = OwnerFilter::User("user:alice".into());
+        for level in [None, Some(AuthLevel::Anonymous)] {
+            assert!(
+                !serves_handoff_body(&filter, level.map(Extension)),
+                "actor identity without a matching authenticated tier served a body"
+            );
+        }
+        for level in [AuthLevel::User, AuthLevel::Root] {
+            assert!(serves_handoff_body(&filter, Some(Extension(level))));
+        }
     }
 
     /// The operator of the ordinary authenticated deployment: root bearer, no

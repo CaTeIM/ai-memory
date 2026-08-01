@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 
 use ai_memory_core::{
-    AgentKind, EntityId, HandoffId, LinkTarget, NewHandoff, NewObservation, NewPage, NewSession,
-    ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
-    WorkspaceId,
+    AgentKind, EntityId, HandoffId, IdentityKey, LinkTarget, NewHandoff, NewObservation, NewPage,
+    NewSession, ObservationId, ObservationKind, OwnerFilter, PageId, PagePath, ProjectId,
+    SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -852,6 +852,7 @@ fn refresh_incoming_links_for_path(
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.
 /// Idempotent: a second call with the same id leaves the row untouched.
 pub fn begin_session(conn: &mut Connection, session: &NewSession) -> StoreResult<()> {
+    validate_identity_storage_key(session.actor_user.as_deref(), "session owner")?;
     let now = Timestamp::now().as_microsecond();
     let agent = session.agent_kind.as_str();
     let cwd: Option<String> = session
@@ -1393,14 +1394,14 @@ pub fn end_session_with_handoff(
         ));
     }
     let tx = conn.transaction()?;
-    let session_scope: Option<(Vec<u8>, Vec<u8>)> = tx
+    let session_scope: Option<(Vec<u8>, Vec<u8>, Option<String>)> = tx
         .query_row(
-            "SELECT workspace_id, project_id FROM sessions WHERE id = ?1",
+            "SELECT workspace_id, project_id, actor_user FROM sessions WHERE id = ?1",
             params![session_id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((workspace_id, project_id)) = session_scope else {
+    let Some((workspace_id, project_id, actor_user)) = session_scope else {
         return Err(StoreError::InvalidState(
             "cannot end a missing session with an automatic handoff".into(),
         ));
@@ -1412,6 +1413,11 @@ pub fn end_session_with_handoff(
             "automatic handoff scope does not match the ended session".into(),
         ));
     }
+    if actor_user != handoff.owner_user {
+        return Err(StoreError::InvalidState(
+            "automatic handoff owner does not match the ended session".into(),
+        ));
+    }
     end_session_row(&tx, session_id, summary_page_id)?;
     let id = insert_handoff_row(&tx, handoff)?;
     tx.commit()?;
@@ -1419,6 +1425,7 @@ pub fn end_session_with_handoff(
 }
 
 fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
+    validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
     let open_q = serde_json::to_string(&h.open_questions)?;
@@ -1512,32 +1519,6 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     Ok(id)
 }
 
-/// A handoff's `(workspace_id, project_id)` as raw 16-byte ids, for tagging
-/// its audit rows. Either component is `None` when the handoff row is absent.
-type HandoffScope = (Option<[u8; 16]>, Option<[u8; 16]>);
-
-/// The `(workspace_id, project_id)` a handoff belongs to, for tagging its
-/// audit rows. `(None, None)` when the handoff row is absent.
-fn handoff_scope(
-    tx: &rusqlite::Transaction<'_>,
-    handoff_id: &HandoffId,
-) -> StoreResult<HandoffScope> {
-    let row = tx
-        .query_row(
-            "SELECT workspace_id, project_id FROM handoffs WHERE id = ?1",
-            params![handoff_id.as_bytes()],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-    Ok(match row {
-        Some((ws, proj)) => (
-            <[u8; 16]>::try_from(ws.as_slice()).ok(),
-            <[u8; 16]>::try_from(proj.as_slice()).ok(),
-        ),
-        None => (None, None),
-    })
-}
-
 /// Mark a handoff accepted by `accepting_agent` / `accepting_session`.
 ///
 /// Returns whether this call is the one that actually claimed it: `false` means
@@ -1551,6 +1532,8 @@ fn handoff_scope(
 pub fn accept_handoff(
     conn: &mut Connection,
     handoff_id: &HandoffId,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
     accepting_user: Option<&str>,
@@ -1561,6 +1544,8 @@ pub fn accept_handoff(
     let claimed = accept_handoff_in_transaction(
         &tx,
         handoff_id,
+        workspace_id,
+        project_id,
         accepting_agent,
         accepting_session,
         accepting_user,
@@ -1574,50 +1559,73 @@ pub fn accept_handoff(
 pub(crate) fn accept_handoff_in_transaction(
     tx: &Transaction<'_>,
     handoff_id: &HandoffId,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
     accepting_agent: AgentKind,
     accepting_session: Option<&SessionId>,
     accepting_user: Option<&str>,
     owner_filter: &OwnerFilter,
     receiving_cwd: Option<&str>,
 ) -> StoreResult<bool> {
+    validate_identity_storage_key(accepting_user, "accepting handoff operator")?;
+    match (owner_filter, accepting_user) {
+        (OwnerFilter::User(expected), Some(actual)) if expected != actual => {
+            return Err(StoreError::InvalidState(
+                "accepting handoff operator does not match its owner filter".into(),
+            ));
+        }
+        (OwnerFilter::User(_), None) => {
+            return Err(StoreError::InvalidState(
+                "an owner-scoped handoff claim requires an accepting operator".into(),
+            ));
+        }
+        (OwnerFilter::Unattributed, Some(_)) => {
+            return Err(StoreError::InvalidState(
+                "an unattributed handoff claim cannot record a named operator".into(),
+            ));
+        }
+        _ => {}
+    }
     let now = Timestamp::now().as_microsecond();
     let agent = accepting_agent.as_str();
     let session: Option<&[u8]> = accepting_session.map(|s| &s.as_bytes()[..]);
     let metadata = tx
         .query_row(
-            "SELECT workspace_id, project_id, from_session_id IS NOT NULL, cwd, created_at, \
-             owner_user \
-             FROM handoffs WHERE id = ?1 AND state = 'open'",
-            params![handoff_id.as_bytes()],
+            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user \
+             FROM handoffs \
+             WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND state = 'open'",
+            params![
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
             |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((workspace_id, project_id, automatic, cwd, created_at, owner_user)) = metadata else {
+    let Some((automatic, cwd, created_at, owner_user)) = metadata else {
         return Ok(false);
     };
-    let (ws, proj) = handoff_scope(tx, handoff_id)?;
     // The ownership check rides along in the UPDATE's WHERE rather than being a
     // separate read: the claim stays a single atomic compare-and-set (only one
     // racing session can flip 'open' -> 'accepted'), and a caller who is not
     // allowed to take this baton simply changes 0 rows.
     let owner_clause = match owner_filter {
         OwnerFilter::Any => "",
-        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?6)",
+        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?8)",
         OwnerFilter::Unattributed => " AND owner_user IS NULL",
     };
     let sql = format!(
         "UPDATE handoffs SET state = 'accepted', accepted_by = ?1, accepted_at = ?2, \
-         accepted_by_session = ?3, accepted_by_user = ?5 \
-         WHERE id = ?4 AND state = 'open'{owner_clause}"
+         accepted_by_session = ?3, accepted_by_user = ?4 \
+         WHERE id = ?5 AND workspace_id = ?6 AND project_id = ?7 \
+           AND state = 'open'{owner_clause}"
     );
     let changed = match owner_filter {
         OwnerFilter::User(user) => tx.execute(
@@ -1626,14 +1634,24 @@ pub(crate) fn accept_handoff_in_transaction(
                 agent,
                 now,
                 session,
-                handoff_id.as_bytes(),
                 accepting_user,
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 user
             ],
         )?,
         _ => tx.execute(
             &sql,
-            params![agent, now, session, handoff_id.as_bytes(), accepting_user],
+            params![
+                agent,
+                now,
+                session,
+                accepting_user,
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
         )?,
     };
     // Only a real state transition ('open' -> 'accepted') is audited.
@@ -1641,8 +1659,8 @@ pub(crate) fn accept_handoff_in_transaction(
         audit(
             tx,
             "accept_handoff",
-            ws.as_ref(),
-            proj.as_ref(),
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
             None,
             None,
             now,
@@ -1656,8 +1674,8 @@ pub(crate) fn accept_handoff_in_transaction(
             let expired = expire_superseded_auto_handoffs(
                 tx,
                 handoff_id,
-                &workspace_id,
-                &project_id,
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 cwd.as_deref(),
                 created_at,
                 receiving_cwd,
@@ -1667,8 +1685,8 @@ pub(crate) fn accept_handoff_in_transaction(
                 audit(
                     tx,
                     "expire_superseded_handoffs",
-                    ws.as_ref(),
-                    proj.as_ref(),
+                    Some(workspace_id.as_bytes()),
+                    Some(project_id.as_bytes()),
                     None,
                     None,
                     now,
@@ -1677,6 +1695,15 @@ pub(crate) fn accept_handoff_in_transaction(
         }
     }
     Ok(changed > 0)
+}
+
+fn validate_identity_storage_key(value: Option<&str>, label: &str) -> StoreResult<()> {
+    if value.is_some_and(|value| IdentityKey::from_storage_key(value).is_none()) {
+        return Err(StoreError::InvalidState(format!(
+            "{label} is not a qualified identity storage key"
+        )));
+    }
+    Ok(())
 }
 
 /// Expire older automatic handoffs that were eligible for the same receiving
@@ -1750,32 +1777,50 @@ fn expire_superseded_auto_handoffs(
 pub fn cancel_handoff(
     conn: &mut Connection,
     handoff_id: &HandoffId,
+    workspace_id: &WorkspaceId,
+    project_id: &ProjectId,
     owner_filter: &OwnerFilter,
 ) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let (ws, proj) = handoff_scope(&tx, handoff_id)?;
     // Same reasoning as the accept path: the owner predicate lives in the
     // UPDATE so cancelling somebody else's baton is a 0-row no-op instead of a
     // read-then-write race.
     let owner_clause = match owner_filter {
         OwnerFilter::Any => "",
-        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?2)",
+        OwnerFilter::User(_) => " AND (owner_user IS NULL OR owner_user = ?4)",
         OwnerFilter::Unattributed => " AND owner_user IS NULL",
     };
     let sql = format!(
-        "UPDATE handoffs SET state = 'expired' WHERE id = ?1 AND state = 'open'{owner_clause}"
+        "UPDATE handoffs SET state = 'expired' \
+         WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+           AND state = 'open'{owner_clause}"
     );
     let changed = match owner_filter {
-        OwnerFilter::User(user) => tx.execute(&sql, params![handoff_id.as_bytes(), user])?,
-        _ => tx.execute(&sql, params![handoff_id.as_bytes()])?,
+        OwnerFilter::User(user) => tx.execute(
+            &sql,
+            params![
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                user,
+            ],
+        )?,
+        _ => tx.execute(
+            &sql,
+            params![
+                handoff_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )?,
     };
     if changed > 0 {
         audit(
             &tx,
             "cancel_handoff",
-            ws.as_ref(),
-            proj.as_ref(),
+            Some(workspace_id.as_bytes()),
+            Some(project_id.as_bytes()),
             None,
             None,
             now,
@@ -3315,6 +3360,8 @@ pub(crate) mod tests {
         accept_handoff(
             &mut conn,
             &id,
+            &ws,
+            &proj,
             AgentKind::Codex,
             None,
             None,
@@ -3339,6 +3386,8 @@ pub(crate) mod tests {
         let second = accept_handoff(
             &mut conn,
             &id,
+            &ws,
+            &proj,
             AgentKind::Codex,
             None,
             None,
@@ -3423,6 +3472,8 @@ pub(crate) mod tests {
         accept_handoff(
             &mut conn,
             &id,
+            &ws,
+            &proj,
             AgentKind::Codex,
             None,
             None,
@@ -3431,7 +3482,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let id2 = insert_handoff(&mut conn, &new()).unwrap();
-        assert!(cancel_handoff(&mut conn, &id2, &OwnerFilter::Any).unwrap());
+        assert!(cancel_handoff(&mut conn, &id2, &ws, &proj, &OwnerFilter::Any).unwrap());
 
         for op in ["insert_handoff", "accept_handoff", "cancel_handoff"] {
             let (count, author) = audit_row_for(&conn, op);
@@ -3448,6 +3499,8 @@ pub(crate) mod tests {
         accept_handoff(
             &mut conn,
             &id,
+            &ws,
+            &proj,
             AgentKind::Codex,
             None,
             None,
@@ -3455,7 +3508,7 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        assert!(!cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap());
+        assert!(!cancel_handoff(&mut conn, &id, &ws, &proj, &OwnerFilter::Any).unwrap());
         assert_eq!(
             audit_row_for(&conn, "accept_handoff").0,
             1,
@@ -3552,7 +3605,7 @@ pub(crate) mod tests {
         };
         let id = insert_handoff(&mut conn, &new).unwrap();
 
-        assert!(cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap());
+        assert!(cancel_handoff(&mut conn, &id, &ws, &proj, &OwnerFilter::Any).unwrap());
         let state: String = conn
             .query_row(
                 "SELECT state FROM handoffs WHERE id = ?1",
@@ -3563,7 +3616,7 @@ pub(crate) mod tests {
         assert_eq!(state, "expired");
 
         assert!(
-            !cancel_handoff(&mut conn, &id, &OwnerFilter::Any).unwrap(),
+            !cancel_handoff(&mut conn, &id, &ws, &proj, &OwnerFilter::Any).unwrap(),
             "double-cancel should be a no-op"
         );
     }

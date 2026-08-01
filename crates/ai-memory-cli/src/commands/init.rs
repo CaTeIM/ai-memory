@@ -46,6 +46,13 @@ token_pepper = \"{pepper}\"
 # root_username = \"boss\"
 # root_email    = \"boss@example.com\"
 # root_name     = \"Boss\"
+#
+# Trusted authenticating proxy (optional). Give the proxy a bearer token that
+# differs from bearer_token. It must replace client-supplied X-Memory-Actor-*
+# headers and assert either User or the Issuer+Sub pair on every request.
+# actor_proxy_bearer_token = \"<distinct-random-token>\"
+# root_issuer  = \"https://idp.example\"
+# root_subject = \"<stable-root-subject>\"
 "
     )
 }
