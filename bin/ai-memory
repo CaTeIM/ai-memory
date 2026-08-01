@@ -10,6 +10,7 @@
 # Special wrapper-only subcommands (not forwarded to the binary):
 #   ai-memory upgrade       Pull the latest image + remind to re-stage hooks.
 #   ai-memory run ...       Use a cached native client so it can exec host agents.
+#   ai-memory show ...      Use that client for host project/harness discovery.
 #
 # Env overrides:
 #   AI_MEMORY_IMAGE         docker image (default: akitaonrails/ai-memory:latest)
@@ -22,7 +23,7 @@
 #   COPILOT_GITHUB_TOKEN    GitHub token for AI_MEMORY_LLM_PROVIDER=copilot
 #   AI_MEMORY_NO_TTY=1      force non-interactive even on a real tty
 #   AI_MEMORY_NO_VERSION_CHECK=1  skip the once-per-day update check
-#   AI_MEMORY_NATIVE_BIN    native ai-memory binary used for `run` (optional)
+#   AI_MEMORY_NATIVE_BIN    native ai-memory binary used for `run`/`show` (optional)
 #   AI_MEMORY_WRAPPER_URL   wrapper release asset override (optional; its
 #                           .sha256 companion is required)
 #   AI_MEMORY_WRAPPER_SHA256_URL  wrapper checksum URL override (optional)
@@ -223,10 +224,10 @@ cmd_upgrade() {
   touch "${VERSION_CHECK_FILE}"
 }
 
-# `ai-memory run` must execute on the host: native harnesses and their
-# native transcript stores are host resources, not contents of the helper
+# `ai-memory run` and `show` must execute on the host: checkouts, harnesses,
+# and native transcript stores are host resources, not contents of the helper
 # container. Keep a checksum-verified release client beside the wrapper cache.
-native_run_binary() {
+native_host_binary() {
   if [ -n "${AI_MEMORY_NATIVE_BIN:-}" ]; then
     [ -x "${AI_MEMORY_NATIVE_BIN}" ] || {
       echo "ai-memory: AI_MEMORY_NATIVE_BIN is not executable: ${AI_MEMORY_NATIVE_BIN}" >&2
@@ -242,7 +243,7 @@ native_run_binary() {
     Darwin) os="macos" ;;
     *)
       echo "ai-memory: the Docker wrapper cannot provide managed host launches on this OS" >&2
-      echo "install the native release binary and run: ai-memory run <harness> ..." >&2
+      echo "install the native release binary to use ai-memory run/show" >&2
       return 1
       ;;
   esac
@@ -250,7 +251,7 @@ native_run_binary() {
     x86_64 | amd64) arch="x86_64" ;;
     aarch64 | arm64) arch="aarch64" ;;
     *)
-      echo "ai-memory: no managed-run release binary is published for $(uname -m)" >&2
+      echo "ai-memory: no host-launch release binary is published for $(uname -m)" >&2
       return 1
       ;;
   esac
@@ -279,13 +280,13 @@ native_run_binary() {
 
   if [ "${need_refresh}" -eq 1 ]; then
     command -v curl >/dev/null 2>&1 || {
-      echo "ai-memory: curl is required to install the native managed-run client" >&2
+      echo "ai-memory: curl is required to install the native host-launch client" >&2
       return 1
     }
     tmp="${native_dir}/.install-$$"
     rm -rf "${tmp}"
     mkdir -p "${tmp}"
-    echo "ai-memory: installing checksum-verified native managed-run client (${artifact})" >&2
+    echo "ai-memory: installing checksum-verified native host-launch client (${artifact})" >&2
     curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz"
     curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -294,7 +295,7 @@ native_run_binary() {
       remote_sum=$(awk 'NR == 1 { print $1 }' "${tmp}/${artifact}.tar.gz.sha256")
       local_sum=$(shasum -a 256 "${tmp}/${artifact}.tar.gz" | awk '{ print $1 }')
       [ "${remote_sum}" = "${local_sum}" ] || {
-        echo "ai-memory: native managed-run client checksum mismatch" >&2
+        echo "ai-memory: native host-launch client checksum mismatch" >&2
         rm -rf "${tmp}"
         return 1
       }
@@ -317,10 +318,11 @@ case "${1:-}" in
     cmd_upgrade
     exit 0
     ;;
-  run)
+  run | show)
+    NATIVE_HOST_COMMAND=$1
     shift
-    NATIVE_RUN_BIN=$(native_run_binary)
-    exec "${NATIVE_RUN_BIN}" run "$@"
+    NATIVE_HOST_BIN=$(native_host_binary)
+    exec "${NATIVE_HOST_BIN}" "${NATIVE_HOST_COMMAND}" "$@"
     ;;
 esac
 

@@ -80,7 +80,7 @@ clap_complete = "4"
 # and only styles text, it cannot read arrow keys. crossterm is the portable
 # option that keeps one code path across Linux, macOS, and Windows consoles
 # instead of a `#[cfg]` split over termios and the Win32 console API.
-crossterm = "0.28"
+crossterm = "0.29"
 dirs = "5"
 # Format-preserving TOML editor for install-mcp --apply against
 # Codex's config.toml. Plain `toml` round-trips destroy comments;

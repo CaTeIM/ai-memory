@@ -245,6 +245,10 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 * `<data_dir>/logs/` - rolling daily `tracing` output.
 * `<data_dir>/models/` - reserved for bundled embedding models
   (M9.5+, when local `ort` lands).
+* `<data_dir>/client-projects.json` - private, client-local checkout links for
+  `ai-memory show`, keyed by credential-free server identity plus workspace and
+  project. It is not part of the SQLite/wiki source of truth, and no server API
+  exposes host paths.
 
 **Schema (current head):**
 

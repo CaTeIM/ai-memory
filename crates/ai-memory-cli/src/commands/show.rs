@@ -1,59 +1,28 @@
-//! `ai-memory show` — pick a project and a harness, then launch it.
+//! `ai-memory show` project and managed-harness picker.
 //!
-//! Thin HTTP client for the listing half: calls `GET /api/v1/projects` and
-//! renders the rows the server already aggregates. The launch half delegates
-//! to [`crate::commands::run`] so managed workstreams, handoff delivery, and
-//! native-argument forwarding keep exactly one implementation.
-//!
-//! The picker exists because project scope is resolved from the working
-//! directory. Opening an agent from a parent directory that holds many
-//! checkouts resolves every one of them to that parent's basename, so the
-//! sessions pile into a single scope. Choosing the project first and entering
-//! its recorded `repo_path` makes the scope explicit before the agent starts.
+//! Remote project metadata is joined with a client-local checkout registry.
+//! The server never sends host filesystem paths, and each client may map the
+//! same remote scope to a different local checkout.
 
-use std::io::{IsTerminal, Write};
+use std::collections::HashMap;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
+use clap::ValueEnum as _;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::style::Stylize;
+use crossterm::style::Stylize as _;
 use crossterm::{cursor, execute, terminal};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::cli::{InstallInstructionsArgs, RunArgs, RunHarnessChoice, ShowArgs};
-use crate::commands::apply_shared::apply_atomic;
-use crate::commands::install_instructions;
-use crate::config::Config;
+use crate::cli::{
+    InstallInstructionsArgs, InstallSkillsAgent, RunArgs, RunHarnessChoice, ShowArgs,
+};
+use crate::commands::{install_instructions, project_registry};
+use crate::config::{Config, DEFAULT_WORKSPACE};
 use crate::http_client::{ServerEndpoint, get_json};
 
-/// Server-shaped row. Mirrors `ai_memory_store::ProjectSummary`.
-#[derive(Debug, Deserialize)]
-struct ProjectRow {
-    /// Workspace the project belongs to.
-    workspace_name: String,
-    /// Project name within the workspace.
-    project_name: String,
-    /// Number of `is_latest = 1` pages.
-    page_count: u64,
-    /// ISO-8601 timestamp of the newest page update, when any page exists.
-    last_updated: Option<String>,
-    /// Absolute checkout path, when one was recorded.
-    repo_path: Option<String>,
-}
-
-/// One selectable line: what the user reads, plus the dimmed trailer.
-struct Choice {
-    /// Primary label, rendered at full brightness.
-    label: String,
-    /// Secondary detail, rendered dim. Empty renders nothing.
-    detail: String,
-}
-
-/// Directory entries that mark a subdirectory as a project worth offering.
-/// Matched by name, so recognising a candidate costs one `exists()` per marker
-/// and never a directory walk.
 const PROJECT_MARKERS: [&str; 12] = [
     ".git",
     ".ai-memory.toml",
@@ -68,16 +37,6 @@ const PROJECT_MARKERS: [&str; 12] = [
     "docker-compose.yml",
     "compose.yml",
 ];
-
-/// Label of the always-present first entry that creates a project.
-const NEW_PROJECT_LABEL: &str = "+ New project";
-
-/// Workspace a created project is filed under when `--workspace` is absent.
-/// Matches the scope resolver's own default, so a project created here lands
-/// where a project created by the lifecycle hooks would.
-const DEFAULT_WORKSPACE: &str = "default";
-
-/// Directory names that hold dependencies or build output, never projects.
 const SKIPPED_DIRS: [&str; 8] = [
     "node_modules",
     "target",
@@ -88,129 +47,136 @@ const SKIPPED_DIRS: [&str; 8] = [
     ".venv",
     "__pycache__",
 ];
+const MAX_SCAN_ENTRIES: usize = 4096;
+const NEW_PROJECT_LABEL: &str = "+ New project";
 
-/// One launchable entry: a project the server already tracks, or a directory
-/// the scan just found.
+#[derive(Debug, Clone, Deserialize)]
+struct ProjectRow {
+    workspace_name: String,
+    project_name: String,
+    page_count: u64,
+    last_updated: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateSource {
+    Registry,
+    Scan,
+}
+
+impl CandidateSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Registry => "registry",
+            Self::Scan => "scan",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Candidate {
-    /// Workspace name when the server already tracks this checkout. `None`
-    /// for a scanned directory, which lets `run` derive the scope from the
-    /// checkout itself exactly as the lifecycle hooks would.
-    workspace: Option<String>,
-    /// Project name: the server's for tracked rows, the directory name for
-    /// scanned ones.
+    workspace: String,
     project: String,
-    /// Directory to enter before launching.
     path: PathBuf,
-    /// Dimmed trailer shown next to the label.
+    source: CandidateSource,
+    page_count: Option<u64>,
+    last_updated: Option<String>,
+    activity_us: Option<i64>,
+}
+
+impl Candidate {
+    fn label(&self) -> String {
+        terminal_text(&format!("{}/{}", self.workspace, self.project))
+    }
+
+    fn detail(&self) -> String {
+        let path = terminal_text(&self.path.to_string_lossy());
+        match self.page_count {
+            Some(count) => format!(
+                "{} | {count} page{} | {path}",
+                humanize_age(self.last_updated.as_deref()),
+                if count == 1 { "" } else { "s" }
+            ),
+            None => format!("local only | {path}"),
+        }
+    }
+}
+
+struct Choice {
+    label: String,
     detail: String,
 }
 
-/// Run the `show` subcommand.
-///
-/// # Errors
-/// Returns an error if nothing launchable is found, stdin/stdout is not a
-/// terminal, or the delegated launch fails. Returns the launched harness's
-/// exit code.
+#[derive(Serialize)]
+struct JsonProject {
+    workspace: String,
+    project: String,
+    path: String,
+    source: &'static str,
+    tracked: bool,
+    page_count: Option<u64>,
+    last_updated: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonOutput {
+    server: String,
+    projects: Vec<JsonProject>,
+    harnesses: Vec<String>,
+}
+
+/// Pick a local checkout and harness, then delegate to managed `run`.
 pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
-    let mut candidates = tracked_projects(config, args.workspace.as_deref()).await;
-
-    // The scan is what makes the picker useful on a machine where ai-memory
-    // has not run yet: without it the menu stays empty until every project has
-    // been opened once the long way, which is the very step this command
-    // exists to remove.
-    if !args.no_scan {
-        let root = std::env::current_dir().context("reading the current directory")?;
-        let mut seen: Vec<PathBuf> = candidates.iter().map(|c| normalize(&c.path)).collect();
-        for path in scan_for_projects(&root) {
-            let key = normalize(&path);
-            if seen.contains(&key) {
-                continue;
-            }
-            let Some(project) = directory_name(&path) else {
-                continue;
-            };
-            seen.push(key);
-            candidates.push(Candidate {
-                workspace: None,
-                project,
-                path,
-                detail: "not tracked yet".to_string(),
-            });
-        }
+    if args.json && (args.yolo || args.fresh || !args.native_args.is_empty()) {
+        bail!("--json only lists launch options; do not combine it with launch arguments");
     }
+    let root = std::env::current_dir()
+        .context("reading the current directory")?
+        .canonicalize()
+        .context("canonicalizing the current directory")?;
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let candidates = collect_candidates(
+        config,
+        &endpoint,
+        &root,
+        args.workspace.as_deref(),
+        !args.no_scan,
+    )
+    .await;
+    let harnesses = available_harnesses();
 
-    // Redirected output means nobody is there to press a key. Printing what
-    // the menu would have offered is more useful than refusing: it makes the
-    // list greppable, and `show` still answers "which projects can I launch?".
-    // Creating a project needs a name nobody can type here, so that entry is
-    // interactive-only and the printed list stays exactly the launchable set.
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        if candidates.is_empty() {
-            bail!(
-                "nothing to launch: the server tracks no project with a \
-                 checkout path, and no project directory was found under {}. \
-                 Run `ai-memory show` on a terminal to create one, or use \
-                 `ai-memory run <harness>` directly",
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "the current directory".to_string())
-            );
-        }
-        // Projects on stdout so the list stays greppable; the harness summary
-        // on stderr so it never contaminates a pipeline.
-        let detected: Vec<String> = RunHarnessChoice::value_variants()
-            .iter()
-            .filter(|choice| crate::commands::run::harness_available(**choice))
-            .map(|choice| harness_name(*choice))
-            .collect();
-        eprintln!(
-            "ai-memory: harnesses found in PATH: {}",
-            if detected.is_empty() {
-                "none".to_string()
-            } else {
-                detected.join(", ")
-            }
-        );
-        for candidate in &candidates {
-            println!(
-                "{}\t{}\t{}",
-                match &candidate.workspace {
-                    Some(workspace) => format!("{workspace}/{}", candidate.project),
-                    None => candidate.project.clone(),
-                },
-                candidate.path.display(),
-                candidate.detail
-            );
-        }
+    if args.json {
+        print_json(&endpoint, &candidates, &harnesses)?;
         return Ok(0);
     }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "`ai-memory show` needs a terminal; use `ai-memory show --json` to list choices in scripts"
+        );
+    }
+    if harnesses.is_empty() {
+        bail!(
+            "no supported managed harness was found in PATH (looked for: {})",
+            RunHarnessChoice::value_variants()
+                .iter()
+                .map(|choice| harness_name(*choice))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
-    banner()?;
-
-    // Creating a project leads the list because an empty machine has nothing
-    // else to offer, and because the alternative — leave the menu, `mkdir`,
-    // write a marker by hand, come back — is the same detour this command
-    // exists to remove.
     let mut project_choices = vec![Choice {
-        label: NEW_PROJECT_LABEL.to_string(),
-        detail: "create the directory and its agent context files".to_string(),
+        label: NEW_PROJECT_LABEL.to_owned(),
+        detail: "create a directory and install its agent context".to_owned(),
     }];
-    project_choices.extend(candidates.iter().map(|c| Choice {
-        label: match &c.workspace {
-            Some(workspace) => format!("{workspace}/{}", c.project),
-            None => c.project.clone(),
-        },
-        detail: c.detail.clone(),
+    project_choices.extend(candidates.iter().map(|candidate| Choice {
+        label: candidate.label(),
+        detail: candidate.detail(),
     }));
-    let Some(picked) = select("Project", &project_choices)? else {
+    let Some(project_index) = select("Project", &project_choices)? else {
         return Ok(0);
     };
-
-    // Ask for the name before the harness question: the answer decides which
-    // directory the rest of the flow is about, and a name rejected after the
-    // harness pick would throw that pick away.
-    let root = std::env::current_dir().context("reading the current directory")?;
-    let new_project = if picked == 0 {
+    let new_project = if project_index == 0 {
         let Some(name) = prompt_project_name(&root)? else {
             return Ok(0);
         };
@@ -219,98 +185,41 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         None
     };
 
-    // Offering a harness that is not installed only moves the failure one step
-    // later, after the user has already committed to a project. Ask the same
-    // question `run` would ask at launch, and ask it before the menu.
-    let harnesses: Vec<RunHarnessChoice> = RunHarnessChoice::value_variants()
+    let harness_choices = harnesses
         .iter()
-        .copied()
-        .filter(|choice| crate::commands::run::harness_available(*choice))
-        .collect();
-    if harnesses.is_empty() {
-        bail!(
-            "no supported agent harness was found in PATH (looked for: {}). \
-             Install one, or use `ai-memory run <harness> --executable <path>` \
-             for a harness installed somewhere else",
-            RunHarnessChoice::value_variants()
-                .iter()
-                .map(|h| harness_name(*h))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let harness_choices: Vec<Choice> = harnesses
-        .iter()
-        .map(|h| Choice {
-            label: harness_name(*h),
+        .map(|choice| Choice {
+            label: harness_name(*choice),
             detail: String::new(),
         })
-        .collect();
-    let Some(picked_harness) = select(
-        &format!(
-            "Agent  ·  {}",
-            new_project
-                .as_deref()
-                .unwrap_or(&project_choices[picked].label)
-        ),
-        &harness_choices,
-    )?
-    else {
+        .collect::<Vec<_>>();
+    let project_label = new_project
+        .as_deref()
+        .map(terminal_text)
+        .unwrap_or_else(|| project_choices[project_index].label.clone());
+    let Some(harness_index) = select(&format!("Agent | {project_label}"), &harness_choices)? else {
         return Ok(0);
     };
-    let harness = harnesses[picked_harness];
+    let harness = harnesses[harness_index];
 
-    // A created project pins nothing here: the marker written below already
-    // declares both scope halves, so letting `run` read it keeps one source of
-    // truth — the same one the lifecycle hooks will read on every later
-    // session, whether or not it was launched from this menu.
-    let (target, workspace, project) = match &new_project {
-        Some(name) => {
-            let workspace = args.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE);
-            (create_project(&root, name, workspace)?, None, None)
-        }
-        None => {
-            let chosen = &candidates[picked - 1];
-            if !chosen.path.is_dir() {
-                bail!(
-                    "project {} records checkout {}, which no longer exists. \
-                     Move it back, or launch from the new location once so the \
-                     path is re-recorded",
-                    chosen.project,
-                    chosen.path.display()
-                );
-            }
-            // A tracked row pins both scope halves, so a marker in the target
-            // tree cannot retarget a launch the listing already resolved. A
-            // scanned directory deliberately passes neither: `run` then derives
-            // the scope from the checkout, honouring its `.ai-memory.toml`, and
-            // the first session lands in the same scope the hooks would have
-            // chosen on their own.
-            (
-                chosen.path.clone(),
-                chosen.workspace.clone(),
-                chosen.workspace.as_ref().map(|_| chosen.project.clone()),
-            )
-        }
+    let (target, workspace, project) = if let Some(name) = new_project {
+        let workspace = args.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE);
+        let target = create_project(&root, &name, workspace, harness)?;
+        (target, workspace.to_owned(), name)
+    } else {
+        let candidate = &candidates[project_index - 1];
+        let target = revalidate_candidate(config, candidate)?;
+        (
+            target,
+            candidate.workspace.clone(),
+            candidate.project.clone(),
+        )
     };
 
-    // Entering the checkout is what makes every cwd-derived resolution inside
-    // `run` (marker discovery, hook scope, transcript adoption) agree with the
-    // project the user just picked.
-    std::env::set_current_dir(&target).with_context(|| format!("entering {}", target.display()))?;
-
-    // After the `cd`, because project-scoped skills resolve their root from the
-    // working directory: installing from the parent would drop the skills next
-    // to the sibling checkouts instead of inside the new project.
-    if new_project.is_some() {
-        install_context_files(config, harness, &target)?;
-    }
-
-    crate::commands::run::run(
+    crate::commands::run::run_from(
         config,
         RunArgs {
-            workspace,
-            project,
+            workspace: Some(workspace),
+            project: Some(project),
             workstream: None,
             new_workstream: None,
             executable: None,
@@ -319,155 +228,231 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             harness: Some(harness),
             native_args: args.native_args,
         },
+        &target,
     )
     .await
 }
 
-/// Whether `name` is accepted by the server's workspace/project rule
-/// (`^[a-z0-9][a-z0-9._-]*$`).
-///
-/// Checked here rather than at launch because a name the server rejects fails
-/// inside the lifecycle hooks, as a warning on a session that already started —
-/// long after the directory carrying that name exists on disk.
-fn valid_scope_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
+async fn collect_candidates(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    root: &Path,
+    workspace_filter: Option<&str>,
+    scan: bool,
+) -> Vec<Candidate> {
+    let query = workspace_filter
+        .filter(|value| !value.is_empty())
+        .map_or_else(Vec::new, |workspace| vec![("workspace", workspace)]);
+    let rows: Option<Vec<ProjectRow>> = match get_json(endpoint, "/api/v1/projects", &query).await {
+        Ok(rows) => Some(rows),
+        Err(error) => {
+            eprintln!(
+                "ai-memory: server project listing unavailable ({}); using client-local links and scan results",
+                terminal_text(&format!("{error:#}"))
+            );
+            None
+        }
     };
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return false;
+    let stats = rows.as_ref().map(|rows| {
+        rows.iter()
+            .cloned()
+            .map(|row| ((row.workspace_name.clone(), row.project_name.clone()), row))
+            .collect::<HashMap<_, _>>()
+    });
+
+    let links = match project_registry::links_for_server(config, endpoint) {
+        Ok(links) => links,
+        Err(error) => {
+            eprintln!(
+                "ai-memory: client project registry unavailable ({}); using scan results",
+                terminal_text(&format!("{error:#}"))
+            );
+            Vec::new()
+        }
+    };
+    let mut candidates = Vec::new();
+    let mut stale_warnings = 0usize;
+    for link in links {
+        if workspace_filter.is_some_and(|filter| filter != link.workspace) {
+            continue;
+        }
+        let key = (link.workspace.clone(), link.project.clone());
+        if stats
+            .as_ref()
+            .is_some_and(|known| !known.contains_key(&key))
+        {
+            continue;
+        }
+        let path = match validate_registered_path(&link.path) {
+            Ok(path) => path,
+            Err(error) => {
+                if stale_warnings < 3 {
+                    eprintln!(
+                        "ai-memory: ignored stale client project link {}/{} ({})",
+                        terminal_text(&link.workspace),
+                        terminal_text(&link.project),
+                        terminal_text(&format!("{error:#}"))
+                    );
+                }
+                stale_warnings += 1;
+                continue;
+            }
+        };
+        let row = stats.as_ref().and_then(|known| known.get(&key));
+        push_candidate(
+            &mut candidates,
+            candidate_from(
+                path,
+                link.workspace,
+                link.project,
+                CandidateSource::Registry,
+                row,
+                Some(&link.linked_at),
+            ),
+        );
     }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
-}
-
-/// Marker contents pinning both scope halves for a freshly created project.
-///
-/// Both keys are written even though `project` defaults to the directory
-/// basename: the default follows the directory, so a later rename or a
-/// `cd` into a subdirectory would silently fork the memory into a second
-/// project. Pinning them means the scope survives both.
-fn marker_body(workspace: &str, project: &str) -> String {
-    format!(
-        "# Created by `ai-memory show`. Declares the scope every wiki page,\n\
-         # observation, and handoff from this directory is filed under.\n\
-         # Both keys are pinned on purpose: the defaults follow the directory\n\
-         # name, so renaming or working from a subdirectory would otherwise\n\
-         # start a second, empty project. See docs/marker-file.md.\n\
-         workspace = \"{workspace}\"\n\
-         project = \"{project}\"\n"
-    )
-}
-
-/// Instruction file the routing block belongs in for `harness`.
-///
-/// Claude Code reads `CLAUDE.md`; every other supported harness converged on
-/// `AGENTS.md`. Writing the one the chosen agent actually reads is what makes
-/// the block take effect on the very first session.
-const fn instruction_file(harness: RunHarnessChoice) -> &'static str {
-    match harness {
-        RunHarnessChoice::Claude => "CLAUDE.md",
-        _ => "AGENTS.md",
+    if stale_warnings > 3 {
+        eprintln!(
+            "ai-memory: ignored {} additional stale client project links",
+            stale_warnings - 3
+        );
     }
-}
 
-/// Create `name` under `parent` with its scope marker.
-///
-/// # Errors
-/// Returns an error when the directory already exists or cannot be created,
-/// or when the marker cannot be written.
-fn create_project(parent: &Path, name: &str, workspace: &str) -> Result<PathBuf> {
-    // Both halves land inside a quoted TOML string, so an unchecked value can
-    // close the quote and append keys of its own. The name comes from the
-    // prompt, which already rejects it; `--workspace` reaches here verbatim and
-    // is checked at the same boundary, before anything is written.
-    for (label, value) in [("project name", name), ("workspace", workspace)] {
-        if !valid_scope_name(value) {
-            bail!(
-                "invalid {label} {value:?}: lowercase letters, digits, dot,                  dash and underscore only, starting with a letter or digit"
+    if scan {
+        for path in scan_for_projects(root) {
+            let Ok((workspace, project)) = super::resolve_scope_for_path(config, &path) else {
+                continue;
+            };
+            if workspace_filter.is_some_and(|filter| filter != workspace) {
+                continue;
+            }
+            let key = (workspace.clone(), project.clone());
+            let row = stats.as_ref().and_then(|known| known.get(&key));
+            push_candidate(
+                &mut candidates,
+                candidate_from(path, workspace, project, CandidateSource::Scan, row, None),
             );
         }
     }
-    let path = parent.join(name);
-    // `create_dir` rather than `create_dir_all`: it fails when the directory
-    // already exists, which is the check that keeps a mistyped name from
-    // adopting an unrelated tree between the prompt's look and this write.
-    std::fs::create_dir(&path)
-        .with_context(|| format!("creating project directory {}", path.display()))?;
-    apply_atomic(&path.join(".ai-memory.toml"), |_| {
-        Ok(marker_body(workspace, name))
-    })
-    .with_context(|| format!("writing the scope marker in {}", path.display()))?;
-    println!("✓ created {}", path.display());
-    Ok(path)
+    candidates.sort_by(|left, right| {
+        right
+            .activity_us
+            .cmp(&left.activity_us)
+            .then_with(|| left.workspace.cmp(&right.workspace))
+            .then_with(|| left.project.cmp(&right.project))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates
 }
 
-/// Write the agent context files into the new project: the routing block in
-/// the instruction file the chosen harness reads, plus the managed ai-memory
-/// Agent Skills that block refers to.
-///
-/// Delegates to `install-instructions` so a project created here is byte-for-
-/// byte what `ai-memory install-instructions` produces, and stays that way as
-/// the snippet evolves.
-///
-/// # Errors
-/// Propagates instruction/skill installation failures.
-fn install_context_files(config: &Config, harness: RunHarnessChoice, path: &Path) -> Result<()> {
-    install_instructions::run(
-        config,
-        InstallInstructionsArgs {
-            target: Some(path.join(instruction_file(harness))),
-            print: false,
-            no_skills: false,
-            skills_scope: None,
-            skills_agent: None,
-            skills_target_dir: None,
-            skills_force: false,
-        },
-    )
+fn candidate_from(
+    path: PathBuf,
+    workspace: String,
+    project: String,
+    source: CandidateSource,
+    row: Option<&ProjectRow>,
+    local_activity: Option<&str>,
+) -> Candidate {
+    Candidate {
+        workspace,
+        project,
+        activity_us: row
+            .and_then(|row| timestamp_us(row.last_updated.as_deref()))
+            .or_else(|| timestamp_us(local_activity))
+            .or_else(|| directory_modified_us(&path)),
+        page_count: row.map(|row| row.page_count),
+        last_updated: row.and_then(|row| row.last_updated.clone()),
+        path,
+        source,
+    }
 }
 
-/// Projects the server already tracks, newest activity first.
-///
-/// A listing failure is reported and treated as empty rather than fatal: the
-/// scan alone still produces a usable menu, and a first run on a machine whose
-/// server is not up yet is exactly when the picker is most useful.
-async fn tracked_projects(config: &Config, workspace: Option<&str>) -> Vec<Candidate> {
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let query: Vec<(&str, &str)> = match workspace {
-        Some(workspace) if !workspace.is_empty() => vec![("workspace", workspace)],
-        _ => Vec::new(),
-    };
-    let rows: Vec<ProjectRow> = match get_json(&endpoint, "/api/v1/projects", &query).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            eprintln!("ai-memory: listing tracked projects failed ({error:#}); showing scan only");
-            return Vec::new();
+fn push_candidate(candidates: &mut Vec<Candidate>, candidate: Candidate) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|existing| existing.path == candidate.path)
+    {
+        if existing.page_count.is_none() && candidate.page_count.is_some() {
+            existing.page_count = candidate.page_count;
+            existing.last_updated = candidate.last_updated;
+            existing.activity_us = candidate.activity_us;
         }
-    };
-    rows.into_iter()
-        .filter_map(|row| {
-            // A row without `repo_path` has no directory to enter — it was
-            // created by explicit scope arguments, or its checkout moved.
-            let path = row.repo_path.filter(|p| !p.is_empty())?;
-            Some(Candidate {
-                detail: format!(
-                    "{}  ·  {} page{}",
-                    humanize_age(row.last_updated.as_deref()),
-                    row.page_count,
-                    if row.page_count == 1 { "" } else { "s" }
-                ),
-                workspace: Some(row.workspace_name),
-                project: row.project_name,
-                path: PathBuf::from(path),
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn print_json(
+    endpoint: &ServerEndpoint,
+    candidates: &[Candidate],
+    harnesses: &[RunHarnessChoice],
+) -> Result<()> {
+    let output = JsonOutput {
+        server: endpoint.identity(),
+        projects: candidates
+            .iter()
+            .map(|candidate| JsonProject {
+                workspace: candidate.workspace.clone(),
+                project: candidate.project.clone(),
+                path: candidate.path.to_string_lossy().into_owned(),
+                source: candidate.source.as_str(),
+                tracked: candidate.page_count.is_some(),
+                page_count: candidate.page_count,
+                last_updated: candidate.last_updated.clone(),
             })
-        })
+            .collect(),
+        harnesses: harnesses
+            .iter()
+            .map(|choice| harness_name(*choice))
+            .collect(),
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer_pretty(&mut out, &output).context("rendering project list JSON")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn available_harnesses() -> Vec<RunHarnessChoice> {
+    RunHarnessChoice::value_variants()
+        .iter()
+        .copied()
+        .filter(|choice| crate::commands::run::harness_available(*choice))
         .collect()
 }
 
-/// Immediate subdirectories of `root` that look like projects, plus `root`
-/// itself when it is one. Depth 1 only — deep trees are what make a scan slow
-/// enough to be noticed, and a workspace directory holds its checkouts flat.
-fn scan_for_projects(root: &std::path::Path) -> Vec<PathBuf> {
+fn validate_registered_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("stored checkout path is not absolute");
+    }
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("checkout {} no longer resolves", path.display()))?;
+    if canonical != path {
+        bail!("checkout path now resolves somewhere else");
+    }
+    if !canonical.is_dir() {
+        bail!("checkout path is not a directory");
+    }
+    Ok(canonical)
+}
+
+fn revalidate_candidate(config: &Config, candidate: &Candidate) -> Result<PathBuf> {
+    let path = validate_registered_path(&candidate.path)?;
+    let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
+    if workspace != candidate.workspace || project != candidate.project {
+        bail!(
+            "checkout scope changed after it was listed: expected {}/{}, found {}/{}; rerun `ai-memory show`",
+            terminal_text(&candidate.workspace),
+            terminal_text(&candidate.project),
+            terminal_text(&workspace),
+            terminal_text(&project)
+        );
+    }
+    Ok(path)
+}
+
+fn scan_for_projects(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     if is_project_dir(root) {
         found.push(root.to_path_buf());
@@ -475,176 +460,216 @@ fn scan_for_projects(root: &std::path::Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return found;
     };
-    for entry in entries.flatten() {
+    for entry in entries.take(MAX_SCAN_ENTRIES).flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        // Dot-directories are configuration and caches; the skip list covers
-        // dependency and build trees that can each hold thousands of entries.
         if name.starts_with('.') || SKIPPED_DIRS.contains(&name) {
             continue;
         }
-        if entry.file_type().is_ok_and(|t| t.is_dir()) && is_project_dir(&path) {
-            found.push(path);
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && is_project_dir(&path)
+            && let Ok(canonical) = path.canonicalize()
+        {
+            found.push(canonical);
         }
     }
-    sort_by_recency(&mut found, directory_modified);
+    found.sort_by(|left, right| {
+        directory_modified_us(right)
+            .cmp(&directory_modified_us(left))
+            .then_with(|| left.cmp(right))
+    });
     found
 }
 
-/// Newest first, then by path.
-///
-/// The tracked half of the menu is ordered by activity, and the scanned half
-/// used to be alphabetical — which buried the project you just created under
-/// every checkout whose name sorts earlier. Both halves now answer the same
-/// question: what did I touch most recently? Directories whose timestamp
-/// cannot be read sort last rather than to the top, and the path tiebreak
-/// keeps the order stable when timestamps match.
-fn sort_by_recency(paths: &mut [PathBuf], at: impl Fn(&Path) -> Option<SystemTime>) {
-    paths.sort_by(|left, right| at(right).cmp(&at(left)).then_with(|| left.cmp(right)));
-}
-
-/// Directory mtime, or `None` when the filesystem will not report one.
-fn directory_modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-}
-
-/// Whether a directory carries any recognised project marker.
-fn is_project_dir(path: &std::path::Path) -> bool {
+fn is_project_dir(path: &Path) -> bool {
     PROJECT_MARKERS
         .iter()
         .any(|marker| path.join(marker).exists())
 }
 
-/// Canonical form for duplicate detection, falling back to the path as given
-/// when the filesystem cannot resolve it.
-fn normalize(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+fn directory_modified_us(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(system_time_us)
 }
 
-/// Directory name as a project name, or `None` for a path without one.
-fn directory_name(path: &std::path::Path) -> Option<String> {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .map(ToString::to_string)
+fn system_time_us(time: SystemTime) -> Option<i64> {
+    let micros = time.duration_since(UNIX_EPOCH).ok()?.as_micros();
+    i64::try_from(micros).ok()
 }
 
-/// Print the start-up banner.
-///
-/// # Errors
-/// Returns an error if stdout cannot be written or flushed.
-fn banner() -> Result<()> {
-    let mut out = std::io::stdout();
-    let art = [
-        r"        _        _ __ ___   ___ _ __ ___   ___  _ __ _   _ ",
-        r"  __ _ (_)      | '_ ` _ \ / _ \ '_ ` _ \ / _ \| '__| | | |",
-        r" / _` || |_____ | | | | | |  __/ | | | | | (_) | |  | |_| |",
-        r" \__,_||_|      |_| |_| |_|\___|_| |_| |_|\___/|_|   \__, |",
-        r"                                                     |___/ ",
-    ];
-    writeln!(out)?;
-    for line in art {
-        writeln!(out, "{}", line.green().bold())?;
+fn timestamp_us(raw: Option<&str>) -> Option<i64> {
+    raw?.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|ts| ts.as_microsecond())
+}
+
+fn portable_component(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '.' | '-' | '_')
+        })
+}
+
+fn marker_body(workspace: &str, project: &str) -> String {
+    let mut document = toml_edit::DocumentMut::new();
+    document["workspace"] = toml_edit::value(workspace);
+    document["project"] = toml_edit::value(project);
+    format!(
+        "# Created by `ai-memory show`. Both scope names are pinned so moving\n\
+         # into a subdirectory or renaming this checkout does not fork memory.\n\
+         {document}"
+    )
+}
+
+fn create_project(
+    parent: &Path,
+    name: &str,
+    workspace: &str,
+    harness: RunHarnessChoice,
+) -> Result<PathBuf> {
+    create_project_with_initializer(parent, name, workspace, |staging| {
+        install_context_files(harness, staging)
+    })
+}
+
+fn create_project_with_initializer(
+    parent: &Path,
+    name: &str,
+    workspace: &str,
+    initialize: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
+    if !portable_component(name) {
+        bail!(
+            "invalid project name {name:?}: use lowercase ASCII letters, digits, dot, dash, or underscore, starting with a letter or digit"
+        );
     }
-    writeln!(
-        out,
-        "{}",
-        "  long-term memory for AI coding agents".dark_green()
-    )?;
-    writeln!(
-        out,
-        "{}",
-        "  by Fabio Akita · github.com/akitaonrails/ai-memory".dark_green()
-    )?;
-    writeln!(out)?;
-    out.flush()?;
-    Ok(())
+    let target = parent.join(name);
+    if target.exists() {
+        bail!("project directory already exists: {}", target.display());
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".ai-memory-project-")
+        .tempdir_in(parent)
+        .with_context(|| format!("creating a staging directory in {}", parent.display()))?;
+    ai_memory_wiki::write_atomic(
+        &staging.path().join(".ai-memory.toml"),
+        marker_body(workspace, name).as_bytes(),
+    )
+    .context("writing the staged project marker")?;
+    initialize(staging.path())?;
+    if target.exists() {
+        bail!(
+            "project directory appeared while it was being prepared: {}",
+            target.display()
+        );
+    }
+    std::fs::rename(staging.path(), &target)
+        .with_context(|| format!("publishing new project {}", target.display()))?;
+    let target = target
+        .canonicalize()
+        .with_context(|| format!("canonicalizing new project {}", target.display()))?;
+    println!("created {}", target.display());
+    Ok(target)
 }
 
-/// Human-readable age of an ISO-8601 timestamp.
+fn install_context_files(harness: RunHarnessChoice, path: &Path) -> Result<()> {
+    let (instruction, agent, skill_root) = match harness {
+        RunHarnessChoice::Claude => (
+            "CLAUDE.md",
+            InstallSkillsAgent::ClaudeCode,
+            path.join(".claude/skills"),
+        ),
+        _ => (
+            "AGENTS.md",
+            InstallSkillsAgent::Agents,
+            path.join(".agents/skills"),
+        ),
+    };
+    install_instructions::run_quiet(InstallInstructionsArgs {
+        target: Some(path.join(instruction)),
+        print: false,
+        no_skills: false,
+        skills_scope: None,
+        skills_agent: Some(agent),
+        skills_target_dir: Some(skill_root),
+        skills_force: false,
+    })
+}
+
 fn humanize_age(timestamp: Option<&str>) -> String {
     let Some(raw) = timestamp else {
-        return "no pages yet".to_string();
+        return "no pages yet".to_owned();
     };
     let Ok(then) = raw.parse::<jiff::Timestamp>() else {
-        return raw.to_string();
+        return "unknown activity".to_owned();
     };
     let seconds = (jiff::Timestamp::now() - then).get_seconds();
     if seconds < 0 {
-        return "just now".to_string();
+        return "just now".to_owned();
     }
     let (value, unit) = match seconds {
-        s if s < 60 => return "just now".to_string(),
-        s if s < 3_600 => (s / 60, "minute"),
-        s if s < 86_400 => (s / 3_600, "hour"),
-        s if s < 2_592_000 => (s / 86_400, "day"),
-        s => (s / 2_592_000, "month"),
+        value if value < 60 => return "just now".to_owned(),
+        value if value < 3_600 => (value / 60, "minute"),
+        value if value < 86_400 => (value / 3_600, "hour"),
+        value if value < 2_592_000 => (value / 86_400, "day"),
+        value => (value / 2_592_000, "month"),
     };
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
 }
 
-/// Display name for a harness variant, taken from the same clap metadata the
-/// parser accepts, so the menu can never drift from the CLI surface.
 fn harness_name(harness: RunHarnessChoice) -> String {
     harness
         .to_possible_value()
-        .map_or_else(|| "unknown".to_string(), |v| v.get_name().to_string())
+        .map_or_else(|| "unknown".to_owned(), |value| value.get_name().to_owned())
 }
 
-/// Restores raw mode and cursor visibility even when the caller bails early.
+fn terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort: the process is already unwinding or finishing, and a
-        // failed restore must not mask the original error.
         let _ = terminal::disable_raw_mode();
         let _ = execute!(std::io::stdout(), cursor::Show);
     }
 }
 
-/// Draw an arrow-key menu and return the chosen index, or `None` when the
-/// user cancels with `Esc`, `q`, or `Ctrl-C`.
-///
-/// # Errors
-/// Returns an error when stdout/stdin is not a terminal, or when raw mode
-/// cannot be entered.
 fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
     if choices.is_empty() {
         bail!("nothing to choose from");
     }
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        bail!(
-            "`ai-memory show` needs an interactive terminal. Use \
-             `ai-memory run <harness>` from the project directory in scripts \
-             and pipelines"
-        );
-    }
-
     terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = TerminalGuard;
     execute!(std::io::stdout(), cursor::Hide)?;
-
-    // Windows reports a release event for every press. The previous menu's
-    // Enter release is still queued when this one opens, and reading it here
-    // would select the first entry before the user sees the list. Discard
-    // whatever is already pending before taking input.
     while event::poll(std::time::Duration::from_millis(0))? {
         let _ = event::read()?;
     }
 
-    let mut cursor_at = 0usize;
+    let mut selected = 0usize;
     let mut offset = 0usize;
     let mut drawn = 0u16;
     loop {
-        drawn = draw(title, choices, cursor_at, &mut offset, drawn)?;
-        // Only key presses matter. Releases and repeats are what made every
-        // arrow move two entries on Windows; resize and mouse events fall
-        // through and redraw on the next iteration.
+        drawn = draw(title, choices, selected, &mut offset, drawn)?;
         let Event::Key(KeyEvent {
             code,
             modifiers,
@@ -656,20 +681,18 @@ fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
         };
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
-                cursor_at = cursor_at.checked_sub(1).unwrap_or(choices.len() - 1);
+                selected = selected.checked_sub(1).unwrap_or(choices.len() - 1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                cursor_at = (cursor_at + 1) % choices.len();
-            }
-            KeyCode::Home => cursor_at = 0,
-            KeyCode::End => cursor_at = choices.len() - 1,
-            KeyCode::PageUp => cursor_at = cursor_at.saturating_sub(viewport_rows()),
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % choices.len(),
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = choices.len() - 1,
+            KeyCode::PageUp => selected = selected.saturating_sub(viewport_rows()),
             KeyCode::PageDown => {
-                cursor_at = (cursor_at + viewport_rows()).min(choices.len() - 1);
+                selected = (selected + viewport_rows()).min(choices.len() - 1);
             }
             KeyCode::Enter => {
                 clear(drawn)?;
-                return Ok(Some(cursor_at));
+                return Ok(Some(selected));
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 clear(drawn)?;
@@ -684,17 +707,6 @@ fn select(title: &str, choices: &[Choice]) -> Result<Option<usize>> {
     }
 }
 
-/// Ask for the new project's name, returning `None` when the user cancels
-/// with `Esc` or `Ctrl-C`.
-///
-/// Rejections are shown in place and leave the typed text alone: the name is
-/// validated against the same rule the server enforces, and against `parent`,
-/// so every reason the creation could fail is answered while it can still be
-/// corrected by typing.
-///
-/// # Errors
-/// Returns an error when raw mode cannot be entered or the terminal cannot be
-/// written.
 fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
     terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = TerminalGuard;
@@ -704,7 +716,7 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
     }
 
     let mut name = String::new();
-    let mut problem: Option<String> = None;
+    let mut problem = None;
     let mut drawn = 0u16;
     loop {
         drawn = draw_prompt("New project name", &name, problem.as_deref(), drawn)?;
@@ -737,11 +749,8 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
                     return Ok(Some(name));
                 }
             }
-            // Control-modified keys are shortcuts, not text. Everything the
-            // rule rejects is still accepted into the buffer so the reason
-            // shows up under the line the user is looking at.
-            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                name.push(c);
+            KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                name.push(character);
                 problem = None;
             }
             _ => {}
@@ -749,17 +758,12 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Why `name` cannot be created under `parent`, or `None` when it can.
 fn rejection(parent: &Path, name: &str) -> Option<String> {
     if name.is_empty() {
-        return Some("type a name".to_string());
+        return Some("type a name".to_owned());
     }
-    if !valid_scope_name(name) {
-        return Some(
-            "lowercase letters, digits, dot, dash and underscore only, \
-             starting with a letter or digit"
-                .to_string(),
-        );
+    if !portable_component(name) {
+        return Some("use lowercase letters, digits, dot, dash, or underscore".to_owned());
     }
     if parent.join(name).exists() {
         return Some(format!("{name} already exists here"));
@@ -767,113 +771,102 @@ fn rejection(parent: &Path, name: &str) -> Option<String> {
     None
 }
 
-/// Render the name prompt in place and return how many lines it occupies.
 fn draw_prompt(title: &str, name: &str, problem: Option<&str>, previous: u16) -> Result<u16> {
-    let (cols, _) = terminal::size().unwrap_or((80, 24));
-    let width = usize::from(cols.max(20)).saturating_sub(1);
-
+    let (columns, _) = terminal::size().unwrap_or((80, 24));
+    let width = usize::from(columns.max(20)).saturating_sub(1);
     let mut out = std::io::stdout();
     if previous > 0 {
         execute!(out, cursor::MoveUp(previous))?;
     }
     write!(out, "\r")?;
     execute!(out, terminal::Clear(terminal::ClearType::FromCursorDown))?;
-    write!(out, "  {}\r\n", truncate(title, width).green().bold())?;
-    // A block stands in for the cursor, which stays hidden so the redraw
-    // cannot leave it parked on a line it already erased.
+    write!(
+        out,
+        "  {}\r\n",
+        truncate(&terminal_text(title), width).green().bold()
+    )?;
     write!(
         out,
         "  > {}{}\r\n",
-        truncate(name, width.saturating_sub(5)).as_str().bold(),
-        "▏".green()
+        truncate(&terminal_text(name), width.saturating_sub(5))
+            .as_str()
+            .bold(),
+        "|".green()
     )?;
-    let footer = match problem {
-        Some(problem) => format!("  {problem}"),
-        None => "  enter create · esc cancel".to_string(),
-    };
+    let footer = problem
+        .map(|problem| format!("  {}", terminal_text(problem)))
+        .unwrap_or_else(|| "  enter create | esc cancel".to_owned());
     let footer = truncate(&footer, width);
-    match problem {
-        Some(_) => write!(out, "{}\r\n", footer.as_str().red())?,
-        None => write!(out, "{}\r\n", footer.as_str().dark_grey())?,
+    if problem.is_some() {
+        write!(out, "{}\r\n", footer.as_str().red())?;
+    } else {
+        write!(out, "{}\r\n", footer.as_str().dark_grey())?;
     }
     out.flush()?;
-
     Ok(3)
 }
 
-/// How many entries fit on screen at once.
-///
-/// The redraw walks the cursor back up over the block it just printed, which
-/// only lands on the right line while the whole block fits in the window. A
-/// list taller than the terminal scrolls the top away and every later redraw
-/// then targets the wrong row — which is what made a long project list flash
-/// and disappear.
 fn viewport_rows() -> usize {
     let (_, rows) = terminal::size().unwrap_or((80, 24));
-    // Title, hint, and one row of slack for the line the cursor rests on.
     usize::from(rows).saturating_sub(3).max(3)
 }
 
-/// First visible entry that keeps `cursor_at` inside a `viewport`-tall window,
-/// moving `current` as little as possible so the list does not jump around
-/// while the cursor travels within the window.
-fn scroll_offset(cursor_at: usize, total: usize, viewport: usize, current: usize) -> usize {
+fn scroll_offset(selected: usize, total: usize, viewport: usize, current: usize) -> usize {
     let mut offset = current;
-    if cursor_at < offset {
-        offset = cursor_at;
-    } else if cursor_at >= offset + viewport {
-        offset = cursor_at + 1 - viewport;
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset + viewport {
+        offset = selected + 1 - viewport;
     }
     offset.min(total.saturating_sub(viewport))
 }
 
-/// Shorten to `width` characters, marking the cut with an ellipsis. Keeps each
-/// rendered line inside the terminal so nothing wraps onto a second row and
-/// desynchronises the redraw's line count.
 fn truncate(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
     if text.chars().count() <= width {
-        return text.to_string();
+        return text.to_owned();
     }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    let mut output = text
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    output.push('…');
+    output
 }
 
-/// Render the menu in place and return how many lines it occupies.
-///
-/// `offset` is the first visible entry, carried between draws so the window
-/// only moves when the cursor would leave it.
 fn draw(
     title: &str,
     choices: &[Choice],
-    cursor_at: usize,
+    selected: usize,
     offset: &mut usize,
     previous: u16,
 ) -> Result<u16> {
-    let (cols, _) = terminal::size().unwrap_or((80, 24));
-    let width = usize::from(cols.max(20)).saturating_sub(1);
+    let (columns, _) = terminal::size().unwrap_or((80, 24));
+    let width = usize::from(columns.max(20)).saturating_sub(1);
     let viewport = viewport_rows().min(choices.len());
-
-    *offset = scroll_offset(cursor_at, choices.len(), viewport, *offset);
+    *offset = scroll_offset(selected, choices.len(), viewport, *offset);
 
     let mut out = std::io::stdout();
     if previous > 0 {
         execute!(out, cursor::MoveUp(previous))?;
     }
-    // Raw mode disables the implicit carriage return, so every line needs an
-    // explicit `\r`.
     write!(out, "\r")?;
     execute!(out, terminal::Clear(terminal::ClearType::FromCursorDown))?;
-    write!(out, "  {}\r\n", truncate(title, width).green().bold())?;
-
+    write!(
+        out,
+        "  {}\r\n",
+        truncate(&terminal_text(title), width).green().bold()
+    )?;
     for (index, choice) in choices.iter().enumerate().skip(*offset).take(viewport) {
-        let marker = if index == cursor_at { "  > " } else { "    " };
-        let label = truncate(&choice.label, width.saturating_sub(marker.len()));
+        let marker = if index == selected { "  > " } else { "    " };
+        let label = truncate(
+            &terminal_text(&choice.label),
+            width.saturating_sub(marker.len()),
+        );
         let used = marker.len() + label.chars().count();
-        if index == cursor_at {
+        if index == selected {
             write!(
                 out,
                 "{}{}",
@@ -884,31 +877,27 @@ fn draw(
             write!(out, "{marker}{}", label.as_str().reset())?;
         }
         if !choice.detail.is_empty() && used + 2 < width {
-            let detail = truncate(&choice.detail, width - used - 2);
+            let detail = truncate(&terminal_text(&choice.detail), width - used - 2);
             write!(out, "  {}", detail.as_str().dark_grey())?;
         }
         write!(out, "\r\n")?;
     }
-
     let hint = if choices.len() > viewport {
         format!(
-            "  ↑/↓ move · pgup/pgdn page · enter select · esc cancel   [{}/{}]",
-            cursor_at + 1,
+            "  up/down move | pgup/pgdn page | enter select | esc cancel [{}/{}]",
+            selected + 1,
             choices.len()
         )
     } else {
-        "  ↑/↓ move · enter select · esc cancel".to_string()
+        "  up/down move | enter select | esc cancel".to_owned()
     };
     write!(out, "{}\r\n", truncate(&hint, width).dark_grey())?;
     out.flush()?;
-
-    // title + visible entries + hint
     Ok(u16::try_from(viewport)
         .unwrap_or(u16::MAX)
         .saturating_add(2))
 }
 
-/// Erase the menu block so the launched agent starts on a clean screen.
 fn clear(drawn: u16) -> Result<()> {
     let mut out = std::io::stdout();
     if drawn > 0 {
@@ -923,100 +912,161 @@ fn clear(drawn: u16) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn humanize_age_reports_missing_pages() {
-        assert_eq!(humanize_age(None), "no pages yet");
-    }
-
-    #[test]
-    fn humanize_age_passes_through_unparseable_timestamps() {
-        assert_eq!(humanize_age(Some("not-a-timestamp")), "not-a-timestamp");
-    }
-
-    #[test]
-    fn humanize_age_singularises_and_pluralises() {
-        let two_days = jiff::Timestamp::now() - std::time::Duration::from_secs(2 * 86_400);
-        assert_eq!(humanize_age(Some(&two_days.to_string())), "2 days ago");
-
-        let one_hour = jiff::Timestamp::now() - std::time::Duration::from_secs(3_600);
-        assert_eq!(humanize_age(Some(&one_hour.to_string())), "1 hour ago");
-    }
-
-    /// A clock skew that puts a page in the future must not underflow into a
-    /// nonsensical age.
-    #[test]
-    fn humanize_age_clamps_future_timestamps() {
-        let ahead = jiff::Timestamp::now() + std::time::Duration::from_secs(600);
-        assert_eq!(humanize_age(Some(&ahead.to_string())), "just now");
-    }
-
-    /// The menu labels come from clap's own metadata, so every harness the
-    /// parser accepts can be named by the picker.
-    #[test]
-    fn harness_names_cover_every_parser_variant() {
-        for harness in RunHarnessChoice::value_variants() {
-            assert_ne!(harness_name(*harness), "unknown");
+    fn config_at(path: &Path) -> Config {
+        Config {
+            data_dir: path.to_path_buf(),
+            ..Config::default()
         }
     }
 
-    /// Availability must not panic or depend on the working directory: the
-    /// picker calls it for every variant before drawing the menu, from
-    /// whatever directory the user happened to be in.
+    fn make_project(root: &Path, name: &str, marker: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(marker), b"").unwrap();
+        path.canonicalize().unwrap()
+    }
+
     #[test]
-    fn availability_is_answerable_for_every_variant() {
+    fn terminal_text_removes_control_sequences() {
+        assert_eq!(terminal_text("safe\n\u{1b}[31mname\r"), "safe??[31mname?");
+    }
+
+    #[test]
+    fn invalid_server_timestamp_is_not_echoed_to_the_terminal() {
+        assert_eq!(humanize_age(Some("\u{1b}[31m")), "unknown activity");
+    }
+
+    #[test]
+    fn registry_activity_orders_projects_when_server_metadata_is_unavailable() {
+        let timestamp = "2026-08-01T12:00:00Z";
+        let candidate = candidate_from(
+            PathBuf::from("/missing-is-fine-for-this-pure-test"),
+            "default".to_owned(),
+            "app".to_owned(),
+            CandidateSource::Registry,
+            None,
+            Some(timestamp),
+        );
+
+        assert_eq!(candidate.activity_us, timestamp_us(Some(timestamp)));
+    }
+
+    #[test]
+    fn portable_project_components_reject_injection_and_traversal() {
+        for valid in ["ai-memory", "app2", "my_project", "web.api"] {
+            assert!(portable_component(valid));
+        }
+        for invalid in ["", "../other", "Upper", "with space", "x\nproject", "x\""] {
+            assert!(!portable_component(invalid));
+        }
+    }
+
+    #[test]
+    fn scan_is_depth_one_and_skips_build_directories() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let restore = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let project = make_project(tmp.path(), "app", "Cargo.toml");
+        let nested = tmp.path().join("plain/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("go.mod"), b"").unwrap();
+        make_project(tmp.path(), "target", "Cargo.toml");
 
-        let answers: Vec<bool> = RunHarnessChoice::value_variants()
-            .iter()
-            .map(|h| crate::commands::run::harness_available(*h))
-            .collect();
-
-        std::env::set_current_dir(restore).unwrap();
-        assert_eq!(answers.len(), RunHarnessChoice::value_variants().len());
+        assert_eq!(scan_for_projects(tmp.path()), vec![project]);
     }
 
     #[test]
-    fn selecting_from_an_empty_list_is_an_error() {
-        assert!(select("empty", &[]).is_err());
+    fn failed_project_initialization_rolls_back_the_staging_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let result = create_project_with_initializer(tmp.path(), "app", "default", |_path| {
+            bail!("synthetic failure")
+        });
+
+        assert!(result.is_err());
+        assert!(!tmp.path().join("app").exists());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ai-memory-project-")
+        }));
     }
 
-    /// The redraw walks back up over exactly the block it printed, so the
-    /// window must never expose more entries than fit — a taller block scrolls
-    /// the top away and every later redraw targets the wrong row.
     #[test]
-    fn scroll_offset_keeps_the_cursor_inside_the_window() {
-        // Cursor within the current window leaves it untouched.
-        assert_eq!(scroll_offset(2, 24, 5, 0), 0);
-        // Falling off the bottom scrolls by the minimum.
+    fn created_project_is_published_only_after_initialization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = create_project_with_initializer(tmp.path(), "app", "default", |staging| {
+            assert!(!tmp.path().join("app").exists());
+            std::fs::write(staging.join("AGENTS.md"), b"ready")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(path.join("AGENTS.md")).unwrap(), b"ready");
+        let marker = std::fs::read_to_string(path.join(".ai-memory.toml")).unwrap();
+        assert!(marker.contains("workspace = \"default\""));
+        assert!(marker.contains("project = \"app\""));
+    }
+
+    #[test]
+    fn marker_encoding_preserves_an_existing_nonportable_workspace_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path =
+            create_project_with_initializer(tmp.path(), "app", "Team \"One\"", |_staging| Ok(()))
+                .unwrap();
+
+        let marker = std::fs::read_to_string(path.join(".ai-memory.toml")).unwrap();
+        let document = marker.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(document["workspace"].as_str(), Some("Team \"One\""));
+    }
+
+    #[test]
+    fn candidate_is_rejected_when_its_scope_changes_after_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = make_project(tmp.path(), "app", ".ai-memory.toml");
+        std::fs::write(
+            path.join(".ai-memory.toml"),
+            b"workspace = \"one\"\nproject = \"app\"\n",
+        )
+        .unwrap();
+        let candidate = Candidate {
+            workspace: "one".to_owned(),
+            project: "app".to_owned(),
+            path: path.clone(),
+            source: CandidateSource::Scan,
+            page_count: None,
+            last_updated: None,
+            activity_us: None,
+        };
+        std::fs::write(
+            path.join(".ai-memory.toml"),
+            b"workspace = \"two\"\nproject = \"app\"\n",
+        )
+        .unwrap();
+
+        assert!(revalidate_candidate(&config_at(tmp.path()), &candidate).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_path_rejects_a_checkout_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let checkout = tmp.path().join("checkout");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let stored = checkout.canonicalize().unwrap();
+        std::fs::remove_dir(&checkout).unwrap();
+        symlink(&other, &checkout).unwrap();
+
+        assert!(validate_registered_path(&stored).is_err());
+    }
+
+    #[test]
+    fn scroll_and_truncation_stay_inside_the_viewport() {
         assert_eq!(scroll_offset(5, 24, 5, 0), 1);
-        assert_eq!(scroll_offset(6, 24, 5, 1), 2);
-        // Falling off the top scrolls back up to the cursor.
-        assert_eq!(scroll_offset(3, 24, 5, 7), 3);
-        // The window never runs past the end of the list.
         assert_eq!(scroll_offset(23, 24, 5, 22), 19);
-    }
-
-    #[test]
-    fn scroll_offset_is_zero_when_everything_fits() {
-        for cursor in 0..5 {
-            assert_eq!(scroll_offset(cursor, 5, 10, 0), 0);
-        }
-    }
-
-    #[test]
-    fn truncate_marks_the_cut_and_respects_the_width() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("exactfit", 8), "exactfit");
-        assert_eq!(truncate("truncate-me", 5), "trun…");
-        assert_eq!(truncate("anything", 0), "");
-    }
-
-    /// A wrapped line would occupy two rows and desynchronise the line count
-    /// the redraw walks back over, so nothing may exceed the given width.
-    #[test]
-    fn truncate_never_exceeds_the_requested_width() {
         for width in 0..12 {
             assert!(
                 truncate("a considerably longer label", width)
@@ -1027,227 +1077,10 @@ mod tests {
         }
     }
 
-    /// Create `dir` and drop `marker` inside it when one is given.
-    fn make_dir(root: &std::path::Path, name: &str, marker: Option<&str>) -> PathBuf {
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        if let Some(marker) = marker {
-            std::fs::write(dir.join(marker), "").unwrap();
+    #[test]
+    fn harness_names_cover_every_parser_variant() {
+        for harness in RunHarnessChoice::value_variants() {
+            assert_ne!(harness_name(*harness), "unknown");
         }
-        dir
-    }
-
-    #[test]
-    fn scan_finds_marked_subdirectories_and_ignores_plain_ones() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        make_dir(tmp.path(), "with-git", Some(".git"));
-        make_dir(tmp.path(), "with-cargo", Some("Cargo.toml"));
-        make_dir(tmp.path(), "just-a-folder", None);
-
-        let found = scan_for_projects(tmp.path());
-        let names: Vec<String> = found.iter().filter_map(|p| directory_name(p)).collect();
-
-        assert!(names.contains(&"with-git".to_string()));
-        assert!(names.contains(&"with-cargo".to_string()));
-        assert!(
-            !names.contains(&"just-a-folder".to_string()),
-            "a directory with no marker is not a project"
-        );
-    }
-
-    /// Dependency and build trees can hold thousands of entries and are never
-    /// projects; descending into them is what would make the scan noticeable.
-    #[test]
-    fn scan_skips_dependency_build_and_dot_directories() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        make_dir(tmp.path(), "node_modules", Some("package.json"));
-        make_dir(tmp.path(), "target", Some("Cargo.toml"));
-        make_dir(tmp.path(), ".cache", Some("package.json"));
-
-        assert!(scan_for_projects(tmp.path()).is_empty());
-    }
-
-    /// Running the picker from inside a single checkout should still offer
-    /// that checkout, not just its children.
-    #[test]
-    fn scan_includes_the_root_when_the_root_is_itself_a_project() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("go.mod"), "").unwrap();
-
-        let found = scan_for_projects(tmp.path());
-
-        assert_eq!(found.len(), 1);
-        assert_eq!(normalize(&found[0]), normalize(tmp.path()));
-    }
-
-    #[test]
-    fn scan_of_an_unreadable_root_is_empty_rather_than_an_error() {
-        let missing = std::path::Path::new("definitely-not-a-real-directory-xyz");
-        assert!(scan_for_projects(missing).is_empty());
-    }
-
-    /// The rule the server enforces at `get_or_create_project`. A name that
-    /// passes here and fails there would only surface as a hook warning on a
-    /// session that already started.
-    #[test]
-    fn scope_names_follow_the_server_rule() {
-        for ok in ["ai-memory", "app2", "my_project", "a", "web.api", "0day"] {
-            assert!(valid_scope_name(ok), "{ok} should be accepted");
-        }
-        for bad in [
-            "",
-            "-leading-dash",
-            ".dotfile",
-            "_underscore",
-            "UpperCase",
-            "with space",
-            "acentuação",
-            "sub/dir",
-        ] {
-            assert!(!valid_scope_name(bad), "{bad} should be rejected");
-        }
-    }
-
-    /// Every reason creation could fail is answered while the name can still
-    /// be corrected by typing.
-    #[test]
-    fn rejection_explains_empty_invalid_and_taken_names() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        make_dir(tmp.path(), "taken", None);
-
-        assert_eq!(rejection(tmp.path(), "").as_deref(), Some("type a name"));
-        assert!(
-            rejection(tmp.path(), "Bad Name").is_some_and(|p| p.contains("lowercase")),
-            "an invalid name names the rule"
-        );
-        assert!(
-            rejection(tmp.path(), "taken").is_some_and(|p| p.contains("already exists")),
-            "an occupied directory is refused before it can be adopted"
-        );
-        assert_eq!(rejection(tmp.path(), "brand-new"), None);
-    }
-
-    /// Both scope halves are pinned so a rename or a subdirectory `cd` cannot
-    /// fork the memory into a second, empty project.
-    #[test]
-    fn created_marker_pins_both_scope_halves() {
-        let body = marker_body("acme", "portal");
-        assert!(body.contains("workspace = \"acme\""));
-        assert!(body.contains("project = \"portal\""));
-    }
-
-    #[test]
-    fn creating_a_project_writes_the_directory_and_its_marker() {
-        let tmp = tempfile::TempDir::new().unwrap();
-
-        let path = create_project(tmp.path(), "fresh", "default").unwrap();
-
-        assert!(path.is_dir());
-        let marker = std::fs::read_to_string(path.join(".ai-memory.toml")).unwrap();
-        assert!(marker.contains("project = \"fresh\""));
-        // The marker is itself a recognised marker, so the project shows up in
-        // the scan on the next run even before the server has tracked it.
-        assert!(is_project_dir(&path));
-    }
-
-    /// An existing directory must not be adopted: it can hold an unrelated
-    /// project whose own marker the creation would overwrite.
-    #[test]
-    fn creating_over_an_existing_directory_fails() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        make_dir(tmp.path(), "occupied", Some("Cargo.toml"));
-
-        assert!(create_project(tmp.path(), "occupied", "default").is_err());
-    }
-
-    /// The routing block only takes effect in the file the chosen agent reads.
-    #[test]
-    fn instruction_file_matches_the_harness_convention() {
-        assert_eq!(instruction_file(RunHarnessChoice::Claude), "CLAUDE.md");
-        for other in RunHarnessChoice::value_variants()
-            .iter()
-            .filter(|h| !matches!(h, RunHarnessChoice::Claude))
-        {
-            assert_eq!(instruction_file(*other), "AGENTS.md");
-        }
-    }
-
-    /// `--workspace` reaches the marker verbatim, so an unvalidated value can
-    /// close the TOML string and append keys of its own. The name typed into
-    /// the prompt is checked; this argument must be held to the same rule.
-    #[test]
-    fn workspace_names_are_validated_before_reaching_the_marker() {
-        let tmp = tempfile::TempDir::new().unwrap();
-
-        let injected = "default\"
-project = \"hijacked";
-        let error = create_project(tmp.path(), "victim", injected).unwrap_err();
-
-        assert!(
-            error.to_string().contains("workspace"),
-            "the failure must name the offending argument: {error}"
-        );
-        assert!(
-            !tmp.path().join("victim").exists(),
-            "nothing may be created when the scope is invalid"
-        );
-    }
-
-    /// The project you just created has to be near the top: alphabetical order
-    /// buried it under every checkout whose name sorts earlier, which is the
-    /// one case the picker exists to serve.
-    #[test]
-    fn scanned_projects_are_ordered_newest_first() {
-        let base = SystemTime::UNIX_EPOCH;
-        let mut paths: Vec<PathBuf> = ["alpha", "personal", "zulu", "unreadable"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-
-        sort_by_recency(&mut paths, |path| {
-            match path.to_str().unwrap() {
-                "alpha" => Some(base + std::time::Duration::from_secs(10)),
-                "personal" => Some(base + std::time::Duration::from_secs(90)),
-                "zulu" => Some(base + std::time::Duration::from_secs(50)),
-                // A directory whose timestamp cannot be read must not win the
-                // top slot by default.
-                _ => None,
-            }
-        });
-
-        assert_eq!(
-            paths
-                .iter()
-                .map(|p| p.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["personal", "zulu", "alpha", "unreadable"]
-        );
-    }
-
-    /// Equal timestamps must not reorder between runs.
-    #[test]
-    fn equal_timestamps_fall_back_to_a_stable_path_order() {
-        let mut paths: Vec<PathBuf> = ["b", "c", "a"].iter().map(PathBuf::from).collect();
-        sort_by_recency(&mut paths, |_| Some(SystemTime::UNIX_EPOCH));
-        assert_eq!(
-            paths
-                .iter()
-                .map(|p| p.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["a", "b", "c"]
-        );
-    }
-
-    /// The same checkout reached by two spellings must dedupe, otherwise a
-    /// tracked project would also appear as an untracked scan hit.
-    #[test]
-    fn normalize_matches_equivalent_paths() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let nested = tmp.path().join("child");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let indirect = tmp.path().join("child").join("..").join("child");
-
-        assert_eq!(normalize(&nested), normalize(&indirect));
     }
 }

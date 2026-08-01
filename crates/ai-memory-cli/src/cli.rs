@@ -37,8 +37,8 @@ pub enum Command {
     /// Native arguments are forwarded except exact wrapper flags such as
     /// `--yolo` and `--fresh`.
     Run(RunArgs),
-    /// Pick a known project and harness from an interactive menu, then launch
-    /// it there. Removes the `cd` step `run` requires.
+    /// Pick a local project and installed harness, then launch from that
+    /// checkout. Removes the `cd` step `run` requires.
     Show(ShowArgs),
     /// Search the complete visible event ledger for a managed workstream.
     WorkstreamSearch(WorkstreamSearchArgs),
@@ -242,13 +242,16 @@ pub enum RunHarnessChoice {
 /// Arguments for `show`.
 #[derive(Debug, Args)]
 pub struct ShowArgs {
-    /// Only list projects from this workspace. Defaults to every workspace.
+    /// Only list local projects resolving to this workspace.
     #[arg(long)]
     pub workspace: Option<String>,
-    /// List only projects the server already tracks, skipping the depth-1
-    /// scan of the current directory for untracked project directories.
+    /// Use saved local checkout links only; skip the depth-1 directory scan.
     #[arg(long)]
     pub no_scan: bool,
+    /// Print structured project and harness choices instead of opening menus.
+    /// Required when stdin or stdout is not a terminal.
+    #[arg(long)]
+    pub json: bool,
     /// Disable native permission prompts using the selected harness's
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
@@ -1701,6 +1704,36 @@ mod tests {
             documented, visible,
             "docs/ARCHITECTURE.md CLI subcommands must match `ai-memory --help`"
         );
+    }
+
+    #[test]
+    fn show_parses_listing_and_launch_flags_without_consuming_native_args() {
+        let listing = Cli::try_parse_from(["ai-memory", "show", "--json", "--no-scan"])
+            .expect("show listing parses");
+        let Command::Show(listing) = listing.command else {
+            panic!("expected show command");
+        };
+        assert!(listing.json);
+        assert!(listing.no_scan);
+
+        let launch = Cli::try_parse_from([
+            "ai-memory",
+            "show",
+            "--workspace",
+            "team",
+            "--yolo",
+            "--fresh",
+            "--model",
+            "fast",
+        ])
+        .expect("show launch parses");
+        let Command::Show(launch) = launch.command else {
+            panic!("expected show command");
+        };
+        assert_eq!(launch.workspace.as_deref(), Some("team"));
+        assert!(launch.yolo);
+        assert!(launch.fresh);
+        assert_eq!(launch.native_args, ["--model", "fast"]);
     }
 
     #[test]

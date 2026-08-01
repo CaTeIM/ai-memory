@@ -37,6 +37,7 @@ pub mod move_project;
 pub mod openclaw_plugin;
 pub mod path_util;
 pub mod pending_writes;
+pub mod project_registry;
 pub mod purge_project;
 pub mod read_page;
 pub mod reindex;
@@ -146,6 +147,51 @@ pub(crate) fn resolve_scope(
             scope.path.display()
         );
     }
+    Ok((workspace, project))
+}
+
+/// Resolve `(workspace, project)` for an explicit local directory without
+/// changing the process working directory or consulting wrapper cwd overrides.
+///
+/// The policy matches [`resolve_scope`]: a marker may pin either half, an
+/// unpinned project under a marker follows that marker's strategy, and a tree
+/// without a scope marker falls back to the main repository root.
+pub(crate) fn resolve_scope_for_path(
+    config: &Config,
+    cwd: &std::path::Path,
+) -> Result<(String, String)> {
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("canonicalizing project candidate {}", cwd.display()))?;
+    let identity = cwd.to_string_lossy().into_owned();
+    let marker = crate::marker::read_scope(&identity, &config.runtime_env);
+    let workspace = marker
+        .as_ref()
+        .and_then(|scope| scope.workspace.clone())
+        .unwrap_or_else(|| crate::config::DEFAULT_WORKSPACE.to_string());
+    let project = match marker.as_ref() {
+        Some(scope) => scope
+            .project
+            .clone()
+            .or_else(|| {
+                if scope.is_repo_root() {
+                    crate::marker::repo_root_project(&identity)
+                } else {
+                    ai_memory_consolidate::derive_project_name(
+                        &cwd,
+                        ai_memory_consolidate::ProjectNameStrategy::Basename,
+                    )
+                    .map(|(name, _)| name)
+                }
+            })
+            .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+        None => ai_memory_consolidate::derive_project_name(
+            &cwd,
+            ai_memory_consolidate::ProjectNameStrategy::MainRepoRoot,
+        )
+        .map(|(name, _)| name)
+        .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+    };
     Ok((workspace, project))
 }
 
@@ -406,6 +452,50 @@ mod tests {
             resolve_scope(&config, Some("flagged"), None).unwrap(),
             ("flagged".to_string(), "cli".to_string()),
             "an explicit workspace must not restore the main-repo fallback"
+        );
+    }
+
+    #[test]
+    fn explicit_path_scope_matches_marker_and_non_repo_fallback_policy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_tree = tmp.path().join("workspace-tree");
+        let workspace_child = workspace_tree.join("child");
+        std::fs::create_dir_all(&workspace_child).unwrap();
+        std::fs::write(
+            workspace_tree.join(".ai-memory.toml"),
+            "workspace = \"acme\"\n",
+        )
+        .unwrap();
+
+        let pinned = tmp.path().join("pinned-checkout");
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(
+            pinned.join(".ai-memory.toml"),
+            "project = \"shared-project\"\n",
+        )
+        .unwrap();
+
+        let plain = tmp.path().join("plain-checkout");
+        std::fs::create_dir(&plain).unwrap();
+        let config = Config::default();
+
+        assert_eq!(
+            resolve_scope_for_path(&config, &workspace_child).unwrap(),
+            ("acme".to_owned(), "child".to_owned())
+        );
+        assert_eq!(
+            resolve_scope_for_path(&config, &pinned).unwrap(),
+            (
+                crate::config::DEFAULT_WORKSPACE.to_owned(),
+                "shared-project".to_owned()
+            )
+        );
+        assert_eq!(
+            resolve_scope_for_path(&config, &plain).unwrap(),
+            (
+                crate::config::DEFAULT_WORKSPACE.to_owned(),
+                "plain-checkout".to_owned()
+            )
         );
     }
 

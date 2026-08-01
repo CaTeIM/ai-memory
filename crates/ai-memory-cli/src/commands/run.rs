@@ -73,7 +73,13 @@ impl HeartbeatHealth {
 /// Run one native harness and return its exact process exit code.
 pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let cwd = std::env::current_dir().context("getting managed run working directory")?;
-    let repository = inspect_repository(&cwd)?;
+    run_from(config, args, &cwd).await
+}
+
+/// Run one native harness from an explicit checkout without changing the
+/// parent process's working directory.
+pub(super) async fn run_from(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let repository = inspect_repository(cwd)?;
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
     let mut native_args = args.native_args;
@@ -116,8 +122,8 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let prepare = PrepareManagedRunRequest {
-        workspace,
-        project,
+        workspace: workspace.clone(),
+        project: project.clone(),
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint,
         worktree_fingerprint: repository.worktree_fingerprint,
@@ -143,6 +149,17 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
             return Err(error);
         }
     };
+    if let Err(error) = super::project_registry::record_prepared_checkout(
+        config,
+        &endpoint,
+        &workspace,
+        &project,
+        &repository.cwd,
+    ) {
+        eprintln!(
+            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+        );
+    }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
     macro_rules! acquired_try {
         ($result:expr) => {
