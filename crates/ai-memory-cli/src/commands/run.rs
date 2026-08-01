@@ -1264,7 +1264,11 @@ mod tests {
             "an extension-less script is not launchable by CreateProcess"
         );
 
-        std::fs::write(tmp.path().join("faux-harness.cmd"), "@echo off\n").unwrap();
+        std::fs::write(
+            tmp.path().join("faux-harness.cmd"),
+            "@echo off\r\nexit /b 0\r\n",
+        )
+        .unwrap();
         let resolved =
             resolve_candidate(&tmp.path().join("faux-harness")).expect("the wrapper resolves");
         // PATHEXT is upper-case, and Windows paths are case-insensitive, so the
@@ -1278,6 +1282,11 @@ mod tests {
             "the PATHEXT sibling is what should be launched"
         );
         assert!(resolved.is_file());
+
+        let status = std::process::Command::new(&resolved)
+            .status()
+            .expect("the resolved wrapper starts");
+        assert!(status.success(), "the resolved wrapper exits successfully");
     }
 
     /// Unix has no PATHEXT: the file itself is the answer.

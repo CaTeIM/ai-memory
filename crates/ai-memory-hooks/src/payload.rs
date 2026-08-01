@@ -511,7 +511,11 @@ fn legacy_tool_body(event: HookEvent, agent: AgentKind, raw: &serde_json::Value)
 const fn closed_tool_agent(agent: AgentKind) -> bool {
     matches!(
         agent,
-        AgentKind::ClaudeCode | AgentKind::OpenCode | AgentKind::Pi | AgentKind::AntigravityCli
+        AgentKind::ClaudeCode
+            | AgentKind::OpenCode
+            | AgentKind::Pi
+            | AgentKind::AntigravityCli
+            | AgentKind::Hermes
     )
 }
 
@@ -1411,6 +1415,8 @@ mod tests {
         assert_eq!(parse_agent("omp"), AgentKind::Omp);
         assert_eq!(parse_agent("pi"), AgentKind::Pi);
         assert_eq!(parse_agent("oh-my-pi"), AgentKind::Omp);
+        assert_eq!(parse_agent("hermes"), AgentKind::Hermes);
+        assert_eq!(parse_agent("hermes-agent"), AgentKind::Hermes);
         // Anything else is `Other`. Critical for the hook router:
         // a typo in the query string must not crash, it just gets
         // attributed to the catch-all bucket.
@@ -1435,6 +1441,41 @@ mod tests {
         assert!(env.cwd.is_none());
         assert!(env.title_hint.is_none());
         assert!(env.body_excerpt.is_none());
+    }
+
+    #[test]
+    fn hermes_tool_title_uses_only_the_verified_shell_hook_shape() {
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {"path": "src/lib.rs", "content": "untrusted"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("hermes".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::Hermes);
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        assert_eq!(env.session_id.as_deref(), Some("hermes-session"));
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("unverified-agent".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
     }
 
     /// Body is well-formed JSON but the expected `session_id` /

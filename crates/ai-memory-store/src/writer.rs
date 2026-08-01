@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, HandoffId, ManagedRunId, NewHandoff, NewObservation, NewPage, NewSession, NewUser,
-    ObservationId, PageId, PagePath, ProjectId, Sanitized, SessionId, UserId, WorkspaceId,
+    AgentKind, HandoffAcceptance, HandoffId, IdentityKey, ManagedRunId, NewHandoff, NewObservation,
+    NewPage, NewSession, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
+    Sanitized, SessionId, UserId, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -20,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::auto_improve::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, FailAutoImproveProposal,
     RejectAutoImproveProposal, StageAutoImproveRun, StagedAutoImproveRun,
+    StagedAutoImproveRunReport,
 };
 use crate::error::{StoreError, StoreResult};
 use crate::ops::{
@@ -162,14 +164,14 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
     AcceptHandoff {
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        receiving_cwd: Option<String>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        acceptance: HandoffAcceptance,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     CancelHandoff {
         handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     /// Retro-fit sessions + observations to per-cwd projects and graveyard
@@ -183,6 +185,7 @@ pub(crate) enum WriteCmd {
     },
     BumpAccess {
         page_ids: Vec<PageId>,
+        actor: Option<IdentityKey>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordPageFeedback {
@@ -312,6 +315,11 @@ pub(crate) enum WriteCmd {
         input: StageAutoImproveRun,
         reply: oneshot::Sender<StoreResult<StagedAutoImproveRun>>,
     },
+    StageAutoImproveRunForOwner {
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+        reply: oneshot::Sender<StoreResult<StagedAutoImproveRunReport>>,
+    },
     RejectAutoImproveProposal {
         input: RejectAutoImproveProposal,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -363,11 +371,8 @@ pub(crate) enum WriteCmd {
         reply: oneshot::Sender<StoreResult<bool>>,
     },
     AcceptStartupContext {
-        handoff_id: Option<HandoffId>,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
-        receiving_cwd: Option<String>,
         reply: oneshot::Sender<StoreResult<StartupContextAcceptance>>,
     },
     FinishWorkstreamRun {
@@ -751,21 +756,18 @@ impl WriterHandle {
 
     /// Mark a handoff accepted by the given agent / session.
     ///
+    /// Returns whether this call is the one that claimed it; `false` means the
+    /// row was already taken, does not belong to the expected workspace and
+    /// project, or its owner does not admit this caller. The body must not reach
+    /// the agent on `false`. `receiving_cwd` is where the claiming session is
+    /// starting, and bounds the sweep of superseded automatic handoffs.
+    ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn accept_handoff(
-        &self,
-        handoff_id: HandoffId,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
-        receiving_cwd: Option<String>,
-    ) -> StoreResult<()> {
+    pub async fn accept_handoff(&self, acceptance: HandoffAcceptance) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptHandoff {
-            handoff_id,
-            accepting_agent,
-            accepting_session,
-            receiving_cwd,
+            acceptance,
             reply: tx,
         })
         .await?;
@@ -775,14 +777,24 @@ impl WriterHandle {
     /// Mark an open handoff expired so it will no longer be consumed.
     ///
     /// Returns `true` when an open handoff was changed, `false` when the id was
-    /// already accepted/expired or missing.
+    /// already accepted/expired, outside the expected workspace and project,
+    /// or missing.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
-    pub async fn cancel_handoff(&self, handoff_id: HandoffId) -> StoreResult<bool> {
+    pub async fn cancel_handoff(
+        &self,
+        handoff_id: HandoffId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        owner_filter: OwnerFilter,
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::CancelHandoff {
             handoff_id,
+            workspace_id,
+            project_id,
+            owner_filter,
             reply: tx,
         })
         .await?;
@@ -860,9 +872,23 @@ impl WriterHandle {
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
     pub async fn bump_access(&self, page_ids: Vec<PageId>) -> StoreResult<()> {
+        self.bump_access_for_actor(page_ids, None).await
+    }
+
+    /// Bump shared access counters and record each identified operator once per
+    /// page for the optional access-breadth retention term.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn bump_access_for_actor(
+        &self,
+        page_ids: Vec<PageId>,
+        actor: Option<IdentityKey>,
+    ) -> StoreResult<()> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::BumpAccess {
             page_ids,
+            actor,
             reply: tx,
         })
         .await?;
@@ -1299,6 +1325,23 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Stage an auto-improvement run in an optional typed operator bucket,
+    /// reporting target collisions without discarding sibling proposals.
+    pub async fn stage_auto_improve_run_for_owner(
+        &self,
+        input: StageAutoImproveRun,
+        owner: Option<IdentityKey>,
+    ) -> StoreResult<StagedAutoImproveRunReport> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::StageAutoImproveRunForOwner {
+            input,
+            owner,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Reject a pending auto-improvement proposal and append an event.
     pub async fn reject_auto_improve_proposal(
         &self,
@@ -1442,19 +1485,13 @@ impl WriterHandle {
     /// handoff remains open and both result fields are false.
     pub async fn accept_startup_context(
         &self,
-        handoff_id: Option<HandoffId>,
-        accepting_agent: AgentKind,
-        accepting_session: Option<SessionId>,
+        handoff: Option<HandoffAcceptance>,
         managed_run_id: Option<ManagedRunId>,
-        receiving_cwd: Option<String>,
     ) -> StoreResult<StartupContextAcceptance> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AcceptStartupContext {
-            handoff_id,
-            accepting_agent,
-            accepting_session,
+            handoff,
             managed_run_id,
-            receiving_cwd,
             reply: tx,
         })
         .await?;
@@ -1699,24 +1736,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
             }
-            WriteCmd::AcceptHandoff {
-                handoff_id,
-                accepting_agent,
-                accepting_session,
-                receiving_cwd,
-                reply,
-            } => {
-                let result = ops::accept_handoff(
-                    &mut conn,
-                    &handoff_id,
-                    accepting_agent,
-                    accepting_session.as_ref(),
-                    receiving_cwd.as_deref(),
-                );
+            WriteCmd::AcceptHandoff { acceptance, reply } => {
+                let result = ops::accept_handoff(&mut conn, &acceptance);
                 send_or_warn(reply, result, "accept_handoff");
             }
-            WriteCmd::CancelHandoff { handoff_id, reply } => {
-                let result = ops::cancel_handoff(&mut conn, &handoff_id);
+            WriteCmd::CancelHandoff {
+                handoff_id,
+                workspace_id,
+                project_id,
+                owner_filter,
+                reply,
+            } => {
+                let result = ops::cancel_handoff(
+                    &mut conn,
+                    &handoff_id,
+                    &workspace_id,
+                    &project_id,
+                    &owner_filter,
+                );
                 send_or_warn(reply, result, "cancel_handoff");
             }
             WriteCmd::Reorg {
@@ -1749,8 +1786,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_page_feedback");
             }
-            WriteCmd::BumpAccess { page_ids, reply } => {
-                let result = ops::bump_access_for_pages(&mut conn, &page_ids);
+            WriteCmd::BumpAccess {
+                page_ids,
+                actor,
+                reply,
+            } => {
+                let result =
+                    ops::bump_access_for_pages_for_actor(&mut conn, &page_ids, actor.as_ref());
                 send_or_warn(reply, result, "bump_access_for_pages");
             }
             WriteCmd::SoftDeleteForDecay { page_ids, reply } => {
@@ -1919,6 +1961,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::auto_improve::stage_run(&mut conn, &input);
                 send_or_warn(reply, result, "stage_auto_improve_run");
             }
+            WriteCmd::StageAutoImproveRunForOwner {
+                input,
+                owner,
+                reply,
+            } => {
+                let result =
+                    crate::auto_improve::stage_run_for_owner(&mut conn, &input, owner.as_ref());
+                send_or_warn(reply, result, "stage_auto_improve_run_for_owner");
+            }
             WriteCmd::RejectAutoImproveProposal { input, reply } => {
                 let result = crate::auto_improve::reject_proposal(&mut conn, &input);
                 send_or_warn(reply, result, "reject_auto_improve_proposal");
@@ -1994,11 +2045,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "accept_managed_run_context");
             }
             WriteCmd::AcceptStartupContext {
-                handoff_id,
-                accepting_agent,
-                accepting_session,
+                handoff,
                 managed_run_id,
-                receiving_cwd,
                 reply,
             } => {
                 let result = (|| {
@@ -2012,14 +2060,8 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     if managed_run_id.is_some() && !managed_context_accepted {
                         return Ok(StartupContextAcceptance::default());
                     }
-                    let handoff_accepted = match handoff_id {
-                        Some(handoff_id) => ops::accept_handoff_in_transaction(
-                            &tx,
-                            &handoff_id,
-                            accepting_agent,
-                            accepting_session.as_ref(),
-                            receiving_cwd.as_deref(),
-                        )?,
+                    let handoff_accepted = match handoff {
+                        Some(acceptance) => ops::accept_handoff_in_transaction(&tx, &acceptance)?,
                         None => false,
                     };
                     tx.commit()?;

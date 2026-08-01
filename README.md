@@ -40,7 +40,7 @@
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
-| Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
+| Hermes Agent | Community | Core hook ingestion recognizes `agent=hermes` and Hermes' documented shell-hook `tool_name` / `tool_input` payload for concrete session attribution, tool-family titles, and capture exclusions. A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available, but no first-party installer is shipped; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. Hermes ignores session-start hook stdout, so recover handoffs through MCP. |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenCode Zen/Go, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, Google Gemini, and keyless OpenAI-compatible endpoints such as Ollama, LM Studio, and vLLM. |
 
@@ -83,6 +83,12 @@ priors are at the [bottom](#influences-and-prior-art).
 - **Per-repository capture exclusions.** A nearest-marker `[capture]`
   `ignore_paths` policy drops matching recognized file-tool events before they
   reach the local spool or server. See [the capture policy reference](docs/marker-file.md#capture-exclusions).
+- **Optional per-operator memory slots.** On shared servers,
+  `[slots] per_user = true` keeps engine-written `_slots/` context in a bounded
+  namespace derived from the authenticated operator. Session briefs and
+  consolidation prompts receive shared slots plus the caller's own; exact wiki
+  reads and searches remain project-wide, so this is context-injection
+  isolation rather than RBAC. See [multi-user operation](docs/users.md#per-operator-memory-slots).
 - **Cross-agent handoffs.** Quit Claude Code mid-task, start Codex
   in the same directory hours later - the next agent sees a
   "where you left off" block before its first prompt.
@@ -151,7 +157,9 @@ priors are at the [bottom](#influences-and-prior-art).
   provider health from the last real provider call. Server is the
   single source of truth. `finalize-session` lists matching open
   sessions through `GET /admin/open-sessions`, then posts synthetic
-  `session-end` hooks back to the server.
+  `session-end` hooks back to the server. On shared deployments it defaults to
+  the caller's own plus unattributed sessions; root can pass `--all-owners` for
+  explicit cross-operator recovery.
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5, manually declared
   entity, and graph-neighbor search plus rule-based summarisation. Add a
   provider when you want consolidated pages, lint contradictions, or staged
@@ -251,11 +259,17 @@ priors are at the [bottom](#influences-and-prior-art).
   automatic review, or set `[auto_improve] require_approval = true` to keep both
   scheduled and manual proposals pending for human review. `ai-memory
   auto-improve --session-id <uuid>` and MCP `memory_auto_improve` remain
-  available for manual catch-up or targeted reruns. `ai-memory
+  available for manual catch-up or targeted reruns. When its `session_id` is
+  omitted, the MCP tool selects the newest completed session without a
+  persisted auto-improvement run, so repeated calls advance past short
+  preflight-skipped sessions; an explicit ID reruns that session. `ai-memory
   auto-improve-report --workspace <w> --project <p>` returns a read-only
   telemetry report for recent auto-improvement outcomes without staging or
   creating proposals; add `--stage` to create one pending report page for
-  audit/approval. See
+  audit/approval. On deployments that distinguish operators, pending learning
+  proposals are isolated by qualified operator identity, so one person's
+  proposal for a page does not block another's; unattributed and single-user
+  deployments retain the shared pending queue. See
   [`docs/auto-improve-eval-gates.md`](docs/auto-improve-eval-gates.md) for
   example executable eval scorers.
 
@@ -271,7 +285,9 @@ priors are at the [bottom](#influences-and-prior-art).
   episodic pages, stale slots, duplicate exact normalized titles, and dangling
   cross-project links. It is report-only unless `--stage` is passed; staging
   queues one report page for approval and still performs no maintenance actions
-  itself.
+  itself. Shared servers can opt into `[decay] breadth_weight` to give pages
+  reinforced by several identified operators a retention bonus; the default
+  `0.0` leaves existing retention scores unchanged.
 - **"Run one ai-memory for the whole household."** Stand the server
   up on a homelab box at `0.0.0.0:49374` with a bearer token; every
   laptop/desktop talks to it. Per-cwd routing keeps each project's
@@ -610,7 +626,10 @@ page view UI. Data stays single-tenant — there is no per-page RBAC. A
 first user row is what immediately switches every `/admin/*` endpoint to
 root-only, including status/search/read-page and user-management routes.
 `ai-memory init` generates a pepper for new installs without changing
-single-user behavior until a user is added. See
+single-user behavior until a user is added. An SSO gateway can instead use a
+dedicated `[auth].actor_proxy_bearer_token` and trusted `X-Memory-Actor-*`
+headers; its credential is deliberately separate from the root bearer so a
+missing identity cannot become root. See
 [`docs/users.md`](docs/users.md) for the full walkthrough and the
 four-rung auth ladder.
 
@@ -646,12 +665,15 @@ Useful entry points:
   GET  /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=...
   GET  /api/v1/workspaces/{workspace}/overview?limit=...
   GET  /api/v1/workspaces/{workspace}/projects/{project}/overview?limit=...
+  GET  /api/v1/workspaces/{workspace}/projects/{project}/handoffs?state=...&limit=...
   GET  /api/v1/search?q=...&workspace=...&project=...&limit=...
   POST /api/v1/search   { "q": "...", "scopes": [{ "workspace": "...", "project": "..." }] }
   ```
 
   `overview` bundles the open handoff + briefing + memory-health for a workspace
-  or project in one call (the data a project overview screen needs).
+  or project in one call (the data a project overview screen needs). The
+  handoff history defaults to the caller's own plus shared rows; root can use
+  `all_owners=true` for recovery across operators.
 
   **Full integration guide:** see [`docs/frontend-api.md`](docs/frontend-api.md)
   for auth setup, response schemas, error model, limits/pagination,

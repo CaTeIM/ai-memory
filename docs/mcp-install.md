@@ -77,6 +77,15 @@ live ai-memory server. In particular, bearer tokens and endpoint settings
 should stay in environment or local config references rather than generated
 plugin source files.
 
+The hook router does recognize `agent=hermes` as a concrete session kind and
+accepts Hermes' documented shell-hook `tool_name` / `tool_input` envelope for
+tool-family metadata and capture-exclusion enforcement. A custom bridge should
+map `on_session_start`, `post_tool_call`, and `on_session_end` to ai-memory's
+canonical `session-start`, `post-tool-use`, and `session-end` event names while
+forwarding the original JSON object. This protocol recognition does not install
+or trust a third-party plugin. Hermes ignores session-start hook stdout, so it
+cannot consume an automatic handoff there; use MCP `memory_handoff_accept`.
+
 The same lifecycle guidance below applies to Hermes or any other external
 bridge: map known events onto ai-memory's canonical hook events where
 possible, and use extension metadata for source-specific events instead of
@@ -540,9 +549,11 @@ The rendered hooks config looks like:
   the conversation. After the final turn, run
   `ai-memory finalize-session --agent antigravity-cli` to create the final
   summary and automatic handoff and to queue opt-in SessionEnd consolidation.
-- `memory_handoff_begin` always creates an explicit, project-wide manual
-  handoff with no `from_session_id` and `from_agent = other`; that
-  session-neutral shape is the same for every MCP client. Handoffs carrying a
+- `memory_handoff_begin` always creates an explicit manual handoff with no
+  `from_session_id` and `from_agent = other`; it is project-wide for cwd
+  matching but belongs to the creating operator by default. Pass `shared=true`
+  only to publish it to every operator in the project. That session-neutral
+  shape is the same for every MCP client. Handoffs carrying a
   Codex or Claude session id came from canonical SessionEnd processing, not
   from the manual tool. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.

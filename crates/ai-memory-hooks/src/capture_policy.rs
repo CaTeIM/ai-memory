@@ -139,6 +139,14 @@ pub(crate) fn tool_observation_metadata(
             object.get("callID").and_then(Value::as_str),
         ),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
+        AgentKind::Hermes => (
+            object.get("tool_name")?.as_str()?,
+            object
+                .get("extra")
+                .and_then(Value::as_object)
+                .and_then(|extra| extra.get("tool_call_id"))
+                .and_then(Value::as_str),
+        ),
         _ => return None,
     };
     // PreToolUse needs a proven input shape. PostToolUse deliberately does
@@ -147,11 +155,13 @@ pub(crate) fn tool_observation_metadata(
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
             _ => object
-                .get(if agent == AgentKind::ClaudeCode {
-                    "tool_input"
-                } else {
-                    "args"
-                })
+                .get(
+                    if matches!(agent, AgentKind::ClaudeCode | AgentKind::Hermes) {
+                        "tool_input"
+                    } else {
+                        "args"
+                    },
+                )
                 .is_some(),
         };
     has_args.then(|| ToolObservationMetadata {
@@ -507,7 +517,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted {
         | AgentKind::Codex
         | AgentKind::Cursor
         | AgentKind::GeminiCli
-        | AgentKind::Devin => object
+        | AgentKind::Devin
+        | AgentKind::Hermes => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -574,9 +585,12 @@ fn family(name: &str) -> ToolFamily {
         | "replace_file_content"
         | "multi_replace_file_content"
         | "write_to_file" => ToolFamily::File,
+        "read_file" | "write_file" | "patch" => ToolFamily::File,
         "search" | "grep" | "glob" | "find" | "list" | "ls" | "list_files" | "read_dir"
-        | "list_dir" | "grep_search" => ToolFamily::SearchList,
-        "bash" | "shell" | "execute" | "run_command" | "web_search" => ToolFamily::NonFile,
+        | "list_dir" | "grep_search" | "search_files" => ToolFamily::SearchList,
+        "bash" | "shell" | "execute" | "run_command" | "web_search" | "terminal" => {
+            ToolFamily::NonFile
+        }
         _ => ToolFamily::Unknown,
     }
 }
@@ -984,6 +998,53 @@ mod tests {
             .insert("paths".into(), json!(["x"]));
         assert!(CaptureProtocol::parse(&bad).is_none());
     }
+
+    #[test]
+    fn hermes_official_tool_shape_is_closed_and_honors_exclusions() {
+        let raw = json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {"path": "secret/token.txt", "content": "do not retain"},
+            "session_id": "hermes-session",
+            "cwd": "/repo",
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        let metadata = tool_observation_metadata(AgentKind::Hermes, &raw, false).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-42"));
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secret/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let decision = policy.inspect(AgentKind::Hermes, &raw, "/repo");
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+
+        let unknown = policy.inspect(AgentKind::Other, &raw, "/repo");
+        assert_eq!(
+            unknown.protocol().extraction_state(),
+            ExtractionState::UnsupportedSchema
+        );
+        assert_eq!(unknown.protocol().tool_family(), ToolFamily::Unknown);
+    }
+
+    #[test]
+    fn hermes_documented_tool_names_map_to_canonical_families() {
+        for (tool, expected) in [
+            ("read_file", ToolFamily::File),
+            ("write_file", ToolFamily::File),
+            ("patch", ToolFamily::File),
+            ("search_files", ToolFamily::SearchList),
+            ("terminal", ToolFamily::NonFile),
+        ] {
+            assert_eq!(family(tool), expected, "tool: {tool}");
+        }
+    }
+
     #[test]
     fn antigravity_native_tools_are_no_longer_unknown() {
         for (tool, expected) in [

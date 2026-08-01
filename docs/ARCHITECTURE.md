@@ -128,10 +128,12 @@ from hook paths.
    `scopes` mode, bounded raw observation FTS returns fallback `raw_hits`;
    `global=true` searches compiled wiki pages across projects only. Page hits
    bump `access_count` + `last_accessed_at` - the M8 reinforcement term, which
-   `memory_feedback` complements with explicit per-page salience. That bump is
-   throttled to at most once per page per minute, so a burst of overlapping
-   searches does not flood the writer actor with redundant reinforcement
-   writes.
+   `memory_feedback` complements with explicit per-page salience. Identified
+   operators also add one `page_access` row per page; an opt-in
+   `[decay] breadth_weight` can reward pages reinforced by several distinct
+   operators. That bump is throttled to at most once per page per minute, so a
+   burst of overlapping searches does not flood the writer actor with
+   redundant reinforcement writes.
 7. The forget sweep runs on demand and on the server's `[maintenance]`
    schedule: pages past their frontmatter `expires_at:` TTL are
    hard-deleted through the wiki layer (file + rows, pin or not);
@@ -260,6 +262,8 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
+| `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
+| `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
@@ -268,7 +272,7 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | Tier | Lifetime | Decay |
 |---|---|---|
 | Working | Current session only | Hard-drop on session end (kept in `observations` for forensics) |
-| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access)` |
+| Episodic | 30d hot → 180d cold → evict | `salience · exp(−λΔt) + σ · log(1+access_count) · exp(−μ · days_since_access) · (1 + breadth_weight · ln(1 + max(distinct_actors−1, 0)))` |
 | Semantic | Indefinite | None - only supersedeable via M7 LLM rewrite |
 | Procedural | Indefinite | Frequency-decay if not re-observed |
 
@@ -282,6 +286,13 @@ focus and pending items. Use `invariant` for high-resistance project
 context, identity, rules, or user preferences; consolidation should not
 rewrite an existing invariant slot unless new observations directly
 contradict specific existing content.
+
+Shared servers may opt into `[slots] per_user = true`. Engine and MCP slot
+writes then use a bounded namespace derived from the authenticated
+`IdentityKey`; session briefs and consolidation prompts include shared slots
+plus the caller's namespace. Existing unnamespaced slots stay shared and the
+default remains off. Exact wiki reads and searches are deliberately unchanged:
+this boundary limits prompt injection, not page access.
 
 ## Cross-project links
 
@@ -338,12 +349,12 @@ invariants below.
 | `memory_status` | read-only | Counts, paths, version. |
 | `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
-| `memory_handoff_begin` | destructive | Open a handoff for the next agent. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched by default). Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_cancel` | destructive | Mark an exact open handoff id expired when it was created by mistake. |
+| `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_accept` | destructive | Fetch + ack the latest own/shared handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
-| `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Defaults to the latest completed session in the resolved current project; the server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
+| `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
 | `memory_delete_page` | destructive | Delete a single page by exact `path`. Fires the admission chain (op=delete); idempotent. |
 | `memory_forget_sweep` | destructive | Retention pass: soft-delete cold pages, purge aged tombstones, and hard-delete TTL-expired pages through the wiki layer. `dry_run=true` for preview. |
@@ -477,6 +488,10 @@ sigma = 0.6                        # ↑ to reward query-hits more
 mu = 0.04                          # ↑ if recent hits should count more
 cold_threshold = 0.20              # below this → soft-delete
 hard_delete_after_days = 180
+breadth_weight = 0.0               # opt-in reward for distinct operators
+
+[slots]                           # optional shared-server injection boundary
+per_user = false                  # shared + own slots in agent context
 
 [auto_improve]                     # default-available learning reviewer
 require_approval = false           # true leaves proposals pending for review

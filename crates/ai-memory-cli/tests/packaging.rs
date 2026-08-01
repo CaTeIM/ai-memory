@@ -431,6 +431,38 @@ fn github_actions_are_pinned_to_full_commits() {
     }
 }
 
+#[test]
+fn workflows_keep_fixed_rust_jobs_on_the_fixed_toolchain() {
+    for (path, expected_fixed_jobs) in [
+        (".github/workflows/ci.yml", 1),
+        (".github/workflows/release.yml", 3),
+    ] {
+        let workflow = read_repo(path);
+        let lines = workflow.lines().collect::<Vec<_>>();
+        let mut fixed_jobs = 0;
+        for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
+            line.contains("uses: dtolnay/rust-toolchain@") && line.ends_with("# 1.95")
+        }) {
+            fixed_jobs += 1;
+            assert_eq!(
+                lines.get(index + 1).map(|line| line.trim()),
+                Some("with:"),
+                "{path} must configure the fixed toolchain after: {line}"
+            );
+            assert_eq!(
+                lines.get(index + 2).map(|line| line.trim()),
+                Some("toolchain: \"1.95\""),
+                "{path} must keep its # 1.95 job on Rust 1.95"
+            );
+        }
+
+        assert_eq!(
+            fixed_jobs, expected_fixed_jobs,
+            "{path} has an unexpected number of fixed Rust jobs"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn wrapper_self_upgrade_rejects_a_checksum_mismatch() {
