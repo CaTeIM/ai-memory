@@ -1488,6 +1488,48 @@ mod tests {
         assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
     }
 
+    #[tokio::test]
+    async fn hermes_file_exclusion_drops_before_spool_or_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let data_dir = tmp.path().join("data");
+        let mut stdout = Vec::new();
+        let called = std::cell::Cell::new(false);
+        let mut args = devin_hook_args("post-tool-use");
+        args.agent = "hermes".into();
+        let raw = serde_json::json!({
+            "hook_event_name": "post_tool_call",
+            "tool_name": "write_file",
+            "tool_input": {
+                "path": "secret/token.txt",
+                "content": "SENTINEL_MUST_NOT_BE_SPOOLED"
+            },
+            "session_id": "hermes-session",
+            "cwd": tmp.path(),
+            "extra": {"tool_call_id": "call-42", "status": "ok"}
+        });
+        run_with_payload(
+            Some(data_dir.clone()),
+            args,
+            raw.to_string(),
+            &mut stdout,
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stdout, b"{}\n");
+        assert!(!called.get());
+        assert_eq!(hook_spool::spool_len(&hook_spool::spool_dir(&data_dir)), 0);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn capture_drop_handles_symlinked_cwd() {

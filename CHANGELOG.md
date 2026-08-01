@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Hook ingestion now recognizes Hermes Agent as a concrete session kind and
+  understands its documented shell-hook `tool_name` / `tool_input` envelope
+  for bounded tool-family titles and capture exclusions. Migration V44 expands
+  the session allowlist without losing session ownership, observation
+  watermarks, indexes, or scope-pairing triggers. This remains protocol support,
+  not a first-party Hermes installer, and session-start handoff acceptance stays
+  disabled because Hermes ignores that hook's stdout (#337).
 - Trusted-proxy identity now has a dedicated
   `[auth].actor_proxy_bearer_token`, distinct from the root bearer. Proxy
   requests must assert either a username or the complete OIDC issuer/subject

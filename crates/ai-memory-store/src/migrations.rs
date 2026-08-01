@@ -52,7 +52,9 @@ pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, HandoffId, NewObservation, ObservationKind, SessionId};
+    use ai_memory_core::{
+        AgentKind, HandoffId, NewObservation, NewSession, ObservationKind, SessionId,
+    };
     use rusqlite::{Connection, params};
 
     /// A store migrated by a newer build (an applied version above anything
@@ -501,5 +503,89 @@ mod tests {
                 "missing ownership/listing index {index}",
             );
         }
+    }
+
+    #[test]
+    fn v43_to_v44_preserves_session_state_and_all_scope_guards() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 43).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "project", None).unwrap();
+        let existing = SessionId::new();
+        conn.execute(
+            "INSERT INTO sessions \
+             (id, workspace_id, project_id, agent_kind, cwd, started_at, ended_at, \
+              ended_observation_count, actor_user) \
+             VALUES (?1, ?2, ?3, 'codex', '/repo', 1, 2, 7, 'user:alice')",
+            params![
+                existing.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let preserved: (String, String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT agent_kind, cwd, ended_observation_count, actor_user \
+                 FROM sessions WHERE id = ?1",
+                params![existing.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("codex".into(), "/repo".into(), 7, Some("user:alice".into()))
+        );
+
+        for index in [
+            "idx_sessions_recent",
+            "idx_sessions_project",
+            "idx_sessions_started_at",
+            "idx_sessions_scope_ended",
+            "idx_sessions_open_owner",
+        ] {
+            assert_eq!(
+                schema_object_count(&conn, "index", index),
+                1,
+                "V44 dropped session index {index}"
+            );
+        }
+        for trigger in [
+            "sessions_ws_proj_pairing_ai",
+            "auto_improve_scheduler_claims_session_pairing_ai",
+            "session_consolidation_jobs_session_pairing_ai",
+        ] {
+            assert_eq!(
+                schema_object_count(&conn, "trigger", trigger),
+                1,
+                "V44 dropped scope guard {trigger}"
+            );
+        }
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                id: SessionId::new(),
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Hermes,
+                cwd: Some("/repo".into()),
+                actor_user: Some("user:alice".into()),
+            },
+        )
+        .unwrap();
     }
 }
