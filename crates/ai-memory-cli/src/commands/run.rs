@@ -325,7 +325,12 @@ pub async fn run(config: &Config, args: RunArgs) -> Result<i32> {
     }
 
     let started_at = SystemTime::now();
-    let mut command = Command::new(&plan.program);
+    // Spawn the resolved file rather than the bare name: on Windows the name
+    // alone can match an unlaunchable extension-less shim (see
+    // `resolve_program`). Falling back to the plan's own value keeps an
+    // unresolvable program reaching the spawn error below, which explains it.
+    let program = resolve_program(&plan.program).unwrap_or_else(|| plan.program.clone().into());
+    let mut command = Command::new(&program);
     command
         .args(&plan.args)
         .current_dir(&repository.cwd)
@@ -689,32 +694,51 @@ fn ensure_executable_available(harness: ManagedHarness, executable: Option<&OsSt
 }
 
 fn executable_available(program: &OsStr) -> bool {
+    resolve_program(program).is_some()
+}
+
+/// Resolve `program` to a concrete path the OS can actually start, or `None`
+/// when nothing launchable matches.
+///
+/// The bare name is not enough on Windows. An npm-style install drops three
+/// files next to each other — `opencode`, `opencode.cmd`, `opencode.ps1` — and
+/// only the ones carrying a `PATHEXT` extension are launchable: `CreateProcess`
+/// refuses the extension-less shell script, which exists for Git Bash. Probing
+/// for mere existence therefore reported harnesses as present that then failed
+/// to spawn with "program not found". Resolving to the concrete file keeps the
+/// availability check and the launch agreeing on one answer, and lets the
+/// launch use a path that works.
+pub(super) fn resolve_program(program: &OsStr) -> Option<std::path::PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 {
-        return executable_path_available(path);
+        return resolve_candidate(path);
     }
-    std::env::var_os("PATH").is_some_and(|path_value| {
-        std::env::split_paths(&path_value)
-            .map(|dir| dir.join(path))
-            .any(|candidate| executable_path_available(&candidate))
+    std::env::var_os("PATH").and_then(|path_value| {
+        std::env::split_paths(&path_value).find_map(|dir| resolve_candidate(&dir.join(path)))
     })
 }
 
-fn executable_path_available(path: &Path) -> bool {
-    if executable_file(path) {
-        return true;
-    }
+/// Concrete launchable file for one candidate location.
+fn resolve_candidate(path: &Path) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
-    if path.extension().is_none() {
+    {
+        // An explicit extension is taken at face value; otherwise only a
+        // PATHEXT match counts. Never the extension-less sibling.
+        if path.extension().is_some() && executable_file(path) {
+            return Some(path.to_path_buf());
+        }
         let extensions =
             std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        return extensions
+        extensions
             .split(';')
             .filter(|extension| !extension.is_empty())
             .map(|extension| path.with_extension(extension.trim_start_matches('.')))
-            .any(|candidate| executable_file(&candidate));
+            .find(|candidate| executable_file(candidate))
     }
-    false
+    #[cfg(not(windows))]
+    {
+        executable_file(path).then(|| path.to_path_buf())
+    }
 }
 
 fn executable_file(path: &Path) -> bool {
@@ -1202,6 +1226,67 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command as CliCommand};
+
+    /// A false positive here reports a harness as installed and then fails to
+    /// spawn it, which is the bug this resolution exists to prevent.
+    #[test]
+    fn executable_available_rejects_a_program_that_is_not_installed() {
+        assert!(!executable_available(OsStr::new(
+            "ai-memory-no-such-harness-binary"
+        )));
+    }
+
+    /// An absolute path that exists resolves without consulting `PATH`, which
+    /// is the branch `--executable` relies on.
+    #[test]
+    fn executable_available_accepts_an_existing_absolute_path() {
+        let current = std::env::current_exe().unwrap();
+        assert!(executable_available(current.as_os_str()));
+        assert_eq!(
+            resolve_program(current.as_os_str()).as_deref(),
+            Some(current.as_path())
+        );
+    }
+
+    /// npm-style installs drop an extension-less shell script beside the
+    /// `.cmd` wrapper. On Windows only the wrapper is launchable, so probing
+    /// for mere existence reported the harness as available and the launch
+    /// then failed with "program not found".
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_skips_the_extension_less_shim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("faux-harness"), "#!/bin/sh\n").unwrap();
+
+        assert_eq!(
+            resolve_candidate(&tmp.path().join("faux-harness")),
+            None,
+            "an extension-less script is not launchable by CreateProcess"
+        );
+
+        std::fs::write(tmp.path().join("faux-harness.cmd"), "@echo off\n").unwrap();
+        let resolved =
+            resolve_candidate(&tmp.path().join("faux-harness")).expect("the wrapper resolves");
+        // PATHEXT is upper-case, and Windows paths are case-insensitive, so the
+        // resolved name carries whichever casing the probe used.
+        assert_eq!(
+            resolved
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_ascii_lowercase),
+            Some("faux-harness.cmd".to_string()),
+            "the PATHEXT sibling is what should be launched"
+        );
+        assert!(resolved.is_file());
+    }
+
+    /// Unix has no PATHEXT: the file itself is the answer.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_resolution_returns_the_file_itself() {
+        let current = std::env::current_exe().unwrap();
+        assert_eq!(resolve_candidate(&current), Some(current));
+    }
 
     fn candidates() -> Vec<NativeSessionCandidate> {
         vec![

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `run` on Windows no longer reports a harness as installed and then fails to
+  start it. npm-style installs drop three files side by side — `opencode`,
+  `opencode.cmd`, `opencode.ps1` — and the availability probe accepted the
+  extension-less shell script, which exists for Git Bash and which
+  `CreateProcess` cannot execute; the launch then died with
+  `program not found`. Availability now resolves to a concrete file, counting
+  only `PATHEXT` matches (or a path whose extension was given explicitly), and
+  the spawn uses that resolved path instead of the bare name, so the check and
+  the launch can no longer disagree. Spawning the resolved path also stops
+  `CreateProcess` from searching the working directory before `PATH`, so a
+  binary planted in the launched checkout can no longer take the harness's
+  place. Unix behaviour is unchanged. (#NNN)
+
 ## [1.21.0] - 2026-07-31
 
 ### Added
